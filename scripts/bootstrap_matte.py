@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Install BiRefNet-lite, the background remover every backend uses once it is present.
+
+    python scripts/bootstrap_matte.py          # says what it will fetch, then asks
+    python scripts/bootstrap_matte.py --yes    # non-interactive
+    python scripts/bootstrap_matte.py --check  # exit 0 if installed, 1 if not
+
+Without it, runs fall back to u2net, which ate a white robot's arms on a light backdrop, an
+axe handle and a sword + shield in a side-by-side test (2026-09-28); BiRefNet-lite kept
+all of them and matched full BiRefNet. One file, 181 MB, MIT licensed: BiRefNet-lite's own
+weights exported with ONNX's built-in DeformConv layer, which needs about 4 GB of memory per
+cut-out where rembg's copy of the same model needed 9.5 GB. Saved where rembg looks
+(`~/.u2net`, or `$U2NET_HOME`) and checked against its SHA-256 before it is kept.
+
+A machine that already has rembg's copy (224 MB) keeps working with it; `--check` reports it
+as not installed, so Setup & Status offers the lighter file. Installing the lighter file
+removes the older copy once the new one loads, and running this again removes a leftover one.
+
+Nothing is fetched without an explicit yes: AGENTS.md forbids weight downloads the user
+has not chosen.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from image_to_3dlab import matte
+
+
+def announcement() -> str:
+    text = (f"Background remover: BiRefNet-lite ({matte.LEAN_BYTES / 1e6:.0f} MB, MIT)\n"
+            f"  from   {matte.LEAN_URL}\n"
+            f"  to     {matte.model_file(matte.LEAN_MODEL)}")
+    older = matte.model_file(matte.LITE_MODEL)
+    if older.is_file():
+        text += (f"\n  then removes the older copy it replaces ({matte.LITE_BYTES / 1e6:.0f} MB)"
+                 f"\n         {older}")
+    return text
+
+
+def retire_older_copy() -> None:
+    removed = matte.retire_older_copy()
+    if removed:
+        print(f"  removed the older remover file {removed} ({matte.LITE_BYTES / 1e6:.0f} MB)")
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def install_if_missing(target: Path | None = None, download=None) -> None:
+    """BiRefNet-lite, unless it is already there. Setups that cut out pictures call this
+    so a first generation never fetches a remover nobody agreed to."""
+    target = target or matte.model_file(matte.LEAN_MODEL)
+    if target.is_file():
+        return
+    download = download or globals()["download"]
+    print(f"\nFetching BiRefNet-lite ({matte.LEAN_BYTES / 1e6:.0f} MB)...", flush=True)
+    download(target)
+    print(f"  background remover in {target}")
+    retire_older_copy()
+
+
+def download(target: Path, opener=urllib.request.urlopen) -> Path:
+    """Fetch to a temporary name, verify, then move into place. A bad file is never kept."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(".part")
+    with opener(matte.LEAN_URL) as response, partial.open("wb") as out:
+        while block := response.read(1 << 20):
+            out.write(block)
+    actual = sha256_of(partial)
+    if actual != matte.LEAN_SHA256:
+        partial.unlink(missing_ok=True)
+        raise SystemExit(f"checksum mismatch ({actual}); nothing was installed")
+    partial.replace(target)
+    return target
+
+
+def main(argv: list[str] | None = None, ask=input) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--yes", action="store_true", help="download without asking")
+    parser.add_argument("--check", action="store_true", help="report only")
+    args = parser.parse_args(argv)
+
+    target = matte.model_file(matte.LEAN_MODEL)
+    if target.is_file():
+        print(f"BiRefNet-lite is installed: {target}")
+        if not args.check:
+            retire_older_copy()
+        return 0
+    if args.check:
+        print("BiRefNet-lite is not installed")
+        return 1
+
+    print(announcement(), flush=True)
+    if not args.yes:
+        try:
+            answer = ask("Download it? [y/N] ")
+        except EOFError:  # no terminal: nobody to ask, so the answer is no
+            print("Refusing to download without --yes when there is nobody to ask.")
+            return 1
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Nothing downloaded.")
+            return 1
+    download(target)
+    print(f"Installed {target}")
+    retire_older_copy()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

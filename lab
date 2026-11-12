@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start the UniMate studio: ./lab
+# It picks how to listen for this machine (your browser opens locally; on a RunPod pod it
+# prints the pod's link; over SSH it prints the tunnel command). See viewer/serve.py --auto.
+#   ./lab mcp    runs the MCP server an agent (Claude Code, Codex, ...) connects to
+# Two environments: .venv-studio runs the studio (Python 3.11); .venv runs UniMate's own
+# model (Python 3.10), which the Motion step calls as a subprocess.
+cd "$(dirname "$0")" || exit 1
+if [ "$1" = "mcp" ]; then
+  shift
+  exec .venv-studio/bin/python -m image_to_3dlab.mcp_server "$@"
+fi
+exec .venv-studio/bin/python viewer/serve.py --auto "$@"

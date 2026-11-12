@@ -1,0 +1,666 @@
+"""The server-side chain runner and the Activity history, driven by a fake job server."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from viewer import activity_api as aa
+
+
+class FakeJobs:
+    """Answers the job endpoints the way the real ones do; each job is done on its first status poll."""
+
+    def __init__(self, output: Path, fail: str | None = None, refuse: str | None = None, four_legged: bool = False):
+        self.output, self.fail, self.refuse, self.four_legged = output, fail, refuse, four_legged
+        self.calls: list[tuple[str, str, bytes | None]] = []
+        self.jobs: dict[str, str] = {}
+
+    def __call__(self, method, path, body, content_type):
+        self.calls.append((method, path, body))
+        if method == "POST" and path.endswith("/cancel"):
+            return 200, {"ok": True}
+        if method == "POST":
+            kind = {"/api/image": "picture", "/api/image/back": "back", "/api/generate": "model", "/api/finish": "finished",
+                    "/api/animate/rig": "rigged", "/api/animate/play": "animated", "/api/motion": "motion",
+                    "/api/props": "split"}[path]
+            if kind == self.refuse:
+                return 409, {"error": "another job is running; wait for it to finish"}
+            job_id = f"job-{kind}"
+            self.jobs[job_id] = kind
+            api = path.split("/")[2]
+            return 202, {"job_id": job_id, "status_url": f"/api/{api}/{job_id}/status"}
+        kind = self.jobs[path.split("/")[3]]
+        if kind == self.fail:
+            return 200, {"status": "error", "error": "MemoryError: out of memory", "log_tail": "ggml_noise\nKilled"}
+        made = {"picture": "images/p/pic.png", "back": "images/p/pic__back.png", "model": "pixal3d/m/model.glb",
+                "finished": "finish/f/finished.glb", "rigged": "animate/r/rigged.glb",
+                "animated": "animate/r/rigged_walk.glb", "motion": "animate/r/rigged_walk.glb"}
+        for rel in made.values():
+            (self.output / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.output / rel).write_bytes(b"x")
+        event = {"phase": "done", "message": f"{kind} done", "overall_pct": 100}
+        if kind == "rigged" and self.four_legged:
+            event.update(humanoid=False, message="Rigged. Preset moves are for humanoids only for now.")
+        if kind in ("finished", "rigged", "animated", "motion"):
+            event["path"] = made[kind]
+        return 200, {"status": "done", "last_event": event, "log_tail": f"{kind} ok",
+                     "picture": made[kind] if kind in ("picture", "back") else None,
+                     "model": made["model"] if kind == "model" else None}
+
+
+def _runner(tmp_path, **fake):
+    jobs = FakeJobs(tmp_path, **fake)
+    return aa.ChainRunner(tmp_path, jobs, poll=0, sleep=lambda s: None), jobs
+
+
+def test_a_whole_character_runs_and_each_step_gets_the_last_ones_file(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="sensei", prompt="a sensei", engine="pixal3d", first_move="walk",
+                     steps=["picture", "model", "finished", "rigged", "animated"])
+    runner.submit(chain, background=False)
+    assert chain.status == "done" and chain.done == chain.steps
+    posts = [(p, b) for m, p, b in jobs.calls if m == "POST"]
+    assert [p for p, _ in posts] == ["/api/image", "/api/generate", "/api/finish", "/api/animate/rig", "/api/animate/play"]
+    assert b'name="image"; filename="pic.png"' in posts[2][1]
+    assert b'name="model"\r\n\r\nfinish/f/finished.glb' in posts[3][1]          # rig takes the finished model
+    assert json.loads(posts[4][1]) == {"model": "animate/r/rigged.glb", "preset": "walk"}
+    history = aa.read_history(tmp_path)
+    assert [h["step"] for h in history] == ["animated", "rigged", "finished", "model", "picture"]  # newest first
+    assert all(h["result"] == "done" for h in history)
+    assert {h["prompt"] for h in history} == {"a sensei"}   # Activity shows what was asked for
+    assert chain.made["animated"] == "animate/r/rigged_walk.glb"   # the move's own file, for agents
+    assert history[0]["made"] == "animate/r/rigged_walk.glb"
+
+
+def test_a_text_motion_chain_hands_the_prompt_to_unimate(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="griffin", prompt="a griffin", engine="pixal3d",
+                     motion_prompt="An object flaps its wings.",
+                     motion_settings={"cfg_scale": 5, "repetitions": 2},
+                     steps=["picture", "model", "finished", "rigged", "motion"])
+    runner.submit(chain, background=False)
+    assert chain.status == "done" and chain.done == chain.steps
+    posts = [(p, b) for m, p, b in jobs.calls if m == "POST"]
+    assert [p for p, _ in posts] == ["/api/image", "/api/generate", "/api/finish", "/api/animate/rig", "/api/motion"]
+    assert json.loads(posts[4][1]) == {"model": "animate/r/rigged.glb",
+                                       "prompt": "An object flaps its wings.",
+                                       "cfg_scale": 5, "repetitions": 2}
+    assert chain.made["animated"] == "animate/r/rigged_walk.glb"   # the clip lands where agents expect it
+    assert aa.read_history(tmp_path)[0]["made"] == "animate/r/rigged_walk.glb"
+
+
+def test_a_text_motion_chain_needs_a_rig_and_a_prompt(tmp_path):
+    runner, _ = _runner(tmp_path)
+    no_prompt = aa.Chain(title="x", steps=["motion"])
+    runner.submit(no_prompt, background=False)
+    assert no_prompt.status == "error" and "rigged model" in no_prompt.error
+    no_rig = aa.Chain(title="x", steps=["motion"], motion_prompt="An object walks forward.")
+    runner.submit(no_rig, background=False)
+    assert no_rig.status == "error" and "rigged model" in no_rig.error
+
+
+def test_the_form_reads_motion_fields(tmp_path):
+    form = {"title": {"value": "k"}, "steps": {"value": json.dumps(["rigged", "motion"])},
+            "motion_prompt": {"value": "An object jumps in place."},
+            "motion_settings": {"value": json.dumps({"cfg_scale": 4, "repetitions": 3, "loop": True})},
+            "made": {"value": json.dumps({"rigged": "animate/r/rigged.glb"})}}
+    chain = aa.chain_from_form(form)
+    assert chain.motion_prompt == "An object jumps in place."
+    assert chain.motion_settings == {"cfg_scale": 4, "repetitions": 3, "loop": True}
+    assert chain.steps == ["rigged", "motion"]
+
+
+def test_a_failure_stops_the_chain_in_plain_words_and_is_kept_in_history(tmp_path):
+    runner, _ = _runner(tmp_path, fail="finished")
+    chain = aa.Chain(title="knight", steps=["picture", "model", "finished", "rigged"], prompt="a knight")
+    runner.submit(chain, background=False)
+    assert chain.status == "error" and chain.done == ["picture", "model"]
+    assert "ran out of memory" in chain.error
+    assert "ggml" not in chain.log  # engine chatter dropped
+    last = aa.read_history(tmp_path)[0]
+    assert last["step"] == "finished" and last["result"] == "error" and "Killed" in last["log"]
+
+
+def test_a_refused_start_is_reported_not_raised(tmp_path):
+    runner, _ = _runner(tmp_path, refuse="model")
+    chain = aa.Chain(title="x", steps=["picture", "model"], prompt="x")
+    runner.submit(chain, background=False)
+    assert chain.status == "error" and "Another job is running" in chain.error
+
+
+def test_a_rig_from_an_uploaded_model_sends_the_file(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="mine", steps=["rigged", "animated"], first_move="idle", upload=("mine.glb", b"GLB!"))
+    runner.submit(chain, background=False)
+    rig_body = next(b for m, p, b in jobs.calls if p == "/api/animate/rig")
+    assert b'filename="mine.glb"' in rig_body and b"GLB!" in rig_body
+    assert chain.status == "done"
+
+
+def test_only_one_chain_at_a_time_and_unknown_steps_are_refused(tmp_path):
+    runner, _ = _runner(tmp_path)
+    runner.chains["busy"] = aa.Chain(title="busy", steps=["picture"], id="busy")
+    with pytest.raises(RuntimeError):
+        runner.submit(aa.Chain(title="b", steps=["picture"]), background=False)
+    runner.chains.clear()
+    with pytest.raises(ValueError):
+        runner.submit(aa.Chain(title="c", steps=["teleport"]), background=False)
+
+
+def test_cancel_asks_the_running_job_to_stop(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="x", steps=["picture"], id="c1")
+    runner.chains["c1"] = chain
+    chain.job = ("image", "job-picture")
+    assert runner.cancel("c1") and chain.cancel_requested
+    assert ("POST", "/api/image/job-picture/cancel", None) in jobs.calls
+
+
+def test_files_outside_output_are_never_read(tmp_path):
+    runner, _ = _runner(tmp_path)
+    with pytest.raises(ValueError):
+        runner._file("../secrets.txt")
+
+
+def test_history_skips_damaged_lines_and_survives_a_missing_file(tmp_path):
+    assert aa.read_history(tmp_path) == []
+    (tmp_path / aa.HISTORY_NAME).write_text('{"step": "a"}\nnot json\n{"step": "b"}\n')
+    assert [h["step"] for h in aa.read_history(tmp_path)] == ["b", "a"]
+
+
+def test_a_quiet_step_is_flagged_as_stalled():
+    chain = aa.Chain(title="x", steps=["picture"])
+    chain.last_change = 0
+    assert chain.to_dict(now=aa.STALL_SECONDS + 1)["stalled"]
+    assert not chain.to_dict(now=10)["stalled"]
+
+
+def test_a_plan_sent_as_a_form_is_read_back_by_the_real_parser():
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart(
+        {"title": "sensei", "steps": json.dumps(["rigged", "animated"]), "first_move": "walk",
+         "made": json.dumps({"finished": "finish/f/x.glb", "evil": "/etc/passwd"})},
+        {"file": ("mine.glb", b"\x00GLB")})
+    chain = aa.chain_from_form(parse_multipart(ctype, body))
+    assert chain.title == "sensei" and chain.steps == ["rigged", "animated"] and chain.first_move == "walk"
+    assert chain.made == {"finished": "finish/f/x.glb"}           # only the known kinds are taken
+    assert chain.upload == ("mine.glb", b"\x00GLB")
+
+
+def test_a_rig_that_does_not_fit_the_moves_ends_the_run_calmly_before_animate(tmp_path):
+    runner, jobs = _runner(tmp_path, four_legged=True)
+    chain = aa.Chain(title="griffin", steps=["picture", "model", "finished", "rigged", "animated"], prompt="g", first_move="walk")
+    runner.submit(chain, background=False)
+    assert chain.status == "done" and chain.done[-1] == "rigged"
+    assert "humanoids only" in chain.to_dict()["note"]
+    assert not any(p == "/api/animate/play" for _, p, _ in jobs.calls)
+
+
+def test_the_picture_step_sends_the_chosen_size_steps_and_seed(tmp_path):
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart({"title": "x", "steps": json.dumps(["picture"]), "prompt": "a crate",
+                                "picture_settings": json.dumps({"width": 512, "height": 512, "steps": 8, "seed": 99, "evil": 1})}, {})
+    chain = aa.chain_from_form(parse_multipart(ctype, body))
+    assert chain.picture_settings == {"width": 512, "height": 512, "steps": 8, "seed": 99}
+    runner, jobs = _runner(tmp_path)
+    runner.submit(chain, background=False)
+    sent = json.loads(next(b for m, p, b in jobs.calls if p == "/api/image"))
+    assert sent == {"prompt": "a crate", "settings": {"width": 512, "height": 512, "steps": 8, "seed": 99},
+                    "engine": None, "picture_only": True}
+
+
+def test_the_picture_step_names_the_chosen_engine_and_whether_3d_follows(tmp_path):
+    """Flux spends 8 steps on a picture that is the end product, 4 on one a 3D model is built from."""
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart({"title": "x", "steps": json.dumps(["picture", "model"]), "prompt": "a crate",
+                                "picture_engine": "qwen", "engine": "pixal3d"}, {})
+    chain = aa.chain_from_form(parse_multipart(ctype, body))
+    assert chain.picture_engine == "qwen"
+    runner, jobs = _runner(tmp_path)
+    runner.submit(chain, background=False)
+    sent = json.loads(next(b for m, p, b in jobs.calls if p == "/api/image"))
+    assert sent["engine"] == "qwen" and sent["picture_only"] is False
+
+
+def test_the_model_step_sends_the_fresh_seed_create_chose(tmp_path):
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart({"title": "x", "steps": json.dumps(["model"]), "engine": "pixal3d", "model_seed": "12345"},
+                               {"file": ("boy.png", b"png")})
+    chain = aa.chain_from_form(parse_multipart(ctype, body))
+    assert chain.model_seed == 12345
+    runner, jobs = _runner(tmp_path)
+    runner.submit(chain, background=False)
+    sent = next(b for m, p, b in jobs.calls if p == "/api/generate")
+    assert b'{"backend": "pixal3d", "seed": 12345}' in sent
+
+
+def test_a_missing_or_bad_model_seed_leaves_the_engine_default():
+    from viewer.generate_api import parse_multipart
+    for seed in (None, "", "lots"):
+        fields = {"title": "x", "steps": json.dumps(["model"])}
+        if seed is not None:
+            fields["model_seed"] = seed
+        body, ctype = aa.multipart(fields, {})
+        assert aa.chain_from_form(parse_multipart(ctype, body)).model_seed is None
+
+
+def test_keep_everything_reaches_the_3d_step_as_debug(tmp_path):
+    """Create's "Keep everything" box: the 3D job keeps its textures, meshes and caches.
+    /api/generate already honours `debug`; the chain just has to send it."""
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart({"title": "x", "steps": json.dumps(["model", "finished"]), "engine": "pixal3d",
+                                "keep_everything": "1"}, {"file": ("boy.png", b"png")})
+    chain = aa.chain_from_form(parse_multipart(ctype, body))
+    assert chain.keep_everything is True
+    runner, jobs = _runner(tmp_path)
+    runner.submit(chain, background=False)
+    sent = {p: b for m, p, b in jobs.calls}
+    assert b'"debug": true' in sent["/api/generate"]
+    assert b"debug" not in sent["/api/finish"]       # only the 3D step has anything to keep
+
+
+def test_keep_everything_is_off_unless_asked(tmp_path):
+    from viewer.generate_api import parse_multipart
+    for value in (None, "", "0", "no"):
+        fields = {"title": "x", "steps": json.dumps(["model"])}
+        if value is not None:
+            fields["keep_everything"] = value
+        body, ctype = aa.multipart(fields, {"file": ("boy.png", b"png")})
+        chain = aa.chain_from_form(parse_multipart(ctype, body))
+        assert chain.keep_everything is False
+    runner, jobs = _runner(tmp_path)
+    runner.submit(chain, background=False)
+    assert b"debug" not in next(b for m, p, b in jobs.calls if p == "/api/generate")
+
+
+
+def test_a_front_and_back_character_draws_the_back_then_builds_from_both(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="viking", prompt="a viking", engine="pixal3d", first_move="walk",
+                     steps=["picture", "back", "model", "finished", "rigged", "animated"])
+    runner.submit(chain, background=False)
+    assert chain.status == "done" and chain.made["back"] == "images/p/pic__back.png"
+    posts = [(p, b) for m, p, b in jobs.calls if m == "POST"]
+    assert [p for p, _ in posts][:3] == ["/api/image", "/api/image/back", "/api/generate"]
+    assert json.loads(posts[1][1])["picture"] == "images/p/pic.png"
+    assert b'name="back"; filename="pic__back.png"' in posts[2][1]
+
+
+def test_an_uploaded_picture_is_kept_in_output_so_its_back_can_be_drawn(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="mine", engine="pixal3d", steps=["back", "model"],
+                     upload=("my orc.png", b"\x89PNG-bytes"))
+    runner.submit(chain, background=False)
+    assert chain.status == "done"
+    sent = json.loads([b for m, p, b in jobs.calls if p == "/api/image/back"][0])["picture"]
+    assert sent.startswith("images/uploads/") and (tmp_path / sent).read_bytes() == b"\x89PNG-bytes"
+
+
+def test_a_front_only_upload_is_kept_too_and_the_model_is_named_after_it(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="mine", engine="pixal3d", steps=["model"], upload=("My Orc.PNG", b"\x89PNG-bytes"))
+    runner.submit(chain, background=False)
+    kept = chain.made["picture"]
+    assert kept == f"images/uploads/my-orc__{chain.id[:8]}.png"
+    assert (tmp_path / kept).read_bytes() == b"\x89PNG-bytes"
+    model_post = [b for m, p, b in jobs.calls if p == "/api/generate"][0]
+    assert f'filename="my-orc__{chain.id[:8]}.png"'.encode() in model_post   # the model's folder starts with it
+
+
+def test_an_uploaded_model_is_not_kept_as_a_picture(tmp_path):
+    runner, _ = _runner(tmp_path)
+    chain = aa.Chain(title="mine", steps=["rigged"], upload=("mine.glb", b"GLB!"))
+    runner.submit(chain, background=False)
+    assert "picture" not in chain.made and not (tmp_path / "images" / "uploads").exists()
+
+
+def test_the_back_only_goes_to_pixal3d(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="x", prompt="x", engine="trellis", steps=["picture", "back", "model"])
+    runner.submit(chain, background=False)
+    model_post = [b for m, p, b in jobs.calls if p == "/api/generate"][0]
+    assert b'name="back"' not in model_post
+
+
+def test_no_named_engine_means_no_back_since_the_default_engine_is_not_pixal3d(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="x", prompt="x", steps=["picture", "back", "model"])
+    runner.submit(chain, background=False)
+    assert b'name="back"' not in [b for m, p, b in jobs.calls if p == "/api/generate"][0]
+
+
+def test_each_finished_step_reports_how_long_it_took(tmp_path):
+    clock = iter(range(0, 1000, 5))
+    jobs = FakeJobs(tmp_path)
+    runner = aa.ChainRunner(tmp_path, jobs, poll=0, sleep=lambda s: None, now=lambda: float(next(clock)))
+    chain = aa.Chain(title="x", prompt="x", engine="pixal3d", steps=["picture", "back", "model"])
+    runner.submit(chain, background=False)
+    seconds = chain.to_dict()["step_seconds"]
+    assert set(seconds) == {"picture", "back", "model"} and all(s > 0 for s in seconds.values())
+    assert [h["made"] for h in aa.read_history(tmp_path) if h["step"] == "back"] == ["images/p/pic__back.png"]
+
+
+def test_a_plan_carries_its_finish_choices_to_the_finish_job(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    form = {"title": {"value": "k"}, "steps": {"value": json.dumps(["finished"])},
+            "made": {"value": json.dumps({"model": "pixal3d/m/model.glb", "picture": "images/p/pic.png"})},
+            "finish_settings": {"value": json.dumps({"keep_mesh": True, "skip_photo": False, "voxel": 9})}}
+    for rel in ("pixal3d/m/model.glb", "images/p/pic.png"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_bytes(b"x")
+    chain = aa.chain_from_form(form)
+    assert chain.finish_settings == {"keep_mesh": True, "skip_photo": False}   # unknown keys never reach Finish
+    runner.submit(chain, background=False)
+    body = next(b for m, p, b in jobs.calls if p == "/api/finish")
+    assert b'{"keep_mesh": true, "skip_photo": false}' in body
+
+
+def test_a_plan_without_finish_choices_gets_finishs_defaults(tmp_path):
+    chain = aa.chain_from_form({"title": {"value": "k"}, "steps": {"value": json.dumps(["finished"])}})
+    assert chain.finish_settings == {}
+
+
+def test_a_plan_carries_edge_fade_to_the_finish_job():
+    form = {"title": {"value": "k"}, "steps": {"value": json.dumps(["finished"])},
+            "finish_settings": {"value": json.dumps({"keep_mesh": True, "skip_edge_fade": True, "skip_nudge": True})}}
+    assert aa.chain_from_form(form).finish_settings == {"keep_mesh": True, "skip_edge_fade": True, "skip_nudge": True}
+
+
+def test_a_plan_carries_move_speed_arm_spread_and_in_place_to_the_animate_job(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    form = {"title": {"value": "k"}, "steps": {"value": json.dumps(["animated"])}, "first_move": {"value": "wave"},
+            "made": {"value": json.dumps({"rigged": "animate/k/k_rigged.glb"})},
+            "move_settings": {"value": json.dumps({"speed": 1.5, "arm_spread": 10, "in_place": True,
+                                                   "colour": "red"})}}
+    (tmp_path / "animate/k").mkdir(parents=True)
+    (tmp_path / "animate/k/k_rigged.glb").write_bytes(b"x")
+    chain = aa.chain_from_form(form)
+    assert chain.move_settings == {"speed": 1.5, "arm_spread": 10, "in_place": True}  # unknown keys never reach Animate
+    runner.submit(chain, background=False)
+    body = next(b for m, p, b in jobs.calls if p == "/api/animate/play")
+    assert json.loads(body) == {"model": "animate/k/k_rigged.glb", "preset": "wave", "speed": 1.5,
+                                "arm_spread": 10, "in_place": True}
+
+
+def test_a_plan_without_move_settings_lets_the_move_use_its_own_pace():
+    chain = aa.chain_from_form({"title": {"value": "k"}, "steps": {"value": json.dumps(["animated"])}})
+    assert chain.move_settings == {}
+
+
+def test_install_help_for_blender_is_passed_on_as_it_is():
+    """2026-10-19, the first site report: "Blender stopped with an error, see the log" for a Mac
+    with no Blender, and no log, because nothing had run."""
+    message = "Finish needs Blender 4.2 or newer, and none was found. Install Blender from blender.org."
+    assert aa.plain_error(message) == message
+    assert aa.plain_error("Blender: Error: something broke").startswith("Blender stopped with an error")
+
+
+def test_a_plan_with_finish_is_refused_up_front_when_blender_is_missing(tmp_path, monkeypatch):
+    """Checked before the picture and the 3D model, not ten minutes in at Finish."""
+    import http.server
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from viewer import generate_api as api
+
+    monkeypatch.setattr(api, "OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(api, "find_blender", lambda: None)
+    started = []
+    monkeypatch.setattr(api.ChainRunner, "submit", lambda self, chain, **k: started.append(chain))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def post(steps):
+        body, ctype = aa.multipart({"title": "knight", "steps": json.dumps(steps)}, {})
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/chains", data=body,
+                                         headers={"Content-Type": ctype, "X-UniMate-Request": "studio"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+    try:
+        status, payload = post(["picture", "model", "finished"])
+        assert status == 409 and "Install Blender" in payload["error"] and payload["needs_blender"]
+        assert "stop after the 3D model" in payload["error"] and started == []
+        assert post(["picture", "model"])[0] == 202 and len(started) == 1   # no Blender needed
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_every_finish_detail_agents_can_ask_for_reaches_finish():
+    from image_to_3dlab import mcp_server as ms
+    for detail, settings in ms.FINISH_DETAILS.items():
+        form = {"title": {"value": "k"}, "steps": {"value": json.dumps(["finished"])},
+                "finish_settings": {"value": json.dumps(settings)}}
+        assert aa.chain_from_form(form).finish_settings == settings, detail
+
+
+# --- Your own back picture (front + back upload, 2026-10-30) --------------------------------
+
+def _picture_bytes(fmt="PNG", mode="RGB"):
+    import io
+
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new(mode, (8, 8), (200, 40, 40)).save(buffer, fmt)
+    return buffer.getvalue()
+
+
+def test_your_own_back_is_kept_beside_the_front_and_sent_to_the_3d_step(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="orc", engine="pixal3d", steps=["back", "model"],
+                     upload=("orc.png", _picture_bytes()), back_upload=("orc back.jpg", _picture_bytes("JPEG")))
+    runner.submit(chain, background=False)
+    assert chain.status == "done"
+    front, back = chain.made["picture"], chain.made["back"]
+    # the name a drawn back has, so the Library and Finish find it the same way; PNG whatever was uploaded
+    assert back == front.removesuffix(".png") + "__back.png"
+    assert (tmp_path / back).read_bytes()[:4] == b"\x89PNG"
+    posts = [p for m, p, b in jobs.calls if m == "POST"]
+    assert posts == ["/api/generate"]                    # nothing drawn: no /api/image/back
+    generate = next(b for m, p, b in jobs.calls if p == "/api/generate")
+    assert b'name="back"; filename="' + Path(back).name.encode() in generate
+
+
+def test_a_back_that_is_not_a_picture_stops_before_anything_runs(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="orc", engine="pixal3d", steps=["model"],
+                     upload=("orc.png", _picture_bytes()), back_upload=("orc-back.png", b"not a picture"))
+    runner.submit(chain, background=False)
+    assert chain.status == "error" and "back picture could not be read" in chain.error
+    assert not [c for c in jobs.calls if c[0] == "POST"]
+
+
+@pytest.mark.parametrize("fields, files, error", [
+    ({"engine": "pixal3d", "steps": '["model"]'}, {"back_file": ("b.png", b"x")}, "upload both"),
+    ({"engine": "trellis", "steps": '["model"]'}, {"file": ("f.png", b"x"), "back_file": ("b.png", b"x")}, "Pixal3D"),
+    ({"engine": "pixal3d", "steps": '["model"]'}, {"file": ("f.png", b"x"), "back_file": ("b.gif", b"x")}, "PNG, JPG or WebP"),
+])
+def test_a_back_upload_that_cannot_be_used_is_refused_when_the_plan_arrives(fields, files, error):
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart({"title": "x", **fields}, files)
+    with pytest.raises(ValueError, match=error):
+        aa.chain_from_form(parse_multipart(ctype, body))
+
+
+def test_a_back_that_breaks_the_decoder_in_any_way_ends_the_run(tmp_path, monkeypatch):
+    """PIL's DecompressionBombError is not an OSError: uncaught, the run sat at "running" forever."""
+    runner, _ = _runner(tmp_path)
+
+    def bomb(*a, **k):
+        raise RuntimeError("decompression bomb")
+    monkeypatch.setattr(runner, "_kept_back", bomb)
+    chain = aa.Chain(title="orc", engine="pixal3d", steps=["model"],
+                     upload=("orc.png", _picture_bytes()), back_upload=("b.png", b"x"))
+    runner.submit(chain, background=False)
+    assert chain.status == "error" and "decompression bomb" in chain.error
+
+
+def test_the_back_step_asks_for_the_fronts_own_engine(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="orc", prompt="an orc", engine="pixal3d", picture_engine="qwen",
+                     steps=["picture", "back"])
+    runner.submit(chain, background=False)
+    sent = json.loads(next(b for m, p, b in jobs.calls if p == "/api/image/back"))
+    assert sent["prefer_engine"] == "qwen" and "engine" not in sent   # a preference, not an ask
+
+
+def test_a_plan_that_stops_at_the_back_picture_still_counts_as_a_3d_source(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="orc", prompt="an orc", engine="pixal3d", steps=["picture", "back"])
+    runner.submit(chain, background=False)
+    assert json.loads(next(b for m, p, b in jobs.calls if p == "/api/image"))["picture_only"] is False
+
+
+def test_drawing_the_back_again_passes_the_seed_and_change_through(tmp_path):
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart({"title": "x", "steps": '["back"]', "made": '{"picture": "images/a/a.png"}',
+                                "back_settings": json.dumps({"seed": 77, "instruction": "a red cloak", "evil": 1})}, {})
+    chain = aa.chain_from_form(parse_multipart(ctype, body))
+    assert chain.back_settings == {"seed": 77, "instruction": "a red cloak"}
+    runner, jobs = _runner(tmp_path)
+    runner.submit(chain, background=False)
+    sent = json.loads(next(b for m, p, b in jobs.calls if p == "/api/image/back"))
+    assert sent == {"picture": "images/a/a.png", "prefer_engine": None, "seed": 77, "instruction": "a red cloak"}
+
+
+def test_a_redraw_can_ask_for_an_engine_by_name(tmp_path):
+    from viewer.generate_api import parse_multipart
+    body, ctype = aa.multipart({"title": "x", "steps": '["back"]', "made": '{"picture": "images/a/a.png"}',
+                                "back_settings": json.dumps({"seed": 1, "engine": "qwen"})}, {})
+    chain = aa.chain_from_form(parse_multipart(ctype, body))
+    runner, jobs = _runner(tmp_path)
+    runner.submit(chain, background=False)
+    assert json.loads(next(b for m, p, b in jobs.calls if p == "/api/image/back"))["engine"] == "qwen"
+
+
+
+# --- Security review fixes (2026-10-30) -------------------------------------------------------
+
+@pytest.mark.parametrize("front", ["../escape/x.png", "/tmp/elsewhere/x.png"])
+def test_a_plan_naming_a_file_outside_output_writes_nothing_there(tmp_path, front):
+    """`made` comes from the request: a back kept "beside" it once landed outside output/."""
+    output = tmp_path / "output"
+    output.mkdir()
+    runner, jobs = _runner(output)
+    chain = aa.Chain(title="x", engine="pixal3d", steps=["model"], made={"picture": front},
+                     upload=("x.png", _picture_bytes()), back_upload=("b.png", _picture_bytes()))
+    runner.submit(chain, background=False)
+    assert chain.status == "error" and "Not a file in output/" in chain.error
+    assert not list(tmp_path.glob("**/*__back.png")) and not [c for c in jobs.calls if c[0] == "POST"]
+
+
+def test_an_enormous_back_picture_is_refused_before_it_is_decoded(tmp_path):
+    import io
+
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("L", (aa.MAX_BACK_SIDE + 1, 8)).save(buffer, "PNG")
+    runner, _ = _runner(tmp_path)
+    chain = aa.Chain(title="x", engine="pixal3d", steps=["model"],
+                     upload=("x.png", _picture_bytes()), back_upload=("b.png", buffer.getvalue()))
+    runner.submit(chain, background=False)
+    assert chain.status == "error" and "largest taken" in chain.error
+
+
+@pytest.mark.parametrize("back", [_picture_bytes("JPEG"), b"not a picture"])
+def test_a_finished_run_lets_go_of_its_uploads(tmp_path, back):
+    """An upload can be near 1 GB; done or failed, the run must not hold it (security review 2026-10-31)."""
+    runner, _ = _runner(tmp_path)
+    chain = aa.Chain(title="orc", engine="pixal3d", steps=["back", "model"],
+                     upload=("orc.png", _picture_bytes()), back_upload=("orc back.jpg", back))
+    runner.submit(chain, background=False)
+    assert chain.status in {"done", "error"}
+    assert chain.upload is None and chain.back_upload is None
+
+
+def test_only_the_latest_runs_are_remembered(tmp_path):
+    runner, _ = _runner(tmp_path)
+    clock = iter(range(1000))
+    for i in range(aa.KEEP_CHAINS + 5):
+        chain = aa.Chain(title=f"r{i}", engine="pixal3d", steps=["picture"], prompt="x", started=float(next(clock)))
+        runner.submit(chain, background=False)
+    assert len(runner.chains) == aa.KEEP_CHAINS
+    assert {c.title for c in runner.chains.values()} == {f"r{i}" for i in range(5, aa.KEEP_CHAINS + 5)}
+
+
+def test_new_lines_in_a_full_log_tail_count_as_progress(tmp_path):
+    """The tail is capped (4000 characters), so its length stops changing on a long step.
+    New lines must still count, or every long Hero head build read as stalled."""
+    tails = iter(["a" * 3990 + "line one\n", "a" * 3981 + "line one\nline two\n"])
+    polls = {"n": 0}
+
+    def request(method, path, body, content_type):
+        if method == "POST":
+            return 202, {"job_id": "j", "status_url": "/api/finish/j/status"}
+        polls["n"] += 1
+        if polls["n"] <= 2:
+            return 200, {"status": "running", "last_event": {"phase": "head"}, "log_tail": next(tails)}
+        return 200, {"status": "error", "error": "stop here", "log_tail": ""}
+
+    for name in ("m.glb", "p.png"):
+        (tmp_path / name).write_bytes(b"x")
+    clock = iter(range(0, 1000, 100))
+    changes = []
+    chain = aa.Chain(title="x", steps=["finished"], made={"model": "m.glb", "picture": "p.png"})
+    runner = aa.ChainRunner(tmp_path, request, poll=0, now=lambda: float(next(clock)),
+                            sleep=lambda s: changes.append(chain.last_change))
+    runner.submit(chain, background=False)
+    assert polls["n"] == 3, chain.error
+    assert len(set(changes[:2])) == 2   # the second poll's new line moved the clock on
+
+
+@pytest.mark.parametrize("when", ["start", "poll"])
+@pytest.mark.parametrize("terminal", ["cancelled", "done"])
+@pytest.mark.parametrize("retry", [False, True])
+def test_cancel_during_child_start_is_delivered(tmp_path, when, terminal, retry):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="cancel", steps=["picture", "model", "finished"], prompt="picture")
+    attempts = []
+    polls = 0
+    def request(method, path, body, content_type):
+        nonlocal polls
+        if path.endswith("/cancel"):
+            assert runner.lock.acquire(blocking=False), "cancel HTTP request held the runner lock"
+            runner.lock.release()
+            attempts.append(path)
+            if retry and len(attempts) == 1:
+                raise OSError("connection lost")
+        if method == "POST" and path == "/api/generate" and when == "start":
+            assert runner.cancel(chain.id)
+        result = jobs(method, path, body, content_type)
+        if method == "GET" and "/generate/" in path:
+            polls += 1
+            if polls == 1:
+                if when == "poll":
+                    assert runner.cancel(chain.id)
+                assert runner.running() is chain
+                with pytest.raises(RuntimeError, match="already being made"):
+                    runner.submit(aa.Chain(title="another", steps=["picture"]), background=False)
+                return 200, {"status": "running"}
+            return result[0], {**result[1], "status": terminal}
+        return result
+    runner.request = request
+    runner.submit(chain, background=False)
+    assert attempts == ["/api/generate/job-model/cancel"] * (2 if retry else 1)
+    assert chain.status == "cancelled"
+    assert chain.done == ["picture"]
+    assert chain.made["picture"] == "images/p/pic.png"
+    if terminal == "done":
+        assert chain.made["model"] == "pixal3d/m/model.glb"
+    assert not any(path == "/api/finish" for _, path, _ in jobs.calls)
+    assert aa.read_history(tmp_path)[0]["result"] == "cancelled"
+
+
+def test_finish_rejects_picture_upload_without_a_model(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="picture", steps=["finished"], upload=("picture.png", b"picture"))
+    runner.submit(chain, background=False)
+    assert chain.status == "error" and "3D model" in chain.error
+    assert not any(path == "/api/finish" for _, path, _ in jobs.calls)

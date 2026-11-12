@@ -1,0 +1,788 @@
+"""The Pixal3D installer: one script for a Mac build and an NVIDIA prebuilt, never a
+download without an explicit yes."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import tarfile
+import types
+import zipfile
+from pathlib import Path
+
+import backend_catalog
+import bootstrap_pixal3d as boot
+import pytest
+
+
+def test_weight_size_matches_the_catalogue():
+    """The Setup page and this script must not quote different numbers for one download."""
+    pixal = next(b for b in backend_catalog.CATALOG if b.id == "pixal3d")
+    assert sum(w.bytes_expected for w in pixal.weights) == pytest.approx(
+        boot.WEIGHTS_GB * backend_catalog.GB + boot.matte.LITE_BYTES, rel=0.01)
+
+
+@pytest.fixture
+def new_driver(monkeypatch):
+    """A driver new enough for upstream's CUDA 12.9 prebuilt, and no compiler."""
+    monkeypatch.setattr(boot, "driver_cuda", lambda: (12, 9))
+    monkeypatch.setattr(boot, "find_nvcc", lambda: None)
+
+
+@pytest.mark.parametrize("key,route,size", [
+    ("macos-arm64", "built from source with Metal", "Xcode"),
+    ("linux-nvidia", "CUDA 12 prebuilt", "~910 MB"),
+    ("windows-nvidia", "CUDA 12 prebuilt", "~880 MB"),
+])
+def test_announcement_names_backend_route_size_and_licence(monkeypatch, new_driver,
+                                                           key, route, size):
+    monkeypatch.setattr(boot, "target", lambda: key)
+    text = boot.announcement()
+    for needle in ("Pixal3D", route, size, "8.4 GB", "MIT", "DINOv3"):
+        assert needle in text
+
+
+def test_unsupported_machine_is_refused_before_anything_is_fetched(monkeypatch, capsys):
+    monkeypatch.setattr(boot, "target", lambda: None)
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("downloaded"))
+    assert boot.main(["--yes"]) == 1
+    assert "Apple Silicon Mac, or Linux/Windows with an NVIDIA card" in capsys.readouterr().out
+
+
+def test_no_yes_and_no_terminal_means_no_download(monkeypatch, new_driver):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot.sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("downloaded"))
+    assert boot.main([]) == 1
+
+
+def test_rerun_on_an_installed_tree_does_not_rebuild(monkeypatch, capsys, new_driver):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "build_present", lambda: True)
+    # a current tree, decided here: the real check reads vendor/ and fails on a fresh clone
+    monkeypatch.setattr(boot, "build_stale", lambda: False)
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("rebuilt"))
+    fetched = []
+    monkeypatch.setattr(boot, "install_weights", lambda *a: fetched.append(1))
+    assert boot.main(["--yes"]) == 0
+    assert "already installed" in capsys.readouterr().out
+    assert fetched == [1]  # the weight fetch resumes, it does not restart
+
+
+def test_build_only_and_weights_only_do_one_half_each(monkeypatch, new_driver):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "build_present", lambda: False)
+    called = []
+    monkeypatch.setattr(boot, "install_build", lambda *a: called.append("build"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: called.append("weights"))
+    assert boot.main(["--yes", "--build-only"]) == 0
+    assert boot.main(["--yes", "--weights-only"]) == 0
+    assert called == ["build", "weights"]
+
+
+# Our own NVIDIA build (.github/workflows/pixal3d-nvidia.yml), beside upstream's names.
+RELEASE = [{"name": n, "browser_download_url": f"https://x/{n}"} for n in (
+    "trellis-cuda12-linux-x64.tar.gz", "trellis-cuda12-windows-x64.zip",
+    "pixal3d-cuda12-linux-x64.tar.gz", "pixal3d-cuda12-windows-x64.zip",
+)]
+
+
+@pytest.mark.parametrize("key,expected", [
+    ("linux-nvidia", "pixal3d-cuda12-linux-x64.tar.gz"),
+    ("windows-nvidia", "pixal3d-cuda12-windows-x64.zip"),
+])
+def test_prebuilt_is_our_own_build_for_this_os(key, expected):
+    """Ours, not upstream's: theirs is compiled for 2016-17 cards and lacks our patches."""
+    assert boot.pick_prebuilt(RELEASE, key)["name"] == expected
+
+
+def test_missing_prebuilt_is_none():
+    assert boot.pick_prebuilt(RELEASE[:2], "linux-nvidia") is None
+
+
+def test_the_prebuilt_comes_from_this_repo_and_the_workflow_builds_the_pinned_commit():
+    assert "/repos/Bingeljell/image-to-3dlab/" in boot.RELEASE_API
+    workflow = (boot.REPO / ".github" / "workflows" / "pixal3d-nvidia.yml").read_text()
+    for name, _ in boot.PREBUILTS.values():
+        assert name in workflow
+    assert "PREBUILT_COMMIT" in workflow
+
+
+def test_the_nvidia_download_can_take_skins_like_the_mac_build():
+    # Skins repaint a model's saved shape; without the shape-reuse patch the NVIDIA download
+    # could only say "rebuild", and a rebuild fetched the same download again (2026-10-22).
+    workflow = (boot.REPO / ".github" / "workflows" / "pixal3d-nvidia.yml").read_text()
+    assert "patch_pixal3d_shape_reuse.py" in workflow
+    assert "PIXAL3D_LOAD_SHAPE" in workflow.split("for marker in")[1].split("\n")[0]
+    # The commit Skins were built and tested on, not an older one.
+    assert boot.PREBUILT_COMMIT == boot.MAC_COMMIT
+    assert boot.PREBUILT_COMMIT[:7] in boot.PREBUILT_RELEASE
+
+
+def test_every_prebuilt_has_a_pinned_checksum():
+    assert set(boot.PREBUILT_SHA256) == {name for name, _ in boot.PREBUILTS.values()}
+    assert all(len(h) == 64 for h in boot.PREBUILT_SHA256.values())
+
+
+def test_a_download_with_the_wrong_checksum_is_refused_and_removed(tmp_path):
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(b"not what was built")
+    with pytest.raises(SystemExit, match="checksum"):
+        boot.verify_download(archive, "0" * 64)
+    assert not archive.exists()
+
+
+def test_a_download_with_the_right_checksum_passes(tmp_path):
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(b"built")
+    boot.verify_download(archive, hashlib.sha256(b"built").hexdigest())
+    assert archive.exists()
+
+
+def _tarball(path: Path, members: dict[str, bytes], links: dict[str, str]) -> None:
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+        for name, target in links.items():
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            tar.addfile(info)
+
+
+def test_unpacking_a_linux_prebuilt_keeps_library_symlinks_and_runs(tmp_path, monkeypatch):
+    """The CUDA tarball carries `libcudart.so.12 -> libcudart.so.12.9.79` style links; a
+    flattened copy that loses them fails to load at run time, not at install time."""
+    monkeypatch.setattr(boot.host, "os_family", lambda *a: "linux")
+    archive = tmp_path / "t.tar.gz"
+    _tarball(archive, {"./trellis-cli": b"x", "./libcudart.so.12.9.79": b"x"},
+             {"libcudart.so.12": "libcudart.so.12.9.79"})
+    build = tmp_path / "build"
+    cli = boot.unpack_prebuilt(archive, build)
+    assert cli == build / "trellis-cli"
+    assert cli.stat().st_mode & 0o111
+    assert (build / "libcudart.so.12").is_symlink()
+
+
+def test_unpacking_a_windows_prebuilt_finds_the_exe(tmp_path, monkeypatch):
+    monkeypatch.setattr(boot.host, "os_family", lambda *a: "windows")
+    archive = tmp_path / "t.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("trellis-cli.exe", "x")
+        z.writestr("cudart64_12.dll", "x")
+    assert boot.unpack_prebuilt(archive, tmp_path / "build").name == "trellis-cli.exe"
+
+
+def test_an_archive_without_the_cli_is_an_error_not_a_silent_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(boot.host, "os_family", lambda *a: "linux")
+    archive = tmp_path / "t.tar.gz"
+    _tarball(archive, {"./README": b"x"}, {})
+    with pytest.raises(SystemExit, match="no trellis-cli"):
+        boot.unpack_prebuilt(archive, tmp_path / "build")
+
+
+def test_matting_model_is_moved_flat_where_trellis_cli_looks(tmp_path):
+    (tmp_path / "q8").mkdir()
+    (tmp_path / "q8" / "birefnet.gguf").write_text("x")
+    boot.flatten_matte(tmp_path)
+    assert (tmp_path / "birefnet.gguf").exists()
+    assert not (tmp_path / "q8").exists()
+    boot.flatten_matte(tmp_path)  # idempotent
+
+
+def test_the_viewer_runs_this_script_with_yes():
+    """The browser dialog is the confirmation; asking again on a detached stdin hangs."""
+    import download_api
+
+    command = download_api.COMMANDS["pixal3d"]
+    assert command[1].endswith("bootstrap_pixal3d.py") and "--yes" in command
+
+
+# Pixal3D's CUDA 12 prebuilt is compiled with CUDA 12.9. On the RunPod 4090 (driver 570,
+# CUDA 12.8) it died at its first kernel: "the provided PTX was compiled with an
+# unsupported toolchain". On a newer driver it runs, at about half the speed of a local
+# compile (390 s against ~190 s, RunPod 2026-09-23), but the compile took 15 minutes on an
+# A40 pod (2026-10-02). So the prebuilt wins whenever the driver can run it; a compiler is
+# the fallback for an old driver.
+NVCC = "/usr/local/cuda/bin/nvcc"
+
+
+@pytest.mark.parametrize("key,cuda,nvcc,nvcc_cuda,expected", [
+    ("linux-nvidia", (12, 9), None, None, "prebuilt"),
+    ("linux-nvidia", (13, 0), NVCC, (12, 8), "prebuilt"),
+    # Driver too old for the prebuilt: compile instead.
+    ("linux-nvidia", (12, 8), NVCC, (12, 8), "cuda-source"),
+    # A version we could not read is tried rather than refused.
+    ("linux-nvidia", (12, 8), NVCC, None, "cuda-source"),
+    # A toolkit newer than the driver builds kernels the driver cannot run.
+    ("linux-nvidia", (13, 0), NVCC, (13, 1), "prebuilt"),
+    ("linux-nvidia", (12, 8), NVCC, (13, 0), None),
+    ("linux-nvidia", (12, 8), None, None, None),
+    ("linux-nvidia", None, None, None, None),
+    ("windows-nvidia", (12, 9), None, None, "prebuilt"),
+    # A Windows source build is a Visual Studio project of its own; not offered.
+    ("windows-nvidia", (12, 8), "C:/cuda/nvcc.exe", (12, 8), None),
+    ("windows-nvidia", (13, 0), "C:/cuda/nvcc.exe", (12, 8), "prebuilt"),
+    ("macos-arm64", None, None, None, "metal-source"),
+])
+def test_the_driver_and_compiler_pick_the_route(key, cuda, nvcc, nvcc_cuda, expected):
+    assert boot.build_kind(key, cuda, nvcc, nvcc_cuda) == expected
+
+
+def test_a_compile_can_be_asked_for_when_it_would_run():
+    """For an agent following the README's "compile it locally" note."""
+    assert boot.build_kind("linux-nvidia", (13, 0), NVCC, (12, 8),
+                           prefer_compile=True) == "cuda-source"
+    # Asking for it with no compiler still gets the prebuilt.
+    assert boot.build_kind("linux-nvidia", (13, 0), None, None,
+                           prefer_compile=True) == "prebuilt"
+
+
+def test_the_compile_flag_reaches_the_route(monkeypatch):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "driver_cuda", lambda: (13, 0))
+    monkeypatch.setattr(boot, "find_nvcc", lambda: NVCC)
+    monkeypatch.setattr(boot, "nvcc_cuda", lambda _: (12, 8))
+    monkeypatch.setattr(boot, "build_present", lambda: False)
+    chosen = []
+    monkeypatch.setattr(boot, "install_build", lambda key, kind: chosen.append(kind))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: None)
+    assert boot.main(["--yes", "--compile"]) == 0
+    assert boot.main(["--yes"]) == 0
+    assert chosen == ["cuda-source", "prebuilt"]
+
+
+def test_an_old_driver_without_a_compiler_is_told_what_to_update(monkeypatch, capsys):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "driver_cuda", lambda: (12, 8))
+    monkeypatch.setattr(boot, "find_nvcc", lambda: None)
+    monkeypatch.setattr(boot, "build_present", lambda: False)
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("downloaded"))
+    assert boot.main(["--yes"]) == 1
+    out = capsys.readouterr().out
+    assert "575" in out and "12.8" in out
+
+
+def test_an_old_driver_with_a_compiler_announces_a_local_cuda_build(monkeypatch):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "driver_cuda", lambda: (12, 8))
+    monkeypatch.setattr(boot, "find_nvcc", lambda: NVCC)
+    monkeypatch.setattr(boot, "nvcc_cuda", lambda _: (12, 8))
+    text = boot.announcement()
+    assert "compiled locally with CUDA" in text and "prebuilt" not in text
+    # Says why it is compiling, and that a driver update skips the wait.
+    assert "12.8" in text and "575" in text and "about a minute" in text
+
+
+def test_choosing_to_compile_on_a_new_driver_gets_no_driver_advice(monkeypatch, new_driver):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "find_nvcc", lambda: NVCC)
+    monkeypatch.setattr(boot, "nvcc_cuda", lambda _: (12, 8))
+    assert "575" not in boot.announcement(prefer_compile=True)
+
+
+def test_cuda_source_build_targets_this_card(monkeypatch):
+    flags = boot.cmake_flags("cuda-source", nvcc="/usr/local/cuda/bin/nvcc", arch="89")
+    assert "-DGGML_CUDA=ON" in flags
+    assert "-DCMAKE_CUDA_ARCHITECTURES=89" in flags
+    assert "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc" in flags
+
+
+def test_cuda_source_build_without_a_known_card_lets_cmake_ask():
+    flags = boot.cmake_flags("cuda-source", nvcc="nvcc", arch=None)
+    assert "-DCMAKE_CUDA_ARCHITECTURES=native" in flags
+
+
+def test_metal_build_passes_no_cuda_flags():
+    assert not any("CUDA" in f for f in boot.cmake_flags("metal-source"))
+
+
+# --- AMD: HIP, compiled here, because upstream ships no AMD prebuilt ----------------------
+# GGML_HIP is ggml's own switch; HIPBLAS is the math library underneath it. Neither is CUDA
+# on an AMD card, so a build that passes either would compile nothing that can run.
+HIPCC = "/opt/rocm/bin/hipcc"
+
+
+@pytest.mark.parametrize("hipcc,gfx,expected", [
+    (HIPCC, ["gfx1100"], "hip-source"),
+    # The compiler without the card would build for an ISA nobody has.
+    (HIPCC, [], None),
+    (HIPCC, None, None),
+    # A card with no ROCm toolchain: the machine can be named AMD and still have no route.
+    (None, ["gfx1100"], None),
+])
+def test_amd_compiles_with_hip_when_both_halves_are_there(hipcc, gfx, expected):
+    assert boot.build_kind("linux-amd", None, None, None, False, hipcc, gfx) == expected
+
+
+def test_amd_ignores_the_nvidia_answer():
+    """An AMD box with an old NVIDIA driver left in the machine must not be sent down the
+    prebuilt route: it has no AMD prebuilt."""
+    assert boot.build_kind("linux-amd", (12, 9), None, None, False, HIPCC,
+                           ["gfx1100"]) == "hip-source"
+
+
+def test_the_hip_build_is_given_rocms_clang_not_the_hipcc_wrapper(monkeypatch, tmp_path):
+    """CMake refuses hipcc outright ("CMAKE_HIP_COMPILER is set to the hipcc wrapper ... This
+    is not supported"), so naming it makes configure fail on every AMD machine. It is the
+    Clang beside it that goes in the flag."""
+    monkeypatch.setattr(boot, "find_hipcc", lambda: HIPCC)
+    monkeypatch.setattr(boot.Path, "exists",
+                        lambda self: str(self).endswith(("llvm/bin/clang++",)))
+    assert boot.hip_compiler(HIPCC) == "/opt/rocm/llvm/bin/clang++"
+    flags = boot.cmake_flags("hip-source", hipcc=HIPCC, gfx=["gfx1100"])
+    compiler = next(f for f in flags if f.startswith("-DCMAKE_HIP_COMPILER="))
+    assert compiler == "-DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++"
+
+
+def test_no_rocm_clang_means_no_compiler_flag_at_all(monkeypatch, tmp_path):
+    """Better an absent flag CMake can resolve itself than a wrong one. This is the shape
+    of the failure: the HIP SDK without its compiler, which is what a partial ROCm install
+    gives you."""
+    monkeypatch.setattr(boot, "find_hipcc", lambda: HIPCC)
+    monkeypatch.setattr(boot.Path, "exists", lambda self: False)
+    assert boot.hip_compiler(HIPCC) is None
+    assert not any("HIP_COMPILER" in f
+                   for f in boot.cmake_flags("hip-source", hipcc=HIPCC, gfx=["gfx1100"]))
+
+
+def test_no_rocm_at_all_means_no_compiler(monkeypatch):
+    monkeypatch.setattr(boot, "find_hipcc", lambda: None)
+    assert boot.hip_compiler() is None
+
+
+def test_hip_build_names_the_card_in_both_spellings():
+    """ggml reads AMDGPU_TARGETS and CMake's HIP language reads CMAKE_HIP_ARCHITECTURES.
+    ggml only falls back to the first when the second is unset, so both get the list."""
+    flags = boot.cmake_flags("hip-source", hipcc=HIPCC, gfx=["gfx1100"])
+    assert "-DGGML_HIP=ON" in flags
+    assert "-DCMAKE_HIP_ARCHITECTURES=gfx1100" in flags
+    assert "-DAMDGPU_TARGETS=gfx1100" in flags
+    assert not any("CUDA" in f for f in flags)
+
+
+def test_hip_build_points_cmake_at_rocm():
+    """Without ROCm's own directory, CMake's HIP support cannot find the runtime."""
+    flags = boot.cmake_flags("hip-source", hipcc=HIPCC, gfx=["gfx1100"])
+    assert any("CMAKE_PREFIX_PATH" in f for f in flags)
+    assert any(f.startswith("-DROCM_PATH=") for f in flags)
+
+
+def test_two_cards_compile_for_both():
+    flags = boot.cmake_flags("hip-source", hipcc=HIPCC, gfx=["gfx1100", "gfx1200"])
+    assert "-DAMDGPU_TARGETS=gfx1100;gfx1200" in flags
+
+
+def test_extra_cmake_flags_come_from_the_environment():
+    """A card ROCm needs help with (a HIPBLASLt build, say) must not need a fork of this
+    script to pass one flag."""
+    assert boot.extra_cmake_flags({}) == []
+    env = {boot.EXTRA_CMAKE_FLAGS: "-DGGML_HIPBLASLT=ON -DGGML_VMM=OFF"}
+    assert boot.extra_cmake_flags(env) == ["-DGGML_HIPBLASLT=ON", "-DGGML_VMM=OFF"]
+
+
+def test_amd_announces_a_hip_compile_and_its_size(monkeypatch):
+    monkeypatch.setattr(boot, "target", lambda: "linux-amd")
+    monkeypatch.setattr(boot, "find_hipcc", lambda: HIPCC)
+    monkeypatch.setattr(boot, "gfx_targets", lambda: ["gfx1100"])
+    text = boot.announcement()
+    assert "HIP" in text and "8.4 GB" in text and "MIT" in text
+    # The 10-20 minutes is the thing a user needs to know before agreeing to it.
+    assert "10-20 minutes" in text
+
+
+def test_amd_without_the_hip_sdk_is_told_which_package_installs_it(monkeypatch, capsys):
+    monkeypatch.setattr(boot, "target", lambda: "linux-amd")
+    monkeypatch.setattr(boot, "find_hipcc", lambda: None)
+    monkeypatch.setattr(boot, "build_present", lambda: False)
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("downloaded"))
+    assert boot.main(["--yes"]) == 1
+    out = capsys.readouterr().out
+    assert "rocm-hip-sdk" in out and "Nothing downloaded" in out
+
+
+def test_amd_with_a_compiler_but_no_readable_card_can_be_told_the_target(monkeypatch, capsys):
+    """rocminfo can be missing from a container that has the SDK. Refusing outright would
+    strand it, so the answer is how to name the card by hand."""
+    monkeypatch.setattr(boot, "target", lambda: "linux-amd")
+    monkeypatch.setattr(boot, "find_hipcc", lambda: HIPCC)
+    monkeypatch.setattr(boot, "gfx_targets", list)
+    monkeypatch.setattr(boot, "build_present", lambda: False)
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("downloaded"))
+    assert boot.main(["--yes"]) == 1
+    out = capsys.readouterr().out
+    assert "PIXAL3D_CMAKE_FLAGS" in out and "gfx1100" in out
+
+
+def test_an_unreadable_amd_card_does_not_reach_the_weights(monkeypatch):
+    """The one case that must never fall through: hipcc present, no gfx target, so CMake
+    would pick an ISA of its own choosing and the binary would miss every kernel."""
+    monkeypatch.setattr(boot, "target", lambda: "linux-amd")
+    monkeypatch.setattr(boot, "find_hipcc", lambda: HIPCC)
+    monkeypatch.setattr(boot, "gfx_targets", list)
+    monkeypatch.setattr(boot, "build_present", lambda: False)
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("downloaded"))
+    assert boot.main(["--yes"]) == 1
+
+
+def test_the_hip_build_says_hip_not_cuda_on_its_progress_line(monkeypatch, capsys):
+    """A 20-minute compile that announces CUDA on an AMD machine is a user who stops and
+    assumes the tool picked the wrong card."""
+    ran = []
+    monkeypatch.setattr(boot.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(boot, "fetch_source", lambda ref: None)
+    monkeypatch.setattr(boot, "apply_steps_patch", lambda: True)
+    monkeypatch.setattr(boot, "apply_dump_patch", lambda: True)
+    monkeypatch.setattr(boot, "apply_shape_patch", lambda: True)
+    monkeypatch.setattr(boot, "gfx_targets", lambda: ["gfx1100"])
+    monkeypatch.setattr(boot, "find_hipcc", lambda: HIPCC)
+    # ROCm's Clang is looked up on disk; this test is about the label, not the lookup,
+    # and must pass on a machine with no ROCm installed.
+    monkeypatch.setattr(boot, "hip_compiler", lambda hipcc=None: "/opt/rocm/llvm/bin/clang++")
+    monkeypatch.setattr(boot, "build_present", lambda: True)
+    monkeypatch.setattr(boot.subprocess, "run",
+                        lambda command, **kw: ran.append(command))
+    boot.build_from_source("hip-source")
+    assert "Building (HIP)" in capsys.readouterr().out
+    configure = next(c for c in ran if c[0] == "cmake")
+    assert "-DGGML_HIP=ON" in configure
+    assert not any("CUDA" in flag for flag in configure)
+
+
+def test_the_hip_build_fetches_the_tested_commit():
+    """The same commit the CUDA build pins, so AMD and NVIDIA run the same code."""
+    assert boot.source_ref("hip-source") == boot.PREBUILT_COMMIT
+
+
+def test_a_hip_build_rebuilds_in_place_like_any_other_source_build():
+    assert boot.build_decision(True, True, "hip-source") == "rebuild"
+
+
+def test_the_build_command_names_a_job_count():
+    """A bare `-j` is unbounded: dozens of nvcc jobs on a 96-CPU, 31 GB pod got OOM-killed."""
+    command = boot.build_command(jobs=10)
+    assert command[-2:] == ["-j", "10"]
+    assert "trellis-cli" in command
+
+
+def test_the_build_includes_post_replay():
+    """The Pixal3D Finish route reruns Pixal3D's own clean-up through it."""
+    assert "post-replay" in boot.build_command(jobs=4)
+
+
+def test_a_failed_dump_patch_does_not_fail_the_install(capsys):
+    def runner(command, **kwargs):
+        assert command[-1].endswith("patch_pixal3d_dump_continue.py")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="anchor found 0 times")
+    assert boot.apply_dump_patch(runner) is False
+    assert "classic route" in capsys.readouterr().out
+
+
+def test_a_failed_shape_patch_does_not_fail_the_install(capsys):
+    """Upstream moving an anchor must cost new skins, not the whole install."""
+    def runner(command, **kwargs):
+        assert command[-1].endswith("patch_pixal3d_shape_reuse.py")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="anchor found 0 times")
+    assert boot.apply_shape_patch(runner) is False
+    assert "new skins" in capsys.readouterr().out
+
+
+def test_a_failed_steps_patch_does_not_fail_the_install(capsys):
+    """Upstream moving the anchor must cost the speed-up, not the whole install."""
+    def runner(command, **kwargs):
+        assert command[-1].endswith("patch_pixal3d_steps.py")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="anchor not found")
+    assert boot.apply_steps_patch(runner) is False
+    assert "12 steps" in capsys.readouterr().out
+
+
+def test_a_successful_steps_patch_is_reported(capsys):
+    def runner(command, **kwargs):
+        return types.SimpleNamespace(returncode=0, stdout="patched flow_runner.cpp", stderr="")
+    assert boot.apply_steps_patch(runner) is True
+
+
+# --- Rebuilding an existing install so it picks up our patches ------------------------------
+
+
+@pytest.mark.parametrize("present, rebuild, kind, expected", [
+    (False, False, "metal-source", "install"),
+    (False, True, "metal-source", "install"),
+    (True, False, "metal-source", "keep"),
+    (True, True, "metal-source", "rebuild"),
+    (True, True, "cuda-source", "rebuild"),
+    (True, True, "prebuilt", "cannot-rebuild"),
+])
+def test_an_existing_build_is_only_rebuilt_when_asked(present, rebuild, kind, expected):
+    """0.3.4's 8-step default needs the steps patch compiled in; before --rebuild, an
+    existing install printed "leaving it alone" and the release notes' command did nothing."""
+    assert boot.build_decision(present, rebuild, kind) == expected
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_upstreams_old_prebuilt_is_replaced_with_ours(rebuild):
+    """Upstream's download has no post-replay; running setup again swaps in our build."""
+    assert boot.build_decision(True, rebuild, "prebuilt", stale=True) == "install"
+
+
+def test_a_build_without_post_replay_is_stale(tmp_path, monkeypatch):
+    monkeypatch.setattr(boot.host, "os_family", lambda *a: "linux")
+    (tmp_path / "trellis-cli").write_text("x")
+    assert boot.build_stale(tmp_path) is True
+    (tmp_path / "post-replay").write_text("x")
+    assert boot.build_stale(tmp_path) is False
+
+
+def test_rebuild_reaches_the_build_decision(monkeypatch, capsys):
+    """--rebuild on an existing Mac build recompiles instead of leaving it alone."""
+    calls = []
+    monkeypatch.setattr(boot, "target", lambda: "macos-arm64")
+    monkeypatch.setattr(boot, "current_kind", lambda key, prefer=False: "metal-source")
+    monkeypatch.setattr(boot, "build_present", lambda: True)
+    monkeypatch.setattr(boot, "rebuild_existing", lambda: calls.append("rebuild"))
+    monkeypatch.setattr(boot, "build_from_source", lambda kind: calls.append("fresh"))
+    monkeypatch.setattr(boot, "install_weights", lambda: calls.append("weights"))
+    assert boot.main(["--build-only", "--rebuild", "--yes"]) == 0
+    assert calls == ["rebuild"]
+    assert "Rebuilding" in capsys.readouterr().out
+
+
+def test_a_rebuild_patches_then_compiles_without_the_fresh_install_checks(monkeypatch):
+    """No Metal-compiler probe: a fresh Terminal usually cannot see it, and C++ is all
+    that changes."""
+    ran = []
+
+    def runner(command, **kwargs):
+        ran.append(command)
+        return types.SimpleNamespace(returncode=0, stdout="patched", stderr="")
+
+    monkeypatch.setattr(boot, "build_present", lambda: True)
+    boot.rebuild_existing(runner)
+    assert ran[0][-1].endswith("patch_pixal3d_steps.py")
+    assert ran[1][-1].endswith("patch_pixal3d_dump_continue.py")
+    assert ran[2][-1].endswith("patch_pixal3d_shape_reuse.py")
+    assert ran[3][:2] == ["cmake", "--build"]
+    assert not any("xcrun" in part for command in ran for part in command)
+
+
+def test_announcement_names_the_background_remover_it_brings(monkeypatch, new_driver):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    assert "BiRefNet-lite" in boot.announcement()
+
+
+def test_background_remover_is_fetched_once_and_only_when_missing(tmp_path):
+    """A fresh install fell back to u2net and lost a robot's arms (2026-09-30)."""
+    target = tmp_path / "birefnet-general-lite.onnx"
+    fetched = []
+    boot.install_background_remover(target, download=lambda t: fetched.append(t))
+    assert fetched == [target]
+    target.write_bytes(b"x")
+    boot.install_background_remover(target, download=lambda t: pytest.fail("refetched"))
+
+
+def test_the_cuda_source_build_fetches_the_tested_commit():
+    assert boot.source_ref("cuda-source") == boot.PREBUILT_COMMIT
+    assert len(boot.PREBUILT_COMMIT) == 40
+
+
+
+def test_the_mac_source_build_fetches_a_pinned_commit_not_the_newest():
+    """Skins repaint saved shapes; a new upstream could change what a shape file means."""
+    assert boot.source_ref("metal-source") == boot.MAC_COMMIT
+    assert len(boot.MAC_COMMIT) == 40 and boot.MAC_COMMIT != "HEAD"
+
+
+def test_weights_come_from_the_tested_revisions(monkeypatch, tmp_path):
+    """A fresh install must get the files that were tested, not whatever was pushed since."""
+    seen = {}
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = lambda repo, **kw: seen.setdefault(repo, kw["revision"])
+    hub.hf_hub_download = lambda repo, name, **kw: seen.setdefault(repo, kw["revision"])
+    monkeypatch.setitem(__import__("sys").modules, "huggingface_hub", hub)
+    monkeypatch.setattr(boot, "install_background_remover", lambda: None)
+    boot.install_weights(tmp_path)
+    assert seen == {boot.WEIGHTS_REPO: boot.WEIGHTS_REVISION,
+                    boot.MATTE_REPO: boot.MATTE_REVISION}
+
+
+# --- multi-view (front + back) weights -------------------------------------------------------
+
+
+def test_multiview_announcement_names_backend_route_size_and_licence():
+    text = boot.multiview_announcement()
+    assert "Pixal3D" in text and "front + back" in text
+    assert f"{boot.MV_GB:.1f} GB" in text and "pixal3d-q8_0-v1" in text
+    assert "DINOv3" in text
+
+
+def test_multiview_downloads_only_the_four_flows_and_the_manifest():
+    assert sorted(boot.MV_DOWNLOAD) == sorted([
+        "pixal3d_ss_flow_mv.gguf", "pixal3d_shape_flow_512_mv.gguf",
+        "pixal3d_shape_flow_1024_mv.gguf", "pixal3d_tex_flow_1024_mv.gguf",
+        "pixal3d-models.json"])
+    assert not set(boot.MV_DOWNLOAD) & set(boot.MV_SHARED)
+
+
+def test_shared_files_are_linked_from_the_single_view_set(tmp_path):
+    sv, mv = tmp_path / "sv", tmp_path / "mv"
+    sv.mkdir()
+    for name in boot.MV_SHARED:
+        (sv / name).write_bytes(name.encode())
+    missing = boot.link_shared(sv, mv)
+    assert missing == []
+    for name in boot.MV_SHARED:
+        assert (mv / name).read_bytes() == name.encode()
+        assert (mv / name).stat().st_ino == (sv / name).stat().st_ino  # stored once
+
+
+def test_shared_files_missing_from_the_single_view_set_are_reported(tmp_path):
+    sv, mv = tmp_path / "sv", tmp_path / "mv"
+    sv.mkdir()
+    (sv / "dinov3.gguf").write_bytes(b"x")
+    missing = boot.link_shared(sv, mv)
+    assert sorted(missing) == sorted(n for n in boot.MV_SHARED if n != "dinov3.gguf")
+
+
+def test_multiview_without_yes_and_no_terminal_downloads_nothing(monkeypatch, new_driver):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot.sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(boot, "install_multiview", lambda *a: pytest.fail("downloaded"))
+    assert boot.main(["--multiview"]) == 1
+
+
+def test_multiview_with_yes_fetches_only_the_multiview_set(monkeypatch, new_driver):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("single-view fetched"))
+    fetched = []
+    monkeypatch.setattr(boot, "install_multiview", lambda *a: fetched.append(1))
+    assert boot.main(["--multiview", "--yes"]) == 0
+    assert fetched == [1]
+
+
+@pytest.mark.parametrize("flags,fetcher", [
+    (["--weights-only"], "install_weights"),
+    (["--multiview"], "install_multiview"),
+    ([], "install_weights"),  # built already: nothing to compile, so no compiler needed
+])
+def test_amd_without_hipcc_still_fetches_when_nothing_is_compiled(monkeypatch, flags, fetcher):
+    monkeypatch.setattr(boot, "target", lambda: "linux-amd")
+    monkeypatch.setattr(boot, "find_hipcc", lambda: None)
+    monkeypatch.setattr(boot, "build_present", lambda: True)
+    monkeypatch.setattr(boot, "install_build", lambda *a: pytest.fail("built"))
+    monkeypatch.setattr(boot, "rebuild_existing", lambda *a: pytest.fail("rebuilt"))
+    fetched = []
+    monkeypatch.setattr(boot, "install_weights", lambda *a: fetched.append("install_weights"))
+    monkeypatch.setattr(boot, "install_multiview",
+                        lambda *a: fetched.append("install_multiview"))
+    assert boot.main(["--yes", *flags]) == 0
+    assert fetched == [fetcher]
+
+
+def test_amd_without_hipcc_is_still_refused_a_rebuild(monkeypatch, capsys):
+    monkeypatch.setattr(boot, "target", lambda: "linux-amd")
+    monkeypatch.setattr(boot, "find_hipcc", lambda: None)
+    monkeypatch.setattr(boot, "build_present", lambda: True)
+    monkeypatch.setattr(boot, "rebuild_existing", lambda *a: pytest.fail("rebuilt"))
+    monkeypatch.setattr(boot, "install_weights", lambda *a: pytest.fail("downloaded"))
+    assert boot.main(["--yes", "--rebuild"]) == 1
+    assert "rocm-hip-sdk" in capsys.readouterr().out
+
+
+def fake_xcrun(works_with):
+    """An `xcrun` that finds Metal only when DEVELOPER_DIR is `works_with` (or always, for
+    "any"), recording each environment it was asked under."""
+    seen = []
+
+    def runner(command, env=None, **kwargs):
+        assert command == ["xcrun", "--find", "metal"]
+        developer = (env or {}).get("DEVELOPER_DIR")
+        seen.append(developer)
+        ok = works_with == "any" or developer == works_with
+        return types.SimpleNamespace(returncode=0 if ok else 1)
+
+    return runner, seen
+
+
+def make_xcode(apps: Path, name: str) -> str:
+    developer = apps / name / "Contents" / "Developer"
+    developer.mkdir(parents=True)
+    return str(developer)
+
+
+def test_metal_already_visible_changes_nothing(tmp_path):
+    runner, _ = fake_xcrun("any")
+    assert boot.find_metal(runner, apps=tmp_path, env={}) == {}
+
+
+def test_a_mac_on_the_command_line_tools_uses_the_installed_xcode(tmp_path):
+    """The Discord report: Metal toolchain installed into Xcode, but the Mac still pointed
+    at the Command Line Tools, so `xcrun` never looked in Xcode."""
+    xcode = make_xcode(tmp_path, "Xcode.app")
+    runner, seen = fake_xcrun(xcode)
+    assert boot.find_metal(runner, apps=tmp_path, env={}) == {"DEVELOPER_DIR": xcode}
+    assert seen == [None, xcode]
+
+
+def test_a_renamed_xcode_is_found_too(tmp_path):
+    xcode = make_xcode(tmp_path, "Xcode-26.3.app")
+    runner, _ = fake_xcrun(xcode)
+    assert boot.find_metal(runner, apps=tmp_path, env={}) == {"DEVELOPER_DIR": xcode}
+
+
+def test_plain_xcode_app_is_tried_first(tmp_path):
+    make_xcode(tmp_path, "Xcode-beta.app")
+    plain = make_xcode(tmp_path, "Xcode.app")
+    assert boot.xcode_apps(tmp_path)[0] == Path(plain)
+
+
+def test_no_metal_anywhere_returns_none(tmp_path):
+    make_xcode(tmp_path, "Xcode.app")
+    runner, _ = fake_xcrun("nowhere")
+    assert boot.find_metal(runner, apps=tmp_path, env={}) is None
+
+
+def test_the_message_without_xcode_says_install_xcode(tmp_path):
+    assert "App Store" in boot.metal_missing_message(tmp_path)
+
+
+def test_the_message_with_xcode_gives_the_commands_for_that_xcode(tmp_path):
+    xcode = make_xcode(tmp_path, "Xcode-26.3.app")
+    text = boot.metal_missing_message(tmp_path)
+    assert f"sudo xcode-select -s {xcode}" in text
+    assert "MetalToolchain" in text
+    assert "DEVELOPER_DIR" not in text  # meaningless to someone who clicked Install
+
+
+def test_the_metal_build_hands_the_found_xcode_to_cmake(monkeypatch):
+    monkeypatch.setattr(boot.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(boot, "find_metal", lambda: {"DEVELOPER_DIR": "/X/Developer"})
+    monkeypatch.setattr(boot, "fetch_source", lambda ref: None)
+    monkeypatch.setattr(boot, "apply_steps_patch", lambda: True)
+    monkeypatch.setattr(boot, "apply_dump_patch", lambda: True)
+    monkeypatch.setattr(boot, "apply_shape_patch", lambda: True)
+    monkeypatch.setattr(boot, "build_present", lambda: True)
+    env = {k: v for k, v in boot.os.environ.items() if k != "DEVELOPER_DIR"}
+    monkeypatch.setattr(boot.os, "environ", env)  # the build writes to it; keep that here
+    seen = []
+    monkeypatch.setattr(boot.subprocess, "run",
+                        lambda command, **kw: seen.append(boot.os.environ.get("DEVELOPER_DIR")))
+    boot.build_from_source("metal-source")
+    assert seen and all(d == "/X/Developer" for d in seen)
+
+
+def test_the_metal_build_stops_with_the_message_when_no_metal(monkeypatch):
+    monkeypatch.setattr(boot.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(boot, "find_metal", lambda: None)
+    monkeypatch.setattr(boot, "metal_missing_message", lambda: "install Xcode")
+    with pytest.raises(SystemExit, match="install Xcode"):
+        boot.build_from_source("metal-source")

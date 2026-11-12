@@ -1,0 +1,4692 @@
+#!/usr/bin/env python3
+"""Small, local-only HTTP job API for the viewer's Generate mode.
+
+This module deliberately uses only the standard library at import time.  The expensive clean
+TRELLIS interpreter is started in a separate process only after a browser submits a job; importing
+the viewer server, running its tests, or serving Compare never imports torch.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from email import policy
+from email.parser import BytesParser
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler
+from pathlib import Path
+from typing import Any, ClassVar
+from urllib.parse import parse_qs, unquote, urlparse
+
+# Sibling import must also work when tests load this file directly via importlib.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import activity_api
+import backend_catalog
+import bug_report_api
+import fixspot_api
+import hf_api
+import image_api
+import model_info_api
+import notices_api
+import preview_api
+import request_utils
+import skins_api
+import studio_auth
+import usage_api
+from activity_api import ChainRunner, chain_from_form, read_history
+from assets_api import assets_payload, list_assets
+from assets_api import delete_version as delete_asset_version
+from assets_api import plan_delete as plan_asset_delete
+from assets_api import set_hidden as set_asset_hidden
+from assets_api import set_main as set_asset_main
+from assets_api import set_name as set_asset_name
+from assets_api import thumbnail as asset_thumbnail
+from autorig_api import (
+    ANIMATE_JOBS,
+)
+from autorig_api import (
+    aliases as animate_aliases,
+)
+from autorig_api import (
+    cancel_job as cancel_animate_job,
+)
+from autorig_api import (
+    installed as autorig_installed,
+)
+from autorig_api import (
+    pickable_models as animate_models,
+)
+from autorig_api import (
+    presets as animate_presets,
+)
+from autorig_api import (
+    resolve_model as resolve_animate_model,
+)
+from autorig_api import (
+    run_job as run_animate_job,
+)
+from autorig_api import (
+    source_record_for as animate_source_record,
+)
+from autorig_api import (
+    status_payload as animate_status_payload,
+)
+from backend_catalog import (
+    AMD,
+    APPLE,
+    NVIDIA,
+    _dir_state,
+    catalog_status,
+    host_platform,
+)
+from backend_catalog import (
+    readiness as catalog_readiness,
+)
+from download_api import (
+    DOWNLOADS,
+    also_fetches,
+    rebuild_download,
+    rebuild_reason,
+    running_payload,
+)
+from download_api import (
+    active as download_active,
+)
+from download_api import (
+    cancel as cancel_download,
+)
+from download_api import (
+    remove as remove_weights,
+)
+from download_api import (
+    start as start_download,
+)
+from download_api import (
+    status_payload as download_status_payload,
+)
+from finish_api import (
+    ARTIFACTS as FINISH_ARTIFACTS,
+)
+from finish_api import (
+    FINISH_JOBS,
+)
+from finish_api import (
+    cancel_job as cancel_finish_job,
+)
+from finish_api import (
+    capabilities as finish_capabilities,
+)
+from finish_api import (
+    list_runs as list_finish_runs,
+)
+from finish_api import (
+    run_job as run_finish_job,
+)
+from finish_api import (
+    status_payload as finish_status_payload,
+)
+from props_api import (
+    PROPS_JOBS,
+    generated_model,
+    generated_models,
+    gltfpack_install_command,
+    source_record_for,
+)
+from props_api import (
+    cancel_job as cancel_props_job,
+)
+from props_api import (
+    list_runs as list_props_runs,
+)
+from props_api import (
+    run_job as run_props_job,
+)
+from props_api import (
+    status_payload as props_status_payload,
+)
+from props_api import (
+    tools_payload as props_tools_payload,
+)
+from rig_api import (
+    ARTIFACTS as RIG_ARTIFACTS,
+)
+from rig_api import (
+    RIG_JOBS,
+)
+from rig_api import (
+    cancel_job as cancel_rig_job,
+)
+from rig_api import (
+    run_job as run_rig_job,
+)
+from rig_api import (
+    status_payload as rig_status_payload,
+)
+from update_api import check as update_check
+from welcome_api import payload as welcome_payload
+
+from image_to_3dlab import models_home, processes
+from image_to_3dlab.blender import find_blender
+from image_to_3dlab.blender import missing_help as blender_missing_help
+from image_to_3dlab.gpu_memory import gpu_busy_note
+from image_to_3dlab.host import (
+    executable,  # image_api put the repo on sys.path
+    find_uv,
+)
+
+import motion_api
+from motion_api import (
+    MOTION_JOBS,
+    cancel_job as cancel_motion_job,
+    installed as motion_installed,
+    missing_note as motion_missing_note,
+    presets as motion_presets,
+    run_job as run_motion_job,
+    source_record_for as motion_source_record,
+    status_payload as motion_status_payload,
+)
+
+REPO = Path(__file__).resolve().parents[1]
+WRAPPER = REPO / "scripts" / "trellis_space_generate.py"
+PYTHON = REPO / "vendor" / "trellis-space-mac" / ".venv" / "bin" / "python"
+TRELLIS_VENDOR = REPO / "vendor" / "trellis-space-mac"
+# The dispatch branch scripts/patch_trellis_mlx_attention.py injects. Its presence is how
+# we know the vendored checkout can actually serve SPARSE_ATTN_BACKEND=mlx.
+MLX_DISPATCH_FILE = TRELLIS_VENDOR / "TRELLIS.2" / "trellis2" / "modules" / "sparse" / "attention" / "full_attn.py"
+MLX_DISPATCH_MARKER = "config.ATTN == 'mlx'"
+# TRELLIS.2 on Linux + NVIDIA: Microsoft's own checkout, built by
+# scripts/bootstrap_trellis_cuda.py. The Mac constants above are untouched.
+TRELLIS_CUDA_VENDOR = REPO / "vendor" / "trellis-cuda"
+TRELLIS_CUDA_WRAPPER = REPO / "scripts" / "trellis_cuda_generate.py"
+TRELLIS_CUDA_PYTHON = TRELLIS_CUDA_VENDOR / ".venv" / "bin" / "python"
+TRELLIS_CUDA_MARKER = TRELLIS_CUDA_VENDOR / ".i2l-build-complete"
+# TRELLIS.2 on Linux + AMD: the same pinned checkout, built with HIP by
+# scripts/bootstrap_trellis_rocm.py. Its own venv and its own build, because the two are
+# different compiled builds of one source and sharing a directory would have one card's
+# extensions overwriting the other's.
+TRELLIS_ROCM_VENDOR = REPO / "vendor" / "trellis-rocm"
+TRELLIS_ROCM_WRAPPER = REPO / "scripts" / "trellis_rocm_generate.py"
+TRELLIS_ROCM_PYTHON = TRELLIS_ROCM_VENDOR / ".venv" / "bin" / "python"
+TRELLIS_ROCM_MARKER = TRELLIS_ROCM_VENDOR / ".i2l-build-complete"
+# Hunyuan3D-2.1 on Linux + NVIDIA: Tencent's own checkout, built by
+# scripts/bootstrap_hunyuan_cuda.py. NVIDIA only; the Mac keeps the MLX routes.
+HUNYUAN_CUDA_VENDOR = REPO / "vendor" / "hunyuan-cuda"
+HUNYUAN_CUDA_WRAPPER = REPO / "scripts" / "hunyuan_cuda_generate.py"
+HUNYUAN_CUDA_PYTHON = HUNYUAN_CUDA_VENDOR / ".venv" / "bin" / "python"
+HUNYUAN_CUDA_MARKER = HUNYUAN_CUDA_VENDOR / ".i2l-build-complete"
+# Hunyuan3D-2.1 on Linux + AMD: the same upstream commit, compiled with hipcc instead of
+# nvcc by scripts/bootstrap_hunyuan_rocm.py. Its own vendor folder, because the weights
+# land there and a machine with both cards keeps both installs.
+HUNYUAN_ROCM_VENDOR = REPO / "vendor" / "hunyuan-rocm"
+HUNYUAN_ROCM_WRAPPER = REPO / "scripts" / "hunyuan_rocm_generate.py"
+HUNYUAN_ROCM_PYTHON = HUNYUAN_ROCM_VENDOR / ".venv" / "bin" / "python"
+HUNYUAN_ROCM_MARKER = HUNYUAN_ROCM_VENDOR / ".i2l-build-complete"
+# Stable Fast 3D on Linux + AMD: the same checkout as the Apple route, but in a venv of its
+# own, because its pins (numpy 1.26, transformers 4.42, an old huggingface-hub) break the
+# shared environment. Built by scripts/bootstrap_sf3d_rocm.py.
+SF3D_ROCM_VENDOR = REPO / "vendor" / "stable-fast-3d"
+SF3D_ROCM_PYTHON = SF3D_ROCM_VENDOR / ".venv" / "bin" / "python"
+SF3D_ROCM_MARKER = SF3D_ROCM_VENDOR / ".i2l-build-complete"
+OUTPUT_ROOT = REPO / "output"
+BASELINE_PATH = REPO / "viewer" / "generate_baseline.json"  # shipped default, never written
+# Timings learned on this machine. Under output/ (git-ignored): writing the tracked file
+# above left every install with a local edit, and the installer then refused to update.
+LEARNED_BASELINE_PATH = REPO / "output" / ".generate_baseline.json"
+TINYCLIP_ADVISOR = REPO / "scripts" / "classify_trellis_input.py"
+TINYCLIP_TIMEOUT_SECONDS = 300
+
+# dgrauet's shape stage stays vendored (Tencent-licensed code, not just weights — see
+# docs/info_and_credits.md). Its shape quality is genuinely the best we've tested
+# (2026-08-19 A/B against Xiong 2.0: no dents/dimples, 10/10), which is why the hybrid
+# stays around despite not being part of the clone-and-go simplification below.
+HUNYUAN_WRAPPER = REPO / "scripts" / "hunyuan_mlx_generate.py"
+HUNYUAN_PYTHON = REPO / "vendor" / "hunyuan-mlx" / ".venv" / "bin" / "python"
+PIXAL3D_ROOT = REPO / "vendor" / "pixal3d-cpp"
+# The models folder this run uses; a new choice in Setup waits for the next start.
+MODELS_STARTED_WITH = models_home.apply()
+MODELS_SETTING_REPO = REPO   # where output/.models-folder is kept; tests point it at a temp folder
+PIXAL3D_CLI = executable(PIXAL3D_ROOT / "build", "trellis-cli")
+PIXAL3D_MODELS = models_home.vendor_models("pixal3d-cpp") / "pixal3d-sv"
+PIXAL3D_WRAPPER = REPO / "scripts" / "pixal3d_generate.py"
+# Front + back: the multi-view set (scripts/bootstrap_pixal3d.py --multiview).
+PIXAL3D_MV_MODELS = models_home.vendor_models("pixal3d-cpp") / "pixal3d-q8_0-v1"
+
+# Routes that cut their own picture out with our remover (image_to_3dlab/matte.py), so the
+# server need not (requires_alpha=False). (backend id, host or None for any) -> the file
+# that does it. Every other route must set requires_alpha: an engine that trusts the alpha
+# of a Qwen picture (opaque noise) builds the backdrop as geometry.
+SELF_CUTTING: dict[tuple[str, str | None], str] = {
+    ("sf3d", None): "image_to_3dlab/sf3d_backend.py",
+    ("pixal3d", None): "scripts/pixal3d_generate.py",
+    ("hunyuan-cuda", None): "scripts/hunyuan_cuda_generate.py",
+    ("hunyuan-rocm", None): "scripts/hunyuan_rocm_generate.py",
+    ("trellis", "nvidia"): "scripts/trellis_cuda_generate.py",
+    # The AMD wrapper re-exports this script's prepare_image rather than copying it, so the
+    # file that does the cutting is the same on both Linux cards. Naming the AMD wrapper
+    # here would point the check at a file with no matte call in it.
+    ("trellis", "amd"): "scripts/trellis_cuda_generate.py",
+}
+
+# Xiong's paint+shape code is MIT and tracked in-repo at hunyuan_mlx/ (moved out of
+# vendor/hunyuan-mlx-paint 2026-08-19) — a fresh clone of this repo alone has the code;
+# only weights/ (git-ignored, downloaded) and .venv/ (uv sync) are still local-only.
+HUNYUAN_PAINT_VENV = REPO / "hunyuan_mlx" / "paint" / ".venv" / "bin" / "python"
+HUNYUAN_PAINT_WEIGHTS = REPO / "hunyuan_mlx" / "paint" / "weights" / "hunyuan3d-paintpbr-v2-1"
+
+# Single-repo variant: ZimengXiong's own shape stage (not dgrauet's) chained into their own
+# paint stage above — same paint venv/weights, different shape venv/weights entirely.
+# Model choice benchmarked 2026-08-19 — see docs/hunyuan-mlx-recipes.md; 2.0 is the
+# recommended default (Xiong's own pick too), 2.1 is not.
+HUNYUAN_XIONG_WRAPPER = REPO / "scripts" / "hunyuan_mlx_xiong_generate.py"
+HUNYUAN_XIONG_SHAPE_VENV = REPO / "hunyuan_mlx" / "shape" / ".venv" / "bin" / "python"
+HUNYUAN_XIONG_SHAPE_ROOT = REPO / "hunyuan_mlx" / "shape" / "weights"
+HUNYUAN_XIONG_SHAPE_MODELS = {
+    "2.1": HUNYUAN_XIONG_SHAPE_ROOT / "Hunyuan3D-2.1" / "hunyuan3d-dit-v2-1",
+    "2.0": HUNYUAN_XIONG_SHAPE_ROOT / "Hunyuan3D-2" / "hunyuan3d-dit-v2-0",
+    "2.0-turbo": HUNYUAN_XIONG_SHAPE_ROOT / "Hunyuan3D-2" / "hunyuan3d-dit-v2-0-turbo",
+}
+
+SF3D_REPO_DEFAULT = REPO / "vendor" / "stable-fast-3d"
+
+# Backend-selection vars the generator must own. A stale value inherited from the server's
+# environment silently selects the wrong backend (the conv_none crash); the subprocess env
+# drops them and the generator's configure_environment/require_flex_gemm pin them fresh.
+BACKEND_ENV_KEYS = (
+    "SPARSE_CONV_BACKEND",
+    "ATTN_BACKEND",
+    "SPARSE_ATTN_BACKEND",
+    "FLEX_GEMM_AUTOTUNE_CACHE_PATH",
+    # Owned per job: the attention precision is part of the chosen backend, so a value
+    # exported into the server's shell must not silently change what a run computes.
+    "I2L_MLX_ATTN_DTYPE",
+)
+
+HF_HUB_DIR = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+# dgrauet's shape weights. from_pretrained("dgrauet/hunyuan3d-2.1-mlx") reads this cache.
+HUNYUAN_SHAPE_REPO = HF_HUB_DIR / "models--dgrauet--hunyuan3d-2.1-mlx"
+WEIGHT_REPOS = (
+    ("models--microsoft--TRELLIS.2-4B", "TRELLIS.2-4B weights"),
+    ("models--facebook--dinov3-vitl16-pretrain-lvd1689m", "DINOv3 image encoder"),
+    (
+        "models--wkcn--TinyCLIP-ViT-8M-16-Text-3M-YFCC15M",
+        "TinyCLIP input advisor (~94 MB, advisory only)",
+    ),
+)
+
+
+def _job_env() -> dict[str, str]:
+    """Subprocess env for the generator: inherit everything except backend-selection vars.
+
+    The generator pins ATTN_BACKEND/SPARSE_ATTN_BACKEND/SPARSE_CONV_BACKEND itself; a stale
+    value in this server's environment (e.g. SPARSE_CONV_BACKEND=none exported earlier)
+    would otherwise be inherited and silently break the run.
+    """
+    env = processes.child_env()
+    for key in BACKEND_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+# Routes whose generator calls from_pretrained on a hub id when the files are absent.
+# The child is pinned offline so a missed readiness check cannot fetch. Setup's download
+# is the fetch, and it does not use this env.
+HUB_OFFLINE_ROUTES = frozenset({"trellis", "sf3d", "hunyuan-mlx"})
+
+
+def generate_child_env(backend_id: str) -> dict[str, str]:
+    """Environment for one generate child. These routes cannot reach the hub."""
+    env = _job_env()
+    if backend_id in HUB_OFFLINE_ROUTES:
+        env["HF_HUB_OFFLINE"] = "1"
+    return env
+
+
+def weights_needed(label: str, route: str, size: str) -> str:
+    """The sentence a not-ready card shows. Names the backend, the route and the size."""
+    return (f"{label} ({route}) needs its weights ({size}) before a run. "
+            "Download them from Setup & Status. Generation does not fetch them.")
+
+
+def weight_blocks_generate(weight: dict[str, Any]) -> bool:
+    """True when this catalogue row is not on disk in enough of a copy to run.
+
+    Advisory rows (the note says so) do not block. Rows that already carry byte counts
+    use the catalogue's 85% floor. Rows that only say present or not are taken at that.
+    """
+    if "Advisory only" in (weight.get("note") or ""):
+        return False
+    if "bytes_expected" in weight and "bytes_present" in weight:
+        expected = weight["bytes_expected"]
+        if expected <= 0:
+            return False
+        return weight["bytes_present"] < expected * 0.85
+    return not weight.get("present")
+
+
+def trellis_weight_gap(host: str | None = None) -> tuple[list[str], str]:
+    """Labels still short of the catalogue, and the size the card states."""
+    described = backend_catalog.BY_ID["trellis"].describe(host or host_platform())
+    missing = [w["label"] for w in described["weights"] if weight_blocks_generate(w)]
+    return missing, described["human_expected"]
+
+
+def linux_trellis_pipeline_present(host: str | None = None) -> bool:
+    """True when this card has a local TRELLIS.2 tree with pipeline.json.
+
+    That file is what makes the generator load the directory instead of the hub id.
+    Bytes in a folder that has no pipeline.json do not stop the hub call.
+    """
+    on_amd = (host or host_platform()) == AMD
+    vendor = TRELLIS_ROCM_VENDOR if on_amd else TRELLIS_CUDA_VENDOR
+    if (vendor / "models" / "TRELLIS.2-4B" / "pipeline.json").is_file():
+        return True
+    named = os.environ.get("I2L_TRELLIS_MODEL_PATH")
+    return bool(named and (Path(named) / "pipeline.json").is_file())
+
+
+def attention_backend_spec(choice: str) -> tuple[str, dict[str, str]]:
+    """Split a UI attention choice into the wrapper's flag and any env it needs.
+
+    Returns (value for --sparse-attn-backend, environment overrides). Pure, so the mapping
+    can be tested without launching anything.
+    """
+    if choice == "mlx-fp16":
+        return "mlx", {"I2L_MLX_ATTN_DTYPE": "fp16"}
+    if choice == "mlx":
+        return "mlx", {"I2L_MLX_ATTN_DTYPE": "fp32"}
+    return choice, {}
+
+
+def _human_bytes(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def weights_on_disk(cache_dir: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Report which model weights are already in the HF cache.
+
+    A first run with missing weights downloads ~14 GB in the background with no progress
+    bar, which reads as a hung 'load'. Surfacing this up front is what the setup card shows.
+    """
+    hub = (cache_dir or HF_HUB_DIR).resolve()
+    out: dict[str, dict[str, Any]] = {}
+    for repo, label in WEIGHT_REPOS:
+        path = hub / repo
+        if path.is_dir():
+            size = _dir_state(path)[1]
+            out[repo] = {"label": label, "present": True, "bytes": size,
+                         "human": _human_bytes(size)}
+        else:
+            out[repo] = {"label": label, "present": False, "bytes": 0, "human": "0 B"}
+    return out
+
+
+@dataclass(frozen=True)
+class BackendSpec:
+    """Everything the job runner needs to drive one generation backend.
+
+    ``parse_line`` is a handler, not a pure parser: it emits SSE events on ``job`` itself
+    (matching the shape of the pre-existing TRELLIS tqdm/banner handling) rather than
+    returning an event for the caller to emit — this keeps the well-tested TRELLIS path
+    untouched, just wrapped, instead of restructured.
+    """
+
+    id: str
+    label: str
+    interpreter: Path
+    wrapper: Path
+    default_settings: dict[str, Any]
+    stages: list[str]
+    stage_labels: dict[str, str]
+    requires_alpha: bool
+    validate_settings: Callable[[Any], dict[str, Any]]
+    build_args: Callable[[Job], list[str]]
+    parse_line: Callable[[Job, str], None]
+    readiness: Callable[[], dict[str, Any]]
+    baseline_path: Path | None = None
+    finalize: Callable[[Job], None] | None = None
+    """Runs after the subprocess exits 0, before the output-file existence check — for
+    backends whose wrapper doesn't write directly to job.output_path (SF3D writes
+    ``<stem>_sf3d.glb`` instead)."""
+    hidden_fields: tuple[str, ...] = ()
+    """Element ids of Generate-tab controls this spec ignores, so the page hides them
+    (the Mac-only attention option means nothing on the NVIDIA route)."""
+    gpu_memory_wanted: int | None = None
+    """Free VRAM this backend needs before it is worth starting, in bytes.
+
+    None for a backend that runs on the CPU or whose peak is unknowable in advance. Set
+    only to a floor a run genuinely cannot go below. The check warns and never refuses, so
+    an over-stated figure costs a needless heads-up, not a run that would have worked.
+    Measured on an RX 7900 XTX, where Pixal3D asked for an 11.1 GB block in one piece."""
+
+
+BACKENDS: dict[str, BackendSpec] = {}
+
+
+def backend_spec(backend_id: str) -> BackendSpec | None:
+    """The generator for a backend, by its own key or by the catalogue's id. The studio sends the
+    catalogue's (hunyuan_xiong); some generators are keyed otherwise (hunyuan-mlx-xiong), and
+    a plain lookup answered 'unknown backend' for an installed engine (issue #151)."""
+    spec = BACKENDS.get(backend_id)
+    if spec is None:
+        spec = next((BACKENDS.get(key) for key, catalog_id in backend_catalog.ALIASES.items()
+                     if catalog_id == backend_id), None)
+    return spec
+
+
+def gpu_busy_check(spec: BackendSpec) -> str | None:
+    """Why this backend may not fit on the card right now, or None if it should.
+
+    Every backend goes through here, and a backend with no declared `gpu_memory_wanted` gets
+    a `None` without the GPU being asked at all — a CPU route must never be warned about
+    having no card.
+    """
+    if spec.gpu_memory_wanted is None:
+        return None
+    return gpu_busy_note(spec.gpu_memory_wanted)
+
+
+def gpu_busy_warning(note: str | None) -> str | None:
+    """The busy note as a heads-up the run carries, never a reason to stop it."""
+    return f"Heads up: {note} This run may fail." if note else None
+
+
+def clean_port_build_present() -> bool:
+    """Whether the clean-port build (interpreter + wrapper) is installed."""
+    return PYTHON.is_file() and WRAPPER.is_file()
+
+
+def mlx_attention_status(vendor: Path | None = None, dispatch: Path | None = None) -> dict[str, Any]:
+    """Whether the mlx attention backend can actually run on this machine.
+
+    Two independent prerequisites, and the UI needs to distinguish them because the
+    remedies differ: the vendored checkout must carry the dispatch branch, and mlx must be
+    installed in that checkout's venv. Offering the backend without both produces a crash
+    partway into a run that has already cost real time.
+    """
+    vendor = vendor or TRELLIS_VENDOR
+    dispatch = dispatch or MLX_DISPATCH_FILE
+    try:
+        patched = dispatch.is_file() and MLX_DISPATCH_MARKER in dispatch.read_text(encoding="utf-8")
+    except OSError:
+        patched = False
+    package = any((vendor / ".venv" / "lib").glob("python*/site-packages/mlx"))
+
+    hints = []
+    if not package:
+        hints.append(
+            "install mlx into the backend venv: uv pip install --python "
+            f"{vendor / '.venv' / 'bin' / 'python'} mlx"
+        )
+    if not patched:
+        hints.append("apply the dispatch branch: python scripts/patch_trellis_mlx_attention.py")
+    return {
+        "patched": patched,
+        "package": package,
+        "ready": patched and package,
+        "hint": "; ".join(hints) or None,
+    }
+
+
+def backends_payload() -> dict:
+    """The Generate tab's routes. `runs_here` lets the page drop a route this machine cannot
+    run: an NVIDIA pod was offered the two Mac-only Hunyuan-MLX routes."""
+    def runs_here(spec_id: str) -> bool:
+        entry = backend_catalog.resolve(spec_id)
+        return True if entry is None else entry.runs_here(backend_catalog.host_platform())
+
+    return {"backends": [
+        {"id": spec.id, "label": spec.label, "requires_alpha": spec.requires_alpha,
+         "default_settings": spec.default_settings, "stages": spec.stages,
+         "stage_labels": spec.stage_labels, "hidden_fields": list(spec.hidden_fields),
+         "runs_here": runs_here(spec.id)}
+        for spec in BACKENDS.values()
+    ]}
+
+
+def hf_sign_in_response(payload: Any) -> tuple[int, dict]:
+    """POST /api/hf/sign-in: check and save a Hugging Face token, answer with the status.
+    The token never comes back in the answer."""
+    if not isinstance(payload, dict):
+        return 400, {"error": "expected {\"token\": ...}"}
+    result = hf_api.sign_in(str(payload.get("token", "")))
+    return (422 if "error" in result else 200), result
+
+
+def front_back_status(weights=None, drawer=None) -> dict[str, Any]:
+    """Whether Create can build from a front and a back picture: Pixal3D's multi-view
+    weights for the shape, and a picture engine that can draw the back (Flux by itself, or
+    Qwen with its vision projector). One place to get what is missing: the Front + back
+    card on the Setup page."""
+    weights_ready, _ = (weights or pixal3d_front_back_ready)()
+    drawer_ready = (drawer or back_drawer_ready)()
+    # shape_ready: enough for a back picture you upload yourself, which needs no drawing
+    if weights_ready and drawer_ready:
+        return {"ready": True, "shape_ready": True, "hint": None}
+    if weights_ready:
+        # the Front + back card is complete; what is missing is something to draw the back
+        return {"ready": False, "shape_ready": True,
+                "hint": "Front + back needs a picture engine to draw the back: install FLUX.2 klein "
+                        "(or finish Qwen-Image's download) on Setup & Status."}
+    return {"ready": False, "shape_ready": False,
+            "hint": "It needs one more download: Setup & Status, Front + back, "
+                    "or python scripts/bootstrap_front_back.py."}
+
+
+BRUSH_UPLOAD_LIMIT = 8 * 1024 * 1024
+# A plan's uploads: a picture or two, or a model GLB (a million-triangle one is a few hundred MB)
+CHAIN_UPLOAD_LIMIT = 1024 * 1024 * 1024
+
+
+BACK_VERSIONS_LOCK = threading.Lock()   # "use" and "delete" of a kept back, one at a time
+
+
+def upload_length_ok(length: int, limit: int) -> bool:
+    """A request body we will read: something there, and no more than `limit`. A negative
+    Content-Length makes read() take everything, so it is refused as well."""
+    return 0 < length <= limit
+
+
+def _back_in_output(output_root: Path, relative: str) -> Path:
+    back = image_api.back_source(output_root, relative)
+    if not back.name.endswith("__back.png"):
+        raise ValueError("versions are kept for back pictures")
+    return back
+
+
+def back_versions_payload(relative: str, output_root: Path | None = None) -> dict[str, Any]:
+    """The back in use and every kept version of it, newest first, as output/-relative paths."""
+    root = output_root or OUTPUT_ROOT
+    back = _back_in_output(root, relative)
+    entry = lambda f: {"file": f.relative_to(root.resolve()).as_posix(), "note": image_api.version_note(f)}
+    return {"current": entry(back), "versions": [entry(f) for f in image_api.back_versions(back)]}
+
+
+def change_back_version(action: str, body: dict[str, Any], output_root: Path | None = None) -> dict[str, Any]:
+    """`use` a kept version of a back, or `delete` one. Returns the versions as they are now."""
+    root = output_root or OUTPUT_ROOT
+    # one change at a time, checked and done under the same lock: a "use" and a "delete" that
+    # cross could otherwise delete the very file being swapped in
+    with BACK_VERSIONS_LOCK:
+        back = _back_in_output(root, str(body.get("back") or ""))
+        version = image_api.back_source(root, str(body.get("version") or ""))
+        if action == "use":
+            image_api.use_back_version(back, version)
+        elif action == "delete":
+            image_api.delete_back_version(back, version)
+        else:
+            raise ValueError(f"unknown action: {action}")
+        return back_versions_payload(str(body.get("back")), root)
+
+
+def brush_request(form: dict[str, dict[str, Any]], output_root: Path | None = None):
+    """(picture, stroke, instruction, seed, keep_old) from a brush request, or ValueError saying
+    what is wrong. A back may always be brushed, and keeps the one it replaces; a front only
+    until a 3D model is built from it, and the fixed one simply becomes the picture."""
+    from PIL import Image
+
+    def text(name: str) -> str:
+        return str((form.get(name) or {}).get("value") or "").strip()
+
+    root = output_root or OUTPUT_ROOT
+    picture = image_api.back_source(root, text("picture"))
+    keep_old = picture.name.endswith("__back.png")
+    if not keep_old:
+        relative = picture.relative_to(root.resolve()).as_posix()
+        users = [a for a in list_assets(root) if a.get("picture") == relative]
+        if not users:
+            raise ValueError("the brush works on a front or back picture")
+        if any(a.get("model") for a in users):
+            raise ValueError("a 3D model was already made from this picture; "
+                             "fix its back, or draw another picture")
+    instruction = text("instruction")
+    if not instruction:
+        raise ValueError("say what goes in the painted area")
+    mask = form.get("mask") or {}
+    if not mask.get("data"):
+        raise ValueError("paint over the part to change first")
+    try:
+        stroke = Image.open(io.BytesIO(mask["data"]))
+        image_api.check_picture_size(stroke)
+        stroke.load()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"the painted area could not be read ({exc})") from exc
+    try:
+        seed = int(text("seed") or 42)
+    except ValueError:
+        seed = 42
+    return picture, stroke, instruction, seed, keep_old
+
+
+def back_drawer_ready() -> bool:
+    """Whether any installed picture engine can draw a back view from the front."""
+    for engine in image_api.ENGINES.values():
+        try:
+            image_api.check_ready(engine, edit=True)
+        except image_api.MissingWeights:
+            continue
+        return True
+    return False
+
+
+def picture_engines_payload() -> list[dict[str, Any]]:
+    """The picture engines, in the order Create offers them, with what each can do here.
+
+    The order is the one we suggest for this machine's memory (Light first at 16 GB or less);
+    `suggested` marks the one we would pick. Every engine stays choosable."""
+    out = []
+    order = image_api.suggested_order()
+    for engine in order:
+        installed = image_api.is_installed(engine)
+        out.append({
+            "id": engine.id, "label": engine.label, "setup_id": engine.setup_id,
+            "suggested": engine is order[0],
+            "installed": installed, "can_draw_backs": installed and image_api.can_edit(engine),
+            "defaults": engine.defaults, "picture_only_steps": engine.picture_only_steps,
+            "license": {"name": engine.licence_name, "url": engine.licence_url,
+                        "attribution": engine.attribution},
+        })
+    return out
+
+
+def catalog_payload() -> dict:
+    """The Setup page's catalogue, plus any setup already running so it can reattach."""
+    payload = with_rebuild_reasons(catalog_status())
+    payload["running_setup"] = running_payload()
+    payload["front_back"] = front_back_status()
+    payload["picture_engines"] = picture_engines_payload()
+    return payload
+
+
+def with_rebuild_reasons(catalog: dict[str, Any],
+                         reason: Callable[[str], str | None] = rebuild_reason,
+                         download: Callable[[str], str | None] = rebuild_download,
+                         extra: Callable[[str], list[dict[str, str]]] | None = None) -> dict[str, Any]:
+    """Say which installed backends want recompiling, so the page can offer a Rebuild
+    button instead of a Terminal command.
+
+    The page draws this machine's tab from `views`, not `backends`, so both lists carry it.
+    Only `backends` did once, and the button vanished when the tabs arrived."""
+    here = catalog.get("views", {}).get(catalog.get("host", {}).get("id"), [])
+    for backend in [*catalog.get("backends", []), *here]:
+        backend["rebuild_reason"] = reason(backend["id"]) if backend.get("supported_here") else None
+        backend["rebuild_downloads"] = download(backend["id"]) if backend["rebuild_reason"] else None
+        # downloads beyond the listed weights (an engine, a projector): named before the yes
+        backend["also_fetches"] = (extra or also_fetches)(backend["id"]) if backend.get("supported_here") else []
+    return catalog
+
+
+def setup_status() -> dict[str, Any]:
+    """Machine readiness for the clean-port generator, for the Generate > Setup card."""
+    build_present = clean_port_build_present()
+    weights = weights_on_disk()
+    missing, size = trellis_weight_gap(APPLE)
+    warning = weights_needed("TRELLIS.2", "Mac clean port", size) if build_present and missing else None
+    return {
+        "schema_version": 1,
+        "build": {
+            "present": build_present,
+            "interpreter": str(PYTHON),
+            "wrapper": str(WRAPPER),
+            "hint": (
+                "clean-port build missing — from the repo root run: "
+                "python scripts/bootstrap_trellis_space_macos.py "
+                "(requires uv, Python 3.11 and Xcode command-line tools)"
+                if not build_present else None
+            ),
+        },
+        "weights": weights,
+        "missing_weights": missing,
+        # Advisory only: the default sdpa path works without it, so an unready mlx backend
+        # must never make the machine look unready for generation.
+        "mlx_attention": mlx_attention_status(),
+        "ready": build_present and not missing,
+        "warning": warning,
+    }
+
+
+def trellis_cuda_bria_patched(checkout: Path | None = None) -> bool:
+    """Whether the CUDA checkout has the BRIA guardrail. Stdlib only, like this module."""
+    sys.path.insert(0, str(REPO / "scripts"))
+    import patch_trellis_cuda_no_bria
+
+    return patch_trellis_cuda_no_bria.is_patched(checkout or TRELLIS_CUDA_VENDOR / "TRELLIS.2")
+
+
+def trellis_rocm_attention_problem(vendor: Path | None = None) -> str | None:
+    """Why the AMD TRELLIS.2 build has no attention backend, or None. Files only.
+
+    The viewer does not run in that venv, so `aule` is looked for on disk rather than
+    imported: its package folder in the venv's site-packages.
+    """
+    vendor = vendor or TRELLIS_ROCM_VENDOR
+    sys.path.insert(0, str(REPO / "scripts"))
+    from patch_trellis_rocm import is_patched
+
+    if not is_patched(vendor):
+        return ("The TRELLIS.2 checkout lacks the AMD attention patches. Run "
+                f"python scripts/patch_trellis_rocm.py --root {vendor}")
+    if not any((vendor / ".venv").glob("lib/python*/site-packages/aule/__init__.py")):
+        return ("aule (AuleAttention), the only attention backend on AMD, is not installed. "
+                "Re-run python scripts/bootstrap_trellis_rocm.py --code-only.")
+    return None
+
+
+def cuda_setup_status(host: str | None = None) -> dict[str, Any]:
+    """Readiness of the Linux TRELLIS.2 routes, for the Generate tab's readiness strip.
+
+    One function for both cards because the readiness question is the same one: is there a
+    finished build, and is the BRIA guardrail in place. Which venv that build lives in is
+    what differs.
+
+    Not ready without the BRIA patch, even when everything else is built: the generator
+    would refuse anyway, and the button should not promise a run that cannot start.
+    """
+    on_amd = (host or host_platform()) == AMD
+    vendor = TRELLIS_ROCM_VENDOR if on_amd else TRELLIS_CUDA_VENDOR
+    python = TRELLIS_ROCM_PYTHON if on_amd else TRELLIS_CUDA_PYTHON
+    wrapper = TRELLIS_ROCM_WRAPPER if on_amd else TRELLIS_CUDA_WRAPPER
+    marker = TRELLIS_ROCM_MARKER if on_amd else TRELLIS_CUDA_MARKER
+    bootstrap = ("scripts/bootstrap_trellis_rocm.py" if on_amd
+                 else "scripts/bootstrap_trellis_cuda.py")
+    card = "AMD" if on_amd else "NVIDIA"
+
+    built = marker.is_file() and python.is_file() and wrapper.is_file()
+    patched = trellis_cuda_bria_patched(vendor / "TRELLIS.2") if built else False
+    # AMD only: the attention backend has to be patched in and installed, or the run gets
+    # as far as the first attention and dies there.
+    attention = trellis_rocm_attention_problem(vendor) if on_amd and built else None
+    weights = weights_on_disk()
+    card_host = AMD if on_amd else NVIDIA
+    missing, size = trellis_weight_gap(card_host)
+    # A local pipeline.json is the tree the generator loads. Without it the hub id is
+    # used, and only a filled cache keeps that from downloading.
+    if linux_trellis_pipeline_present(card_host):
+        missing = []
+    hint = None
+    if not built:
+        hint = (f"TRELLIS.2 for {card} is not installed. Set it up from Setup & Status, or "
+                f"run python {bootstrap} (Linux only, ~16 GB of weights).")
+    elif not patched:
+        hint = ("The TRELLIS.2 checkout still loads BRIA RMBG-2.0. Run "
+                "python scripts/patch_trellis_cuda_no_bria.py first.")
+    elif attention:
+        hint = attention
+    code_ready = built and patched and not attention
+    ready = code_ready and not missing
+    return {
+        "schema_version": 1,
+        "build": {"present": ready, "interpreter": str(python),
+                  "wrapper": str(wrapper), "hint": hint},
+        "weights": weights,
+        "missing_weights": missing,
+        "bria_patched": patched,
+        "ready": ready,
+        "warning": (weights_needed("TRELLIS.2", card, size) if code_ready and missing else None),
+    }
+
+
+def run_trellis_input_advisor(image_path: Path) -> dict[str, Any]:
+    """Run TinyCLIP out-of-process so the lightweight viewer never imports torch."""
+    python = trellis_spec().interpreter
+    if not python.is_file():
+        raise RuntimeError("TRELLIS environment is not installed")
+    if not TINYCLIP_ADVISOR.is_file():
+        raise RuntimeError(f"TinyCLIP advisor is missing: {TINYCLIP_ADVISOR}")
+    try:
+        result = subprocess.run(
+            [str(python), str(TINYCLIP_ADVISOR), str(image_path)],
+            cwd=REPO,
+            env=generate_child_env("trellis"),
+            check=True,
+            capture_output=True,
+            timeout=TINYCLIP_TIMEOUT_SECONDS,
+            **processes.TEXT_PIPE,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("TinyCLIP input check timed out") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise RuntimeError(f"TinyCLIP input check failed{suffix}") from exc
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("TinyCLIP input check returned invalid JSON") from exc
+    if payload.get("verdict") not in {"likely_flat", "likely_dimensional", "uncertain"}:
+        raise RuntimeError("TinyCLIP input check returned an invalid verdict")
+    if not isinstance(payload.get("flat_risk"), (int, float)):
+        raise RuntimeError("TinyCLIP input check returned an invalid score")
+    return payload
+
+
+# Setup-run state: one bootstrap subprocess at a time, mirrored to the browser over SSE.
+SETUP_RUNS: dict[str, SetupRun] = {}
+SETUP_ACTIVE: str | None = None
+SETUP_LOCK = threading.Lock()
+
+
+class SetupRun:
+    """A bootstrap subprocess exposing the same SSE surface (condition/events/status) as Job."""
+
+    def __init__(self, run_id: str):
+        self.id = run_id
+        self.status = "queued"
+        self.process: subprocess.Popen[bytes] | None = None
+        self.started = time.monotonic()
+        self.events: list[dict[str, Any]] = []
+        self.condition = threading.Condition()
+
+    def emit(self, event: dict[str, Any]) -> None:
+        event = {"elapsed_seconds": round(time.monotonic() - self.started, 1), **event}
+        with self.condition:
+            self.events.append(event)
+            self.condition.notify_all()
+
+
+def setup_available(host: str | None = None) -> tuple[bool, str | None]:
+    """Whether the setup runner can start: uv on PATH and the bootstrap script present.
+
+    This older runner only knows the Mac bootstrap; anywhere else, Setup & Status runs the
+    right installer for the machine.
+    """
+    if (host or host_platform()) != APPLE:
+        return False, ("this setup runs the Mac port; on this machine use Setup & Status "
+                       "> TRELLIS.2 > Set up")
+    if find_uv() is None:
+        return False, "uv is not installed — install it first (https://docs.astral.sh/uv/)"
+    bootstrap = REPO / "scripts" / "bootstrap_trellis_space_macos.py"
+    if not bootstrap.is_file():
+        return False, f"bootstrap script missing: {bootstrap}"
+    return True, None
+
+
+def blender_install_command() -> list[str]:
+    return [sys.executable, str(REPO / "scripts" / "bootstrap_blender.py"), "--yes"]
+
+
+def blender_install_refusal(caps: dict[str, Any], generating: bool,
+                            setting_up: bool) -> tuple[int, str] | None:
+    """Why Setup's Install Blender cannot start now, or None when it can."""
+    if generating:
+        return 409, "a generation is running; wait for it to finish"
+    if setting_up:
+        return 409, "another setup is running; wait for it to finish"
+    if not caps.get("blender_installable"):
+        return 409, ("Blender is already found, or this machine needs the app from "
+                     "https://www.blender.org/download/")
+    return None
+
+
+def gltfpack_install_refusal(tools: dict[str, Any], generating: bool,
+                             setting_up: bool) -> tuple[int, str] | None:
+    """Why Setup's Install gltfpack cannot start now, or None when it can."""
+    if generating:
+        return 409, "a generation is running; wait for it to finish"
+    if setting_up:
+        return 409, "another setup is running; wait for it to finish"
+    if not tools.get("gltfpack_installable"):
+        return 409, ("gltfpack is already found, or there is no build for this machine at "
+                     "https://github.com/zeux/meshoptimizer/releases")
+    return None
+
+
+def _start_setup_run(run_id: str, command: list[str] | None = None) -> SetupRun:
+    """Spawn a setup script and stream its output into the run's events (SSE)."""
+    run = SetupRun(run_id)
+    bootstrap = REPO / "scripts" / "bootstrap_trellis_space_macos.py"
+    proc = subprocess.Popen(
+        command or [sys.executable, str(bootstrap)],
+        cwd=str(REPO),
+        env=_job_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    run.process = proc
+    run.status = "running"
+
+    def reader() -> None:
+        global SETUP_ACTIVE
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            if line:
+                run.emit({"phase": "setup", "message": line})
+        code = proc.wait()
+        ok = code == 0
+        run.emit({"phase": "setup_done", "status": "done" if ok else "error",
+                  "message": f"bootstrap exited with code {code}"
+                             + ("" if ok else " — review the output above")})
+        run.status = "done" if ok else "error"
+        with SETUP_LOCK:
+            SETUP_ACTIVE = None
+
+    threading.Thread(target=reader, daemon=True, name=f"setup-{run_id[:8]}").start()
+    return run
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "resolution": "1024",
+    "seed": 0,
+    "decimation_target": 300_000,
+    "texture_size": 2048,
+    "sparse_attn_backend": "sdpa",
+}
+VALID_RESOLUTIONS = {"512", "1024", "1536"}
+# sdpa is the default because mlx needs scripts/patch_trellis_mlx_attention.py applied to
+# the vendored checkout and mlx installed in its venv; a fresh clone has neither, and a
+# default that fails on a clean machine is worse than a default that is merely slower.
+# One control, not two: precision is part of the choice a user makes, and splitting it
+# into a second setting invites the combination nobody wants (sdpa with fp16, which is
+# meaningless -- fp16 is a property of the fused MLX kernel, and on torch MPS SDPA it is
+# measurably slower than fp32).
+VALID_SPARSE_ATTN = {"sdpa", "mlx", "mlx-fp16"}
+VALID_TEXTURES = {1024, 2048, 3072, 4096}
+STAGES = [
+    "load",
+    "sparse_structure",
+    "shape_slat_coarse",
+    "shape_slat_fine",
+    "texture_slat",
+    "decode",
+    "bake",
+]
+PHASE_LABELS = {
+    "load": "Load",
+    "sparse_structure": "Sparse structure",
+    "shape_slat_coarse": "Shape SLat coarse",
+    "shape_slat_fine": "Shape SLat fine",
+    "texture_slat": "Texture SLat",
+    "decode": "Decode",
+    "bake": "Bake / remesh",
+}
+TQDM_RE = re.compile(
+    r"(?P<label>[^:]+):\s+(?P<pct>\d+)%.*?"
+    r"(?P<step>\d+)/(?P<total>\d+)\s+\[(?P<elapsed>\d+:\d+)"
+    r"(?:<(?P<remain>\d+:\d+))?,?\s*"
+    r"(?P<rate>[\d.]+)(?P<rate_unit>s/it|it/s)\]"
+)
+SECONDS_RE = re.compile(r"(?:in|Total:)\s*(?P<seconds>[\d.]+)s?")
+JOB_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    bits = value.split(":")
+    try:
+        if len(bits) == 2:
+            return float(bits[0]) * 60 + float(bits[1])
+        if len(bits) == 3:
+            return float(bits[0]) * 3600 + float(bits[1]) * 60 + float(bits[2])
+    except ValueError:
+        return None
+    return None
+
+
+def parse_tqdm_line(line: str) -> dict[str, Any] | None:
+    """Parse one tqdm update, including the carriage-return form emitted by MPS jobs."""
+    match = TQDM_RE.search(line.strip())
+    if not match:
+        return None
+    rate = float(match.group("rate"))
+    return {
+        "label": match.group("label").strip(),
+        "pct": int(match.group("pct")),
+        "step": int(match.group("step")),
+        "total": int(match.group("total")),
+        "elapsed": _seconds(match.group("elapsed")),
+        "remain": _seconds(match.group("remain")),
+        "s_per_it": rate if match.group("rate_unit") == "s/it" else 1.0 / rate,
+    }
+
+
+def validate_settings(raw: Any) -> dict[str, Any]:
+    """Validate browser JSON and return a fresh, CLI-shaped settings dict."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be a JSON object")
+    # allow_rembg (BRIA) is gone: the server cuts pictures out itself. Old clients may send it.
+    settings = {**DEFAULT_SETTINGS, **{k: v for k, v in raw.items() if k != "allow_rembg"}}
+    if str(settings["resolution"]) not in VALID_RESOLUTIONS:
+        raise ValueError("resolution must be one of 512, 1024, or 1536")
+    try:
+        settings["seed"] = int(settings["seed"])
+        settings["decimation_target"] = int(settings["decimation_target"])
+        settings["texture_size"] = int(settings["texture_size"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("seed, decimation_target, and texture_size must be integers") from exc
+    if settings["decimation_target"] <= 0:
+        raise ValueError("decimation_target must be positive")
+    if settings["texture_size"] not in VALID_TEXTURES:
+        raise ValueError("texture_size must be one of 1024, 2048, 3072, or 4096")
+    if settings["sparse_attn_backend"] not in VALID_SPARSE_ATTN:
+        raise ValueError("sparse_attn_backend must be one of sdpa, mlx, or mlx-fp16")
+    settings["resolution"] = str(settings["resolution"])
+    return settings
+
+
+# Mirrors the wrapper's BORDER_OPAQUE_LIMIT; see image_border_opaque_fraction.
+UNCUT_BORDER_LIMIT = 0.05
+
+
+def image_has_transparent_alpha(path: Path) -> bool:
+    """Return whether an image has an actual (not merely opaque) alpha channel.
+
+    Raises RuntimeError if Pillow itself isn't importable in this interpreter -- that's a
+    broken server environment, not a fact about the image, and must not be reported as one.
+    (2026-08-20: a bare `except Exception` here caught a missing Pillow install the same as
+    a genuinely opaque image, so every upload silently failed the alpha check on a
+    Pillow-less interpreter and users were told to enable rembg for images that already had
+    real transparency.)"""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "Pillow is not installed in the interpreter running viewer/serve.py, so the "
+            "alpha-transparency check cannot run. Install it (`pip install Pillow`) into "
+            "that same interpreter and restart the server."
+        ) from exc
+    try:
+        with Image.open(path) as image:
+            if image.mode != "RGBA":
+                return False
+            return image.getextrema()[3][0] < 255
+    except Exception:
+        # A missing/undecodable alpha is deliberately conservative: the wrapper will refuse it
+        # and the server cuts it out with our own remover.
+        return False
+
+
+def needs_cut(path: Path) -> bool:
+    """Whether an upload must be cut out before the Mac TRELLIS port sees it: no real
+    transparency, or an alpha channel that never cut the subject out (Qwen-Image writes
+    RGBA with opaque alpha, so its pictures look cut out by mode and are not)."""
+    if not image_has_transparent_alpha(path):
+        return True
+    border = image_border_opaque_fraction(path)
+    return border is not None and border > UNCUT_BORDER_LIMIT
+
+
+def matte_upload(image_path: Path) -> tuple[Path, str]:
+    """Cut an upload out with our own remover; returns (the cut-out PNG, the remover's name).
+
+    The Mac TRELLIS port needs a transparent picture, and upstream's remover is BRIA
+    RMBG-2.0, which this repo never loads. Its venv has no rembg, so the server cuts here.
+    The original stays beside it as original.<ext>.
+    """
+    from PIL import Image
+
+    from image_to_3dlab.matte import cut_out
+
+    original = image_path.with_name(f"original{image_path.suffix}")
+    image_path.replace(original)
+    with Image.open(original) as opened:
+        cut, model = cut_out(opened.convert("RGB"))
+    destination = image_path.with_name("input.png")
+    cut.save(destination)
+    return destination, model
+
+
+def image_border_opaque_fraction(path: Path) -> float | None:
+    """Fraction of an image's outer border that is still opaque, or None if unmeasurable.
+
+    Delegates to the TRELLIS wrapper's own helper rather than restating the rule here: the
+    2026-09-03 slab bug happened because "has alpha" was defined in two places, and the UI's
+    copy and the wrapper's copy were each separately wrong about what a cut-out image is.
+    One definition, imported.
+
+    Returns None -- rather than raising or guessing -- when the check simply cannot run in
+    this interpreter (no numpy). The wrapper still enforces the same rule at run start, so a
+    missing preflight costs a late refusal, never a silent bad run.
+    """
+    import importlib.util
+
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        script = REPO / "scripts" / "trellis_space_generate.py"
+        spec = importlib.util.spec_from_file_location("trellis_space_generate", script)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        with Image.open(path) as image:
+            if image.mode != "RGBA":
+                return None
+            return wrapper.border_opaque_fraction(np.array(image)[..., 3])
+    except Exception:
+        return None
+
+
+def _read_seconds(path: Path) -> dict[str, float]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        seconds = data.get("seconds", data.get("stages", {}))
+        return {str(k): float(v) for k, v in seconds.items() if v is not None}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _baseline() -> dict[str, float]:
+    """Stage durations for the ETA: the shipped defaults, overlaid by this machine's own."""
+    return {**_read_seconds(BASELINE_PATH), **_read_seconds(LEARNED_BASELINE_PATH)}
+
+
+def _update_baseline(job: Job) -> None:
+    """Learn real stage durations after a successful job for the next ETA estimate."""
+    if not job.stage_durations:
+        return
+    seconds = _read_seconds(LEARNED_BASELINE_PATH)
+    seconds.update({name: round(value, 1) for name, value in job.stage_durations.items()})
+    data = {"schema_version": 1, "seconds": seconds,
+            "source": "learned from completed Generate jobs on this machine"}
+    LEARNED_BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LEARNED_BASELINE_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-")
+    return slug[:80] or "job"
+
+
+def _resolve_output_base(output_dir: str | None) -> Path:
+    """Resolve the user-chosen output base dir. Defaults to <repo-root>/output; a client-
+    supplied override is resolved and required to stay inside that same tree (never an
+    arbitrary absolute path -- this is a local server writing files from browser input)."""
+    base = (REPO / "output").resolve()
+    if not output_dir or not output_dir.strip():
+        return base
+    candidate = (REPO / output_dir.strip()).resolve()
+    if candidate != base and base not in candidate.parents:
+        raise ValueError(f"output_dir must be inside {base}")
+    return candidate
+
+
+def _job_folder_name(image_stem: str, backend_id: str, requested: str | None) -> str:
+    """Human-readable job folder name — a user-chosen slug, or ``<image>__<backend>__<time>``
+    so results never end up in an unlabeled UUID directory (the exact problem hand-run
+    asset sweeps kept hitting on 2026-08-18 — every result had to be moved by hand
+    afterward to avoid the next run silently clobbering or burying it)."""
+    if requested and requested.strip():
+        return _slugify(requested)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return _slugify(f"{image_stem}__{backend_id}__{stamp}")
+
+
+def _safe_id(value: str) -> bool:
+    return bool(JOB_RE.fullmatch(value))
+
+
+def parse_multipart(content_type: str, body: bytes) -> dict[str, dict[str, Any]]:
+    """Parse the two small multipart fields without the removed Python 3.13 ``cgi`` module."""
+    raw = (f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + body)
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    fields: dict[str, dict[str, Any]] = {}
+    for part in message.iter_parts():
+        disposition = part.get("Content-Disposition", "")
+        name = part.get_param("name", header="Content-Disposition")
+        if not name or "form-data" not in disposition:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        fields[str(name)] = {
+            "filename": part.get_param("filename", header="Content-Disposition"),
+            "data": payload,
+            "value": payload.decode("utf-8", errors="replace"),
+        }
+    return fields
+
+
+class Job:
+    def __init__(self, job_id: str, directory: Path, image_path: Path, output_path: Path,
+                 settings: dict[str, Any], backend_id: str, debug: bool = False):
+        self.id = job_id
+        self.directory = directory
+        self.image_path = image_path
+        self.output_path = output_path
+        # Pixal3D's run record is its .provenance.json; every other route still writes <run>.json.
+        self.manifest_path = output_path.with_suffix(
+            ".provenance.json" if backend_id == "pixal3d" else ".json")
+        self.settings = settings
+        self.backend_id = backend_id
+        self.debug = debug
+        self.status = "queued"
+        self.process: subprocess.Popen[bytes] | None = None
+        self.started = time.monotonic()
+        self.events: list[dict[str, Any]] = []
+        self.log_lines: deque[str] = deque(maxlen=200)
+        self.condition = threading.Condition()
+        self.shape_pass = 0
+        self.stage_started: dict[str, float] = {}
+        self.stage_durations: dict[str, float] = {}
+        self.cancel_requested = False
+
+    def emit(self, event: dict[str, Any]) -> None:
+        event = {"elapsed_seconds": round(time.monotonic() - self.started, 1), **event}
+        with self.condition:
+            self.events.append(event)
+            self.condition.notify_all()
+
+    def append_log(self, line: str) -> None:
+        self.log_lines.append(line)
+        with self.directory.joinpath("run.log").open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
+class JobManager:
+    """One active subprocess, with completed jobs retained for reconnect/downloads."""
+
+    def __init__(self):
+        self.jobs: dict[str, Job] = {}
+        self.lock = threading.Lock()
+        self.active: str | None = None
+
+    def create(self, image_path: Path, settings: dict[str, Any], backend_id: str,
+               image_stem: str, output_name: str | None, output_base: Path,
+               debug: bool = False) -> Job:
+        with self.lock:
+            if self.active is not None:
+                active = self.jobs.get(self.active)
+                if active and active.status in {"queued", "running", "cancelling"}:
+                    raise RuntimeError("a generation is already running")
+            job_id = uuid.uuid4().hex
+            name = _job_folder_name(image_stem, backend_id, output_name)
+            suffix = 2
+            while (output_base / name).exists():
+                name = f"{_job_folder_name(image_stem, backend_id, output_name)}-{suffix}"
+                suffix += 1
+            directory = output_base / name
+            directory.mkdir(parents=True, exist_ok=False)
+            # Folder name and primary output filename match (only the extension differs) --
+            # <name>/<name>.glb -- so a run is identifiable from either without cross-checking.
+            output_path = directory / f"{name}.glb"
+            job = Job(job_id, directory, image_path, output_path, settings, backend_id, debug)
+            self.jobs[job_id] = job
+            self.active = job_id
+            return job
+
+    def finish(self, job: Job) -> None:
+        with self.lock:
+            if self.active == job.id:
+                self.active = None
+
+    def get(self, job_id: str) -> Job | None:
+        return self.jobs.get(job_id)
+
+
+JOBS = JobManager()
+
+
+def _phase_for_tqdm(job: Job, label: str, step: int) -> str:
+    lower = label.lower()
+    if "sparse" in lower:
+        return "sparse_structure"
+    if "shape" in lower:
+        # The 1024 cascade prints this exact label twice.  A new 0/12 bar starts the fine pass.
+        if job.shape_pass == 0:
+            job.shape_pass = 1
+        elif step <= 1 and getattr(job, "shape_last_step", 0) > 1:
+            job.shape_pass = 2
+        job.shape_last_step = step
+        return "shape_slat_fine" if job.shape_pass >= 2 else "shape_slat_coarse"
+    if "texture" in lower or "tex slat" in lower:
+        return "texture_slat"
+    return "bake"
+
+
+def _overall_pct(phase: str, stage_pct: int) -> int:
+    try:
+        index = STAGES.index(phase)
+    except ValueError:
+        return 0
+    return round((index + max(0, min(stage_pct, 100)) / 100) / len(STAGES) * 100)
+
+
+def _event_from_tqdm(job: Job, parsed: dict[str, Any]) -> dict[str, Any]:
+    phase = _phase_for_tqdm(job, parsed["label"], parsed["step"])
+    now = time.monotonic()
+    if parsed["step"] <= 1 or phase not in job.stage_started:
+        job.stage_started.setdefault(phase, now)
+    baseline = _baseline()
+    future = STAGES[STAGES.index(phase) + 1:] if phase in STAGES else []
+    future_seconds = sum(baseline.get(s, 0.0) for s in future)
+    stage_eta = parsed["remain"]
+    total_eta = (stage_eta or 0.0) + future_seconds
+    if parsed["pct"] >= 100 and parsed["elapsed"] is not None:
+        job.stage_durations[phase] = parsed["elapsed"]
+    return {
+        "phase": phase,
+        "step": parsed["step"],
+        "total": parsed["total"],
+        "s_per_it": parsed["s_per_it"],
+        "stage_eta_seconds": round(stage_eta, 1) if stage_eta is not None else None,
+        "total_eta_seconds": round(total_eta, 1),
+        "stage_pct": parsed["pct"],
+        "overall_pct": _overall_pct(phase, parsed["pct"]),
+        "message": PHASE_LABELS.get(phase, parsed["label"]),
+    }
+
+
+def _emit_banner(job: Job, line: str) -> None:
+    lower = line.lower()
+    event: dict[str, Any] | None = None
+    if "loading trellis" in lower:
+        event = {"phase": "load", "overall_pct": 0, "message": "Loading TRELLIS.2 pipeline"}
+    elif "pipeline loaded" in lower:
+        event = {"phase": "load", "stage_pct": 100, "overall_pct": _overall_pct("load", 100),
+                 "message": line.strip()}
+    elif "decode_latent" in lower and "done in" in lower:
+        event = {"phase": "decode", "stage_pct": 100, "overall_pct": _overall_pct("decode", 100),
+                 "message": "Decode complete"}
+    elif "to_glb + export" in lower and "done in" in lower:
+        event = {"phase": "bake", "stage_pct": 100, "overall_pct": _overall_pct("bake", 100),
+                 "message": "GLB export complete"}
+    elif "pre-cap done" in lower:
+        event = {"phase": "bake", "message": "Pre-cap complete, starting to_glb…"}
+    if event:
+        job.emit(event)
+
+
+def _signal_hint(return_code: int) -> str:
+    """Human-readable suffix for a negative (signal-killed) exit code, empty otherwise."""
+    signals = {-9: "SIGKILL", -15: "SIGTERM", -6: "SIGABRT", -4: "SIGILL", -11: "SIGSEGV"}
+    if return_code < 0:
+        return f" — killed by {signals.get(return_code, f'signal {abs(return_code)}')}"
+    return ""
+
+
+def _process_rss_gb(pid: int) -> float:
+    """Resident set size of a child process in GB (macOS ps; best-effort, 0.0 on failure)."""
+    try:
+        kb = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False,  # best-effort probe
+        ).stdout.strip()
+        return round(int(kb) / (1024 ** 2), 2) if kb.isdigit() else 0.0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def _rss_monitor(job: Job) -> None:
+    """Append the generator's RSS to the job log every 30s so a silent death leaves a
+    memory trajectory behind (an OOM-style kill climbs before it vanishes)."""
+    assert job.process is not None
+    pid = job.process.pid
+    while job.status in {"queued", "running"}:
+        job.append_log(f"[rss {_process_rss_gb(pid)} GB]")
+        time.sleep(30)
+
+
+def _read_process(job: Job) -> None:
+    assert job.process is not None and job.process.stdout is not None
+    spec = BACKENDS[job.backend_id]
+    buffer = ""
+    while True:
+        chunk = job.process.stdout.read(4096)
+        if not chunk:
+            break
+        buffer += chunk.decode("utf-8", errors="replace")
+        while True:
+            positions = [p for p in (buffer.find("\n"), buffer.find("\r")) if p >= 0]
+            if not positions:
+                break
+            cut = min(positions)
+            line, buffer = buffer[:cut], buffer[cut + 1:]
+            if not line:
+                continue
+            job.append_log(line)
+            spec.parse_line(job, line)
+    if buffer:
+        job.append_log(buffer)
+        spec.parse_line(job, buffer)
+
+
+def _trellis_parse_line(job: Job, line: str) -> None:
+    """TRELLIS's original tqdm/banner handling, unchanged, just wrapped as a BackendSpec hook."""
+    parsed = parse_tqdm_line(line)
+    if parsed:
+        job.emit(_event_from_tqdm(job, parsed))
+    else:
+        _emit_banner(job, line)
+
+
+def _cleanup_debug_files(job: Job) -> None:
+    """Debug mode off (the default): keep the .glb and what travels with it. Deletes
+    textures, intermediate meshes, resume caches and run.log -- everything a run writes
+    that exists purely to diagnose a run, not to use the asset."""
+    # The licence record travels with the file (AGENTS.md), so it is never "debug". For
+    # Pixal3D that record is <name>.provenance.json (older runs: <name>.json), and
+    # <name>.svviews/ is the camera Finish's Pixel Match needs: deleting them shipped
+    # Pixal3D models with no provenance at all.
+    out = job.output_path
+    # <name>.post.bin is Pixal3D's clean-up input, which the Pixal3D Finish route reruns;
+    # <name>.shape.bin is the shape every new skin repaints.
+    keep = {out, out.with_suffix(".provenance.json"), out.with_suffix(".json"),
+            out.with_suffix(".svviews"), out.with_suffix(".post.bin"),
+            out.with_suffix(".shape.bin")}
+    for path in job.directory.iterdir():
+        if path in keep:
+            continue
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _pid_file_path(directory: Path) -> Path:
+    return directory / "pid"
+
+
+def _write_pid_file(directory: Path, pid: int) -> None:
+    """Record the generator subprocess's pid on disk the moment it starts.
+
+    This is the only trace of a running job that survives the server process itself
+    dying (memory-only Job/JobManager state does not) -- see _reconcile_orphaned_jobs,
+    which reads this file back on the next server startup to find and clean up jobs
+    whose tracker died mid-run."""
+    _pid_file_path(directory).write_text(processes.pid_record(pid), encoding="utf-8")
+
+
+def _remove_pid_file(directory: Path) -> None:
+    _pid_file_path(directory).unlink(missing_ok=True)
+
+
+def _killpg_if_alive(pid: int) -> None:
+    """Best-effort stop of a process group; a pid that's already gone is not an error."""
+    processes.terminate_group(pid)
+
+
+def _process_group_alive(pid: int) -> bool:
+    return processes.group_alive(pid)
+
+
+def _process_alive(pid: int) -> bool:
+    return processes.process_alive(pid)
+
+
+def _terminate_active_job() -> None:
+    """Kill the active job's process group, if one is running. Called on a clean server
+    shutdown (SIGTERM/SIGINT) so a deliberate stop doesn't leave the same kind of orphan
+    _reconcile_orphaned_jobs cleans up after a crash -- this is the graceful-exit half of
+    that same problem: a signal caught here means the pid file gets left behind (the job's
+    own finally block, in a background thread, may not get to run before the process
+    exits), but the next startup's reconciliation finds it, sees the process is already
+    dead, and annotates it correctly."""
+    job = JOBS.jobs.get(JOBS.active) if JOBS.active else None
+    if job is not None and job.process is not None and job.process.poll() is None:
+        _killpg_if_alive(job.process.pid)
+    rig_job = RIG_JOBS.get(RIG_JOBS.active) if RIG_JOBS.active else None
+    if rig_job is not None and rig_job.process is not None and rig_job.process.poll() is None:
+        _killpg_if_alive(rig_job.process.pid)
+    props_job = PROPS_JOBS.get(PROPS_JOBS.active) if PROPS_JOBS.active else None
+    if props_job is not None and props_job.process is not None and props_job.process.poll() is None:
+        _killpg_if_alive(props_job.process.pid)
+    finish_job = FINISH_JOBS.get(FINISH_JOBS.active) if FINISH_JOBS.active else None
+    if finish_job is not None and finish_job.process is not None and finish_job.process.poll() is None:
+        _killpg_if_alive(finish_job.process.pid)
+    picture = image_api.MANAGER.jobs.get(image_api.MANAGER.active) if image_api.MANAGER.active else None
+    if picture is not None and picture.process is not None and picture.process.poll() is None:
+        _killpg_if_alive(picture.process.pid)
+    animate_job = ANIMATE_JOBS.jobs.get(ANIMATE_JOBS.active) if ANIMATE_JOBS.active else None
+    if animate_job is not None and animate_job.process is not None and animate_job.process.poll() is None:
+        _killpg_if_alive(animate_job.process.pid)
+    skin_job = skins_api.BUILDS.jobs.get(skins_api.BUILDS.active) if skins_api.BUILDS.active else None
+    if skin_job is not None and skin_job.process is not None and skin_job.process.poll() is None:
+        _killpg_if_alive(skin_job.process.pid)
+    for download in DOWNLOADS.values():
+        if download.process is not None and download.process.poll() is None:
+            _killpg_if_alive(download.process.pid)
+
+
+def _animate_running() -> bool:
+    """Whether the Animate tab is rigging (SkinTokens holds ~8 GB) or retargeting."""
+    return ANIMATE_JOBS.busy()
+
+
+def _props_baking() -> bool:
+    """Whether a prop-sheet job is running. Its Blender bakes share unified memory with a
+    generation or a finishing repaint, so neither of those starts while it runs."""
+    job = PROPS_JOBS.get(PROPS_JOBS.active) if PROPS_JOBS.active else None
+    return job is not None and job.status not in {"done", "error", "cancelled"}
+
+
+def _running(manager) -> bool:
+    job = manager.jobs.get(manager.active) if manager.active else None
+    return job is not None and job.status not in {"done", "error", "cancelled"}
+
+
+# Every job that holds the GPU or gigabytes of unified memory. Each start waits while any
+# OTHER kind runs (its own manager refuses a second of its kind), so the studio, the MCP
+# and a second tab all meet the same rule; the page's busy flag is only a convenience.
+HEAVY_JOBS: dict[str, Callable[[], bool]] = {
+    "setup": lambda: SETUP_ACTIVE is not None,
+    "generate": lambda: _running(JOBS),
+    "image": lambda: _running(image_api.MANAGER),
+    "finish": lambda: _running(FINISH_JOBS),
+    "props": lambda: _props_baking(),
+    "rebind": lambda: _running(RIG_JOBS),
+    "animate": lambda: _animate_running(),
+    "motion": lambda: _running(MOTION_JOBS),
+    "skin": lambda: skins_api.BUILDS.running(),
+}
+BUSY_WORDS = {
+    "setup": "setup is running", "generate": "a generation is running",
+    "image": "a picture is being made", "finish": "a model is being finished",
+    "props": "a prop sheet is baking", "rebind": "a rig rebind is running",
+    "animate": "an auto-rig or animation is running",
+    "motion": "a UniMate motion job is running",
+    "skin": "a skin is being made",
+}
+
+
+def busy_reason(starting: str) -> str | None:
+    """Why a `starting` job must wait, or None."""
+    for kind, running in HEAVY_JOBS.items():
+        if kind != starting and running():
+            return f"{BUSY_WORDS[kind]}; wait for it to finish"
+    return None
+
+
+def _reconcile_orphaned_jobs(output_root: Path) -> list[str]:
+    """Resolve pid files left behind by a previous server life -- this server process died
+    mid-run (crash, closed terminal, etc.) before it could record a terminal outcome, same
+    failure shape as the leather_satchel/jesus_chibi incidents on 2026-08-20. Call once at
+    server startup, before serving.
+
+    For each leftover <job-dir>/pid: if the process that started the job is still alive
+    (another viewer, or a script driving the Finish code), the job is not an orphan and is
+    left alone. Otherwise, if that process group is still running, it's an actual ghost
+    (nobody has been tracking it since the old server died) -- kill it. Either way,
+    annotate that job's run.log so it stops trailing off silently, and remove the pid file
+    since this server now owns (or has just closed out) that job's fate.
+
+    Returns the touched job-folder names, for a one-line startup banner."""
+    touched = []
+    for pid_file in sorted(output_root.rglob("pid")):
+        if not pid_file.is_file():
+            continue    # a folder that happens to be called pid (a prop, say), not a job's
+        directory = pid_file.parent
+        try:
+            pid, owner = processes.parse_pid_record(pid_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pid_file.unlink(missing_ok=True)
+            continue
+        if owner is not None and owner != os.getpid() and _process_alive(owner):
+            continue
+        alive = _process_group_alive(pid)
+        if alive:
+            _killpg_if_alive(pid)
+            note = "orphaned generation from a previous server session, terminated on restart"
+        else:
+            note = "server died mid-run (previous session) -- job status unknown, treat as failed"
+        # Finish runs from 0.3.5 keep their log in steps/.
+        log_path = next((path for path in (directory / "run.log", directory / "steps" / "run.log")
+                         if path.is_file()), None)
+        if log_path is not None:
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(note + "\n")
+        pid_file.unlink(missing_ok=True)
+        touched.append(directory.name)
+    return touched
+
+
+# Progress chatter the generator emits constantly; never the reason it stopped.
+_LOG_NOISE = re.compile(r"^(\[rss |Sampling |Loading |Pipeline loaded|\s*$)|\|\s*\d+/\d+ \[")
+
+
+def out_of_memory_reason(log_lines) -> str | None:
+    """What a run that died of GPU memory shortage should be told, or None if it did not.
+
+    ggml announces the shortage and then dies the way C++ dies: `std::terminate`, a signal,
+    and -- because the binary links a crash handler -- forty lines of GDB backtrace. The one
+    line that explains anything is near the top of that, and `failure_reason` reads from the
+    bottom, so the user got "trellis-cli exited with code -6" (which is the wrapper restating
+    the signal, not a cause) and the actual sentence about the card was never shown.
+    """
+    for line in reversed(list(log_lines)):
+        text = line.rstrip()
+        if "out of memory" in text and ("allocat" in text or "Malloc" in text):
+            return (
+                f"{text} The GPU did not have enough free memory. Another program using "
+                f"the card is the usual cause -- Close it and run this again."
+            )
+    return None
+
+
+def failure_reason(log_lines, limit: int = 6) -> str | None:
+    """The generator's own last words, or None if it said nothing but progress.
+
+    A failed run used to surface as "generator exited with code 1" while the actual
+    explanation -- an alpha refusal, a missing weight, a traceback -- sat unread in the log
+    tail. Walk back from the end, skip the progress chatter, and return the trailing block
+    of real output so the browser can show what the process actually said.
+    """
+    reason: list[str] = []
+    for line in reversed(list(log_lines)):
+        text = line.rstrip()
+        if not text or _LOG_NOISE.match(text) or text.startswith("generator exited"):
+            if reason:
+                break
+            continue
+        reason.append(text)
+        if len(reason) >= limit:
+            break
+    # A shortage of GPU memory has a cause and a remedy, and neither is in the trailing
+    # block: ggml aborts, so the last words are a backtrace and the wrapper's exit code.
+    shortage = out_of_memory_reason(log_lines)
+    if shortage:
+        return shortage
+    return "\n".join(reversed(reason)) or None
+
+
+def _run_job(job: Job) -> None:
+    spec = BACKENDS[job.backend_id]
+    args = [str(spec.interpreter), str(spec.wrapper), *spec.build_args(job)]
+    env = generate_child_env(job.backend_id)
+    if job.backend_id == "trellis" and spec.wrapper == WRAPPER:
+        env.update(attention_backend_spec(job.settings["sparse_attn_backend"])[1])
+    try:
+        job.status = "running"
+        job.emit({"phase": "load", "overall_pct": 0, "message": f"Starting {spec.label} job"})
+        job.process = subprocess.Popen(
+            args,
+            cwd=str(REPO),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            **processes.group_popen_kwargs(),
+        )
+        _write_pid_file(job.directory, job.process.pid)
+        reader = threading.Thread(target=_read_process, args=(job,), daemon=True)
+        reader.start()
+        threading.Thread(target=_rss_monitor, args=(job,), daemon=True,
+                         name=f"rss-{job.id[:8]}").start()
+        return_code = job.process.wait()
+        reader.join(timeout=5)
+        job.append_log(f"generator exited with code {return_code}{_signal_hint(return_code)}")
+        if job.cancel_requested:
+            job.status = "cancelled"
+            job.append_log("generation cancelled")
+            job.emit({"phase": "error", "message": "Generation cancelled"})
+        elif return_code == 0:
+            if spec.finalize is not None and not job.output_path.is_file():
+                spec.finalize(job)
+            if job.output_path.is_file():
+                job.status = "done"
+                usage_api.count_done("model")
+                job.append_log("generation complete")
+                _update_baseline(job)
+                if not job.debug:
+                    _cleanup_debug_files(job)
+                event = {
+                    "phase": "done", "overall_pct": 100, "message": "Generation complete",
+                    "result_url": f"/api/generate/{job.id}/result.glb",
+                }
+                if job.manifest_path.is_file():
+                    event["manifest_url"] = f"/api/generate/{job.id}/manifest.json"
+                job.emit(event)
+            else:
+                tail = "\n".join(job.log_lines)[-8000:]
+                job.status = "error"
+                job.emit({"phase": "error",
+                          "message": "generator exited 0 but produced no output file",
+                          "log_tail": tail})
+        else:
+            tail = "\n".join(job.log_lines)[-8000:]
+            job.status = "error"
+            reason = failure_reason(job.log_lines)
+            job.emit({"phase": "error",
+                      "message": reason or f"generator exited with code {return_code}",
+                      "exit_code": return_code,
+                      "log_tail": tail})
+    except Exception as exc:  # process launch errors must reach the browser, not kill the server
+        job.status = "error"
+        job.emit({"phase": "error", "message": str(exc)})
+    finally:
+        _remove_pid_file(job.directory)
+        JOBS.finish(job)
+
+
+# --- TRELLIS backend spec (wraps the pre-existing, unchanged behavior above) -----------
+
+
+def _trellis_build_args(job: Job) -> list[str]:
+    args = [
+        str(job.image_path), str(job.output_path),
+        "--resolution", job.settings["resolution"],
+        "--seed", str(job.settings["seed"]),
+        "--decimation-target", str(job.settings["decimation_target"]),
+        "--texture-size", str(job.settings["texture_size"]),
+        "--sparse-attn-backend", attention_backend_spec(job.settings["sparse_attn_backend"])[0],
+    ]
+    if job.settings.get("matted_with"):
+        args += ["--matted-with", job.settings["matted_with"]]
+    if not job.debug:
+        # Skip the multi-hundred-MB resume caches entirely rather than write-then-delete.
+        args += ["--no-save-latents", "--no-save-decode"]
+    return args
+
+
+def _trellis_cuda_build_args(job: Job) -> list[str]:
+    """The CUDA generator takes the same settings, minus the Mac-only ones: attention is
+    flash-attn, and the cut-out is always our own remover, never BRIA."""
+    args = [
+        str(job.image_path), str(job.output_path),
+        "--resolution", job.settings["resolution"],
+        "--seed", str(job.settings["seed"]),
+        "--decimation-target", str(job.settings["decimation_target"]),
+        "--texture-size", str(job.settings["texture_size"]),
+    ]
+    if not job.debug:
+        args.append("--no-save-latents")
+    return args
+
+
+# --- SF3D backend spec ------------------------------------------------------------------
+
+SF3D_DEFAULT_SETTINGS: dict[str, Any] = {
+    "texture_resolution": 1024,
+    "foreground_ratio": 0.85,
+    "remesh": "none",
+    "target_vertices": -1,
+}
+SF3D_VALID_REMESH = {"none", "triangle", "quad"}
+SF3D_STAGES = ["running"]
+SF3D_STAGE_LABELS = {"running": "Running SF3D"}
+
+
+def _sf3d_validate_settings(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be a JSON object")
+    settings = {**SF3D_DEFAULT_SETTINGS, **raw}
+    try:
+        settings["texture_resolution"] = int(settings["texture_resolution"])
+        settings["foreground_ratio"] = float(settings["foreground_ratio"])
+        settings["target_vertices"] = int(settings["target_vertices"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("texture_resolution/target_vertices must be integers, "
+                          "foreground_ratio must be a number") from exc
+    if settings["remesh"] not in SF3D_VALID_REMESH:
+        raise ValueError("remesh must be one of none, triangle, or quad")
+    if settings["texture_resolution"] <= 0:
+        raise ValueError("texture_resolution must be positive")
+    if not (0.0 < settings["foreground_ratio"] <= 1.0):
+        raise ValueError("foreground_ratio must be between 0 and 1")
+    return settings
+
+
+def _sf3d_build_args(job: Job) -> list[str]:
+    return [
+        "--fast",
+        "--output-dir", str(job.directory),
+        "--texture-resolution", str(job.settings["texture_resolution"]),
+        "--foreground-ratio", str(job.settings["foreground_ratio"]),
+        "--remesh", job.settings["remesh"],
+        "--target-vertices", str(job.settings["target_vertices"]),
+        str(job.image_path),
+    ]
+
+
+def _sf3d_finalize(job: Job) -> None:
+    """pipeline.py's provenance system (image_to_3dlab.provenance.finalize_output) sorts
+    the real output into a license-class subfolder with a randomized run id --
+    <job-dir>/<license-folder>/<image-stem>__sf3d__<classification>__<run-id>.glb -- not
+    the flat <stem>_sf3d.glb this used to assume. That wrong assumption meant every SF3D
+    run through the web UI reported "generator exited 0 but produced no output file" even
+    on a full, successful generation (confirmed 2026-08-20 with a real run: a genuine .glb
+    existed on disk the whole time, the web UI just never found it -- the bug the user
+    reported as "the web view never updated" was this, not a dropped connection).
+
+    The exact filename can't be predicted (random run id), so glob for it instead."""
+    matches = sorted(job.directory.glob(f"*/{job.image_path.stem}__sf3d__*.glb"))
+    if not matches:
+        return
+    produced = matches[-1]
+    produced.replace(job.output_path)
+    sidecar = produced.with_suffix(".provenance.json")
+    if sidecar.is_file():
+        sidecar.replace(job.manifest_path)
+
+
+def _sf3d_parse_line(job: Job, line: str) -> None:
+    """SF3D has no structured per-step progress; relay raw lines, no false pct signal."""
+    stripped = line.strip()
+    if stripped:
+        job.emit({"phase": "running", "message": stripped[:200]})
+
+
+def _sf3d_weights(host: str | None = None) -> list[dict[str, Any]]:
+    """SF3D's weights as the Setup card counts them, so the two screens agree."""
+    import backend_catalog
+
+    return backend_catalog.BY_ID["sf3d"].describe(host or AMD)["weights"]
+
+
+def _sf3d_readiness(host: str | None = None) -> dict[str, Any]:
+    """Is SF3D usable here. The two installs are not interchangeable.
+
+    On a Mac the proof is the checkout, because SF3D is installed into this interpreter.
+    On AMD it is the venv and its build marker: the checkout alone would also be true on a
+    Mac, and a shared source file says nothing about whether anything was compiled for the
+    card -- which for this route is exactly the thing that goes wrong silently.
+    """
+    if (host or host_platform()) == AMD:
+        present = SF3D_ROCM_MARKER.is_file() and SF3D_ROCM_PYTHON.is_file()
+        # The weights too: a code-only install (or one stopped by the gated licence) would
+        # otherwise start a run, and SF3D would fetch ~4.9 GB that nobody agreed to.
+        rows = _sf3d_weights()
+        weights = {w["label"]: {"label": w["label"], "present": not weight_blocks_generate(w),
+                                "human": w.get("human_present", "")} for w in rows}
+        missing = [label for label, w in weights.items() if not w["present"]]
+        hint = None
+        if not present:
+            hint = ("Stable Fast 3D for AMD is not installed. Run "
+                    "scripts/bootstrap_sf3d_rocm.py (Linux with ROCm, ~4.9 GB of weights).")
+        elif missing:
+            hint = ("Stable Fast 3D weights are missing: " + "; ".join(missing) + ". Press "
+                    "Download on its Setup card, or run python scripts/bootstrap_sf3d_rocm.py "
+                    "--weights-only.")
+        return {
+            "schema_version": 1,
+            "build": {"present": present, "interpreter": str(SF3D_ROCM_PYTHON), "hint": hint},
+            "weights": weights, "missing_weights": missing,
+            "ready": present and not missing, "warning": None,
+        }
+    present = (SF3D_REPO_DEFAULT / "sf3d" / "system.py").is_file()
+    rows = _sf3d_weights(APPLE)
+    weights = {w["label"]: {"label": w["label"], "present": not weight_blocks_generate(w),
+                            "human": w.get("human_present", "")} for w in rows}
+    missing = [label for label, w in weights.items() if not w["present"]]
+    hint = None
+    warning = None
+    if not present:
+        hint = (f"SF3D checkout not found at {SF3D_REPO_DEFAULT} — "
+                "run python scripts/bootstrap_sf3d.py first.")
+    elif missing:
+        size = backend_catalog.BY_ID["sf3d"].describe(APPLE)["human_expected"]
+        warning = weights_needed("Stable Fast 3D", "Mac", size)
+        hint = warning
+    return {
+        "schema_version": 1,
+        "build": {"present": present, "hint": hint},
+        "weights": weights,
+        "missing_weights": missing,
+        "ready": present and not missing,
+        "warning": warning,
+    }
+
+
+# --- Hunyuan3D-MLX backend spec ----------------------------------------------------------
+
+HUNYUAN_DEFAULT_SETTINGS: dict[str, Any] = {
+    "octree_resolution": 512,
+    "seed": 42,
+    "decimation_target": 300_000,
+    "paint_seed": 0,
+    "paint_res": 512,
+    "paint_steps": 15,
+    "paint_tex": 4096,
+}
+HUNYUAN_VALID_OCTREE = {256, 384, 512, 1024}
+HUNYUAN_STAGES = ["shape", "remesh", "paint_setup", "paint_diffusion", "paint_finish"]
+HUNYUAN_STAGE_LABELS = {
+    "shape": "Shape generation",
+    "remesh": "Remesh",
+    "paint_setup": "Paint setup (mesh/UV)",
+    "paint_diffusion": "Paint diffusion",
+    "paint_finish": "Paint finish (super-res/bake)",
+}
+HUNYUAN_STEP_RE = re.compile(r"^\s*step (\d+)/(\d+) (\d+)s")
+# The shape stage's own denoise loop prints `\r[denoise] i/n` (no trailing text) per step,
+# distinct from the final `[denoise] N steps (...) in Xs` summary line the regex below
+# doesn't match (it has non-digit trailing content).
+HUNYUAN_SHAPE_DENOISE_RE = re.compile(r"^\[denoise\] (\d+)/(\d+)$")
+
+
+def _hunyuan_validate_settings(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be a JSON object")
+    settings = {**HUNYUAN_DEFAULT_SETTINGS, **raw}
+    try:
+        for key in ("octree_resolution", "seed", "decimation_target", "paint_seed",
+                    "paint_res", "paint_steps", "paint_tex"):
+            settings[key] = int(settings[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("all Hunyuan settings must be integers") from exc
+    if settings["octree_resolution"] not in HUNYUAN_VALID_OCTREE:
+        raise ValueError("octree_resolution must be one of 256, 384, 512, or 1024")
+    if settings["decimation_target"] <= 0:
+        raise ValueError("decimation_target must be positive")
+    if settings["decimation_target"] > 600_000:
+        raise ValueError(
+            "decimation_target above ~500k hits a confirmed xatlas wall (500k-700k faces "
+            "crawled in testing, 1M never finished) — keep it at or "
+            "under 500,000"
+        )
+    return settings
+
+
+def _hunyuan_build_args(job: Job) -> list[str]:
+    s = job.settings
+    return [
+        str(job.image_path), str(job.output_path),
+        "--octree-resolution", str(s["octree_resolution"]),
+        "--seed", str(s["seed"]),
+        "--decimation-target", str(s["decimation_target"]),
+        "--paint-seed", str(s["paint_seed"]),
+        "--paint-res", str(s["paint_res"]),
+        "--paint-steps", str(s["paint_steps"]),
+        "--paint-tex", str(s["paint_tex"]),
+    ]
+
+
+def _hunyuan_overall_pct(phase: str, stage_pct: int) -> int:
+    try:
+        index = HUNYUAN_STAGES.index(phase)
+    except ValueError:
+        return 0
+    return round((index + max(0, min(stage_pct, 100)) / 100) / len(HUNYUAN_STAGES) * 100)
+
+
+def _hunyuan_parse_line(job: Job, line: str) -> None:
+    stripped = line.strip()
+    step_match = HUNYUAN_STEP_RE.match(line)
+    if step_match:
+        step, total = int(step_match.group(1)), int(step_match.group(2))
+        pct = round(step / total * 100)
+        job.emit({
+            "phase": "paint_diffusion", "step": step, "total": total, "stage_pct": pct,
+            "overall_pct": _hunyuan_overall_pct("paint_diffusion", pct),
+            "message": f"Paint diffusion — step {step}/{total}",
+        })
+        return
+    shape_denoise_match = HUNYUAN_SHAPE_DENOISE_RE.match(stripped)
+    if shape_denoise_match:
+        step, total = int(shape_denoise_match.group(1)), int(shape_denoise_match.group(2))
+        # Denoise is roughly the first 60% of the shape stage's own progress; VAE grid
+        # decode + mesh extraction take the rest. Approximate — the exact split varies by
+        # model/quantize/octree-decode, but "roughly right and moving" beats frozen at 0%.
+        pct = round(step / total * 60)
+        job.emit({
+            "phase": "shape", "step": step, "total": total, "stage_pct": pct,
+            "overall_pct": _hunyuan_overall_pct("shape", pct),
+            "message": f"Shape denoise — step {step}/{total}",
+        })
+        return
+    if stripped.startswith("loaded "):
+        job.emit({"phase": "shape", "stage_pct": 5,
+                  "overall_pct": _hunyuan_overall_pct("shape", 5), "message": stripped})
+    elif stripped.startswith("[vae] grid"):
+        job.emit({"phase": "shape", "stage_pct": 80,
+                  "overall_pct": _hunyuan_overall_pct("shape", 80), "message": stripped})
+    elif stripped.startswith("[mesh]"):
+        job.emit({"phase": "shape", "stage_pct": 95,
+                  "overall_pct": _hunyuan_overall_pct("shape", 95), "message": stripped})
+    elif stripped.startswith("shape generated"):
+        job.emit({"phase": "shape", "stage_pct": 100,
+                  "overall_pct": _hunyuan_overall_pct("shape", 100), "message": stripped})
+    elif stripped.startswith(("simplified to", "mesh at/under decimation")):
+        job.emit({"phase": "remesh", "stage_pct": 100,
+                  "overall_pct": _hunyuan_overall_pct("remesh", 100), "message": stripped})
+    elif stripped.startswith(("mesh loaded", "xatlas parametrize done", "mesh render loaded",
+                               "control renders done", "controls + dino ready")):
+        job.emit({"phase": "paint_setup", "message": stripped})
+    elif stripped.startswith(("views decoded", "super-res x4")):
+        job.emit({"phase": "paint_finish", "message": stripped})
+    elif stripped.startswith(("DONE", "paint stage done")):
+        job.emit({"phase": "paint_finish", "stage_pct": 100,
+                  "overall_pct": _hunyuan_overall_pct("paint_finish", 100), "message": stripped})
+
+
+def _hunyuan_readiness() -> dict[str, Any]:
+    shape_ok = HUNYUAN_PYTHON.is_file() and HUNYUAN_WRAPPER.is_file()
+    paint_venv_ok = HUNYUAN_PAINT_VENV.is_file()
+    weights_ok = HUNYUAN_PAINT_WEIGHTS.is_dir()
+    shape_repo_ok = _dir_state(HUNYUAN_SHAPE_REPO)[0]
+    shape_weight = next(w for w in backend_catalog.BY_ID["hunyuan-mlx"].weights
+                        if w.source == "dgrauet/hunyuan3d-2.1-mlx")
+    shape_size = backend_catalog.human_bytes(shape_weight.bytes_expected)
+    ready = shape_ok and paint_venv_ok and weights_ok and shape_repo_ok
+    missing = []
+    if not shape_ok:
+        missing.append("shape venv/wrapper (vendor/hunyuan-mlx, scripts/hunyuan_mlx_generate.py)")
+    if not paint_venv_ok:
+        missing.append("paint venv (hunyuan_mlx/paint/.venv)")
+    if not weights_ok:
+        missing.append("paint weights (hunyuan_mlx/paint/weights/hunyuan3d-paintpbr-v2-1)")
+    if not shape_repo_ok:
+        missing.append(f"shape weights (dgrauet/hunyuan3d-2.1-mlx, {shape_size})")
+    warning = (weights_needed("Hunyuan3D-MLX", "dgrauet shape", shape_size)
+               if not shape_repo_ok else None)
+    return {
+        "schema_version": 1,
+        "build": {
+            "present": ready,
+            "hint": None if ready else (
+                "Hunyuan3D-MLX setup is incomplete — missing: " + "; ".join(missing) + ". "
+                "dgrauet's shape stage (vendor/hunyuan-mlx) is Tencent-licensed and stays "
+                "manually vendor-cloned. Xiong's paint stage (hunyuan_mlx/paint) is tracked "
+                "in-repo — run `uv sync` there, then download weights per "
+                "docs/hunyuan-mlx-recipes.md."
+            ),
+        },
+        "weights": {},
+        "missing_weights": missing,
+        "ready": ready,
+        "warning": warning,
+    }
+
+
+# --- Hunyuan3D-MLX (Xiong, full single-repo pipeline) spec --------------------------------
+# Same job protocol as hunyuan-mlx above (identical print-line vocabulary — both wrapper
+# scripts share the same stage prints), so stages/labels/parse_line are reused as-is. Only
+# settings/build_args/readiness differ: this variant exposes shape-stage quantization (the
+# one real lever for a usable interactive speed, since ZimengXiong's own shape stage runs
+# full-precision 3.3B-MoE by default — see the wrapper script's docstring caveat) and points
+# at a completely separate shape venv/weights.
+
+HUNYUAN_XIONG_DEFAULT_SETTINGS: dict[str, Any] = {
+    **HUNYUAN_DEFAULT_SETTINGS,
+    "model": "2.0",
+    "quantize": 8,
+}
+HUNYUAN_XIONG_VALID_QUANTIZE = {0, 4, 8}
+
+
+def _hunyuan_xiong_validate_settings(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be a JSON object")
+    settings = {**HUNYUAN_XIONG_DEFAULT_SETTINGS, **raw}
+    if settings["model"] not in HUNYUAN_XIONG_SHAPE_MODELS:
+        raise ValueError(
+            f"model must be one of {sorted(HUNYUAN_XIONG_SHAPE_MODELS)}"
+        )
+    try:
+        for key in ("octree_resolution", "seed", "quantize", "decimation_target",
+                    "paint_seed", "paint_res", "paint_steps", "paint_tex"):
+            settings[key] = int(settings[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("all Hunyuan settings must be integers") from exc
+    if settings["octree_resolution"] not in HUNYUAN_VALID_OCTREE:
+        raise ValueError("octree_resolution must be one of 256, 384, 512, or 1024")
+    if settings["quantize"] not in HUNYUAN_XIONG_VALID_QUANTIZE:
+        raise ValueError("quantize must be 0 (off), 4, or 8")
+    if settings["decimation_target"] <= 0:
+        raise ValueError("decimation_target must be positive")
+    if settings["decimation_target"] > 600_000:
+        raise ValueError(
+            "decimation_target above ~500k hits a confirmed xatlas wall (500k-700k faces "
+            "crawled in testing, 1M never finished) — keep it at or "
+            "under 500,000"
+        )
+    return settings
+
+
+def _hunyuan_xiong_build_args(job: Job) -> list[str]:
+    s = job.settings
+    return [
+        str(job.image_path), str(job.output_path),
+        "--model", str(s["model"]),
+        "--octree-resolution", str(s["octree_resolution"]),
+        "--seed", str(s["seed"]),
+        "--quantize", str(s["quantize"]),
+        "--decimation-target", str(s["decimation_target"]),
+        "--paint-seed", str(s["paint_seed"]),
+        "--paint-res", str(s["paint_res"]),
+        "--paint-steps", str(s["paint_steps"]),
+        "--paint-tex", str(s["paint_tex"]),
+    ]
+
+
+def _hunyuan_xiong_shape_weights_status() -> dict[str, dict[str, Any]]:
+    """Per-model shape-weights presence, in the {label, present, human} shape the Setup
+    panel's frontend expects for every backend's `weights` field (see weights_on_disk).
+
+    Previously this was a flat {name: bool} dict. Object.values(...) on that yields plain
+    JS booleans, and `repo.present` / `repo.label` on a boolean are just undefined -- so the
+    panel rendered all three models as "undefined ... not on disk" regardless of what was
+    actually downloaded (found 2026-08-20 via a real screenshot: three "undefined" rows on
+    a machine that in fact had weights present)."""
+    out: dict[str, dict[str, Any]] = {}
+    for name, path in HUNYUAN_XIONG_SHAPE_MODELS.items():
+        present = path.is_dir()
+        size = _dir_state(path)[1]
+        out[name] = {"label": f"Hunyuan3D-MLX shape weights ({name})", "present": present,
+                     "bytes": size, "human": _human_bytes(size)}
+    return out
+
+
+def _hunyuan_xiong_readiness() -> dict[str, Any]:
+    shape_ok = HUNYUAN_XIONG_SHAPE_VENV.is_file() and HUNYUAN_XIONG_WRAPPER.is_file()
+    weights_status = _hunyuan_xiong_shape_weights_status()
+    model_availability = {name: info["present"] for name, info in weights_status.items()}
+    any_model_ok = any(model_availability.values())
+    default_model_ok = model_availability.get(HUNYUAN_XIONG_DEFAULT_SETTINGS["model"], False)
+    paint_venv_ok = HUNYUAN_PAINT_VENV.is_file()
+    paint_weights_ok = HUNYUAN_PAINT_WEIGHTS.is_dir()
+    ready = shape_ok and any_model_ok and paint_venv_ok and paint_weights_ok
+    missing = []
+    if not shape_ok:
+        missing.append(
+            "shape venv/wrapper (hunyuan_mlx/shape/.venv, "
+            "scripts/hunyuan_mlx_xiong_generate.py)"
+        )
+    if not any_model_ok:
+        missing.append(
+            "shape weights — none of 2.1/2.0/2.0-turbo downloaded "
+            "(hunyuan_mlx/shape/weights/...); see docs/hunyuan-mlx-recipes.md"
+        )
+    elif not default_model_ok:
+        missing.append(
+            f"default model ({HUNYUAN_XIONG_DEFAULT_SETTINGS['model']}) not downloaded — "
+            f"other models are, but requests without an explicit model will fail"
+        )
+    if not paint_venv_ok:
+        missing.append("paint venv (hunyuan_mlx/paint/.venv)")
+    if not paint_weights_ok:
+        missing.append("paint weights (hunyuan_mlx/paint/weights/hunyuan3d-paintpbr-v2-1)")
+    return {
+        "schema_version": 1,
+        "build": {
+            "present": ready,
+            "hint": None if ready else (
+                "Hunyuan3D-MLX (Xiong, full) setup is incomplete — missing: "
+                + "; ".join(missing) + ". Code is tracked in-repo (hunyuan_mlx/); run "
+                "`uv sync` in hunyuan_mlx/shape and hunyuan_mlx/paint, then download "
+                "weights per docs/hunyuan-mlx-recipes.md."
+            ),
+        },
+        "weights": weights_status,
+        "missing_weights": missing,
+        # Per model, so the Shape model dropdown can disable what is not on disk instead
+        # of letting a run fail minutes in. Downloading only the default route is now the
+        # norm, so absent models are the expected case rather than a broken install.
+        "model_availability": model_availability,
+        "ready": ready,
+        "warning": (
+            "2.0 is the default and the cleanest. 2.0-turbo is about twice as fast but "
+            "can leave small dents. 2.1 is slower and not recommended."
+        ),
+    }
+
+
+PIXAL3D_DEFAULT_SETTINGS: dict[str, Any] = {
+    "res": 1024,
+    "seed": 42,
+    "fov": 0.3490658503988659,
+    # "auto": the wrapper runs 8 on a patched trellis-cli and 12 otherwise, so an install
+    # without scripts/patch_pixal3d_steps.py keeps working. 12 forces the full count.
+    "steps": "auto",
+}
+PIXAL3D_STEP_CHOICES = {"auto", 12}
+# trellis-cli --sv-image refuses anything but 1024 ("supports --res 1024 only in this
+# release"), and the single-view weights ship no res-512 texture flow.
+PIXAL3D_VALID_RES = {1024}
+PIXAL3D_STAGES = ["views", "ss", "shape", "decode", "texture", "write"]
+PIXAL3D_STAGE_LABELS = {
+    "views": "Preparing view",
+    "ss": "Sparse structure",
+    "shape": "Shape SLAT (512 to 1024 cascade)",
+    "decode": "Shape decode",
+    "texture": "Texture SLAT + PBR decode",
+    "write": "Writing GLB",
+}
+# `trellis-cli` announces `[n/6] ...`; n maps to a stage, and the bar follows n.
+PIXAL3D_BANNERS = {1: "views", 2: "ss", 3: "shape", 4: "decode", 5: "texture", 6: "write"}
+
+
+def _pixal3d_validate_settings(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be a JSON object")
+    # "back_name" is the server's own record of a saved back picture: never the client's.
+    settings = {**PIXAL3D_DEFAULT_SETTINGS, **{k: v for k, v in raw.items() if k != "back_name"}}
+    try:
+        settings["res"] = int(settings["res"])
+        settings["seed"] = int(settings["seed"])
+        settings["fov"] = float(settings["fov"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("res and seed must be integers, fov a number") from exc
+    if settings["res"] not in PIXAL3D_VALID_RES:
+        raise ValueError("Pixal3D single-image runs at res 1024 only")
+    if not 0.05 <= settings["fov"] <= 2.0:
+        raise ValueError("fov is in radians; 0.349 is 20 degrees")
+    if settings["steps"] != "auto":
+        try:
+            settings["steps"] = int(settings["steps"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError('steps must be "auto" or 12') from exc
+    if settings["steps"] not in PIXAL3D_STEP_CHOICES:
+        raise ValueError('steps must be "auto" or 12')
+    return settings
+
+
+def _pixal3d_build_args(job: Job) -> list[str]:
+    s = job.settings
+    return [
+        str(job.image_path), str(job.output_path),
+        "--res", str(s["res"]),
+        "--seed", str(s["seed"]),
+        "--fov", str(s["fov"]),
+    ] + ([] if s.get("steps", "auto") == "auto" else ["--steps", str(s["steps"])]) + (
+        ["--back", str(job.directory / s["back_name"])] if s.get("back_name") else [])
+
+
+def _pixal3d_parse_line(job: Job, line: str) -> None:
+    """Emit a stage event per `[n/6]` banner, and let the rest through as log."""
+    if line.startswith("[") and "]" in line and "/6" in line[: line.index("]")]:
+        marker = line[1 : line.index("]")]
+        try:
+            index = int(marker.split("/")[0])
+        except ValueError:
+            return
+        stage = PIXAL3D_BANNERS.get(index)
+        if stage is None:
+            return
+        # `phase` must BE the stage id: JobProgressPanel.apply looks the row up by it.
+        # Emitting {"phase": "stage", "stage": ...} leaves the panel frozen on its
+        # placeholder, which is exactly what it did.
+        job.emit({
+            "phase": stage,
+            "stage_pct": 0,
+            "overall_pct": min(99, round(index / 6 * 100)),
+            "message": PIXAL3D_STAGE_LABELS[stage],
+        })
+
+
+def pixal3d_front_back_ready(models: Path = PIXAL3D_MV_MODELS) -> tuple[bool, str | None]:
+    """Whether every file the multi-view set's manifest requires is present, and if not,
+    what to say. The build itself is the single-view readiness check's business."""
+    listing = models / "pixal3d-models.json"
+    if not listing.is_file():
+        return False, ("Front + back needs Pixal3D's multi-view weights (5.9 GB). Get them from "
+                       "Setup & Status, or run python scripts/bootstrap_pixal3d.py --multiview.")
+    required = [entry["name"] for entry in json.loads(listing.read_text(encoding="utf-8")).get("files", [])
+                if entry.get("required", True)]
+    missing = [name for name in required if not (models / name).is_file()]
+    if missing:
+        return False, ("Front + back is missing " + ", ".join(missing) + ". Run "
+                       "python scripts/bootstrap_pixal3d.py --multiview to finish the download.")
+    return True, None
+
+
+def _pixal3d_readiness() -> dict[str, Any]:
+    weights = sorted(PIXAL3D_MODELS.glob("*.gguf")) if PIXAL3D_MODELS.is_dir() else []
+    built = PIXAL3D_CLI.is_file() and PIXAL3D_WRAPPER.is_file()
+    # Nine files: four flow DiTs, three decoders, the image encoder and NAF.
+    weights_ok = len(weights) >= 9
+    ready = built and weights_ok
+    missing = []
+    if not built:
+        missing.append("trellis-cli build (vendor/pixal3d-cpp/build)")
+    if not weights_ok:
+        missing.append(f"Q8_0 weight set ({len(weights)}/9 in {PIXAL3D_MODELS})")
+    return {
+        "schema_version": 1,
+        "build": {
+            "present": ready,
+            "hint": None if ready else (
+                "Pixal3D is not set up — missing: " + "; ".join(missing)
+                + ". Set it up from Setup & Status, or run "
+                "python scripts/bootstrap_pixal3d.py (8.4 GB of weights)."
+            ),
+        },
+        "weights": {
+            "pixal3d-sv-q8_0": {
+                "label": "Pixal3D single-view Q8_0",
+                "present": weights_ok,
+                "human": f"{len(weights)}/9 GGUF files",
+            }
+        },
+        "missing_weights": missing,
+        "ready": ready,
+        "warning": (
+            "Single-view only, and these weights have no res 512 option."
+        ),
+    }
+
+
+def trellis_spec(host: str | None = None) -> BackendSpec:
+    """TRELLIS.2 for this machine: the Metal port on a Mac, Microsoft's code on NVIDIA and AMD.
+
+    One id, three installs. The Linux specs are the same shape because the pipeline is the
+    same — both are Microsoft's own checkout and both matte images themselves with our
+    remover, so neither demands a transparent upload the way the Mac port does. What differs
+    is the venv each one runs in.
+
+    The AMD install is Microsoft's checkout built with HIP: nvdiffrast and CuMesh from their
+    ROCm ports, FlexGEMM and o-voxel from upstream with one compiler flag changed, and
+    AuleAttention in place of flash-attn. See scripts/bootstrap_trellis_rocm.py.
+    """
+    if (host or host_platform()) == NVIDIA:
+        return BackendSpec(
+            id="trellis", label="TRELLIS.2 (NVIDIA)",
+            interpreter=TRELLIS_CUDA_PYTHON, wrapper=TRELLIS_CUDA_WRAPPER,
+            default_settings=DEFAULT_SETTINGS, stages=STAGES, stage_labels=PHASE_LABELS,
+            requires_alpha=False,
+            validate_settings=validate_settings, build_args=_trellis_cuda_build_args,
+            parse_line=_trellis_parse_line, readiness=cuda_setup_status,
+            baseline_path=BASELINE_PATH,
+            hidden_fields=("generate-attention",),
+        )
+    if (host or host_platform()) == AMD:
+        # Same spec as NVIDIA but the ROCm venv: like it, this route mattes images itself
+        # with our remover, so it does not demand a transparent upload the way the Mac port
+        # does. The attention field is hidden because the backend is not a choice here --
+        # AuleAttention is the only one that exists for this card.
+        return BackendSpec(
+            id="trellis", label="TRELLIS.2 (AMD)",
+            interpreter=TRELLIS_ROCM_PYTHON, wrapper=TRELLIS_ROCM_WRAPPER,
+            default_settings=DEFAULT_SETTINGS, stages=STAGES, stage_labels=PHASE_LABELS,
+            requires_alpha=False,
+            validate_settings=validate_settings, build_args=_trellis_cuda_build_args,
+            parse_line=_trellis_parse_line, readiness=cuda_setup_status,
+            baseline_path=BASELINE_PATH,
+            hidden_fields=("generate-attention",),
+        )
+    return BackendSpec(
+        id="trellis", label="TRELLIS.2 (clean port)",
+        interpreter=PYTHON, wrapper=WRAPPER,
+        default_settings=DEFAULT_SETTINGS, stages=STAGES, stage_labels=PHASE_LABELS,
+        requires_alpha=True,
+        validate_settings=validate_settings, build_args=_trellis_build_args,
+        parse_line=_trellis_parse_line, readiness=setup_status,
+        baseline_path=BASELINE_PATH,
+    )
+
+
+# --- Hunyuan3D-2.1 on NVIDIA (Tencent's own code) ---------------------------------------
+# Upstream's demo.py defaults. The generator validates the same ranges again.
+HUNYUAN_CUDA_DEFAULT_SETTINGS: dict[str, Any] = {
+    "seed": 1234,
+    "steps": 50,
+    "octree_resolution": 384,
+    "max_num_view": 6,
+    "paint_resolution": 512,
+}
+
+
+def _hunyuan_cuda_validate_settings(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be a JSON object")
+    settings = {**HUNYUAN_CUDA_DEFAULT_SETTINGS,
+                **{k: v for k, v in raw.items() if k in HUNYUAN_CUDA_DEFAULT_SETTINGS}}
+    try:
+        settings = {key: int(value) for key, value in settings.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("all Hunyuan3D-2.1 settings must be integers") from exc
+    if settings["octree_resolution"] not in {256, 384, 512}:
+        raise ValueError("octree_resolution must be 256, 384 or 512")
+    if not 6 <= settings["max_num_view"] <= 9:
+        raise ValueError("max_num_view must be 6 to 9")
+    if settings["paint_resolution"] not in {512, 768}:
+        raise ValueError("paint_resolution must be 512 or 768")
+    if settings["steps"] < 1:
+        raise ValueError("steps must be at least 1")
+    return settings
+
+
+# The AMD route's defaults deliberately omit views and texture resolution. Upstream's
+# defaults want about 21 GB, which a consumer card does not have; the generator's
+# fit_paint_settings walks down a ladder until it fits what is free, and a default here
+# would override that without saying so.
+HUNYUAN_ROCM_DEFAULT_SETTINGS: dict[str, Any] = {
+    "seed": 1234,
+    "steps": 50,
+    "octree_resolution": 384,
+}
+
+
+def _hunyuan_rocm_validate_settings(raw: Any) -> dict[str, Any]:
+    """Validate what the studio sends, and pass through the two optional overrides.
+
+    The bounds are the generator's, not upstream's: a small card has to be allowed to ask
+    for one view and a 128px texture, which the NVIDIA route does not permit.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be a JSON object")
+    known = {**HUNYUAN_ROCM_DEFAULT_SETTINGS, "max_num_view": 0, "paint_resolution": 0}
+    settings = {**HUNYUAN_ROCM_DEFAULT_SETTINGS,
+                **{k: v for k, v in raw.items() if k in known}}
+    try:
+        settings = {key: int(value) for key, value in settings.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("all Hunyuan3D-2.1 settings must be integers") from exc
+    if settings["octree_resolution"] not in {256, 384, 512}:
+        raise ValueError("octree_resolution must be 256, 384 or 512")
+    if settings["steps"] < 1:
+        raise ValueError("steps must be at least 1")
+    # The two fitted settings are checked only when they are here. They are absent from the
+    # defaults on purpose -- that is what lets the generator fit them to the card -- so
+    # reading them unconditionally raised KeyError('max_num_view') on every fresh job.
+    if "max_num_view" in settings and not 1 <= settings["max_num_view"] <= 9:
+        raise ValueError("max_num_view must be 1 to 9")
+    if "paint_resolution" in settings and settings["paint_resolution"] not in {128, 256}:
+        # 512 and 768 are what upstream offers, and this card returns an all-black texture
+        # at both: the paint UNet's multiview output comes back with a maximum of 0.02
+        # across the whole image. Measured on an RX 7900 XTX, 2026-10-14.
+        raise ValueError("paint_resolution must be 128 or 256 on an AMD card")
+    return settings
+
+
+def _hunyuan_rocm_build_args(job: Job) -> list[str]:
+    """Only pass the two fitted settings when the studio actually set them.
+
+    The generator fits whatever is absent, so passing a default here would quietly pin the
+    card to whatever this file guessed when it was written.
+    """
+    s = job.settings
+    args = [str(job.image_path), str(job.output_path),
+            "--seed", str(s["seed"]), "--steps", str(s["steps"]),
+            "--octree-resolution", str(s["octree_resolution"])]
+    if "max_num_view" in s:
+        args += ["--max-num-view", str(s["max_num_view"])]
+    if "paint_resolution" in s:
+        args += ["--paint-resolution", str(s["paint_resolution"])]
+    return args
+
+
+def _hunyuan_cuda_build_args(job: Job) -> list[str]:
+    s = job.settings
+    return [
+        str(job.image_path), str(job.output_path),
+        "--seed", str(s["seed"]),
+        "--steps", str(s["steps"]),
+        "--octree-resolution", str(s["octree_resolution"]),
+        "--max-num-view", str(s["max_num_view"]),
+        "--paint-resolution", str(s["paint_resolution"]),
+    ]
+
+
+def _hunyuan_cuda_readiness() -> dict[str, Any]:
+    """Ready only when built *and* every weight is on disk.
+
+    Upstream fetches missing weights on first use, unannounced. The installer names and
+    fetches them all up front, so a missing one means setup has not finished, and the run
+    must not start and download it behind the user's back.
+    """
+    import backend_catalog
+
+    built = (HUNYUAN_CUDA_MARKER.is_file() and HUNYUAN_CUDA_PYTHON.is_file()
+             and HUNYUAN_CUDA_WRAPPER.is_file())
+    weights = {w["label"]: {"label": w["label"], "present": w["present"],
+                            "human": w["human_present"]}
+               for w in backend_catalog.BY_ID["hunyuan-cuda"].describe()["weights"]}
+    missing = [label for label, w in weights.items() if not w["present"]]
+    ready = built and not missing
+    hint = None
+    if not built:
+        hint = ("Hunyuan3D-2.1 for NVIDIA is not installed. Set it up from Setup & Status, "
+                "or run python scripts/bootstrap_hunyuan_cuda.py (Linux only, ~19.5 GB).")
+    elif missing:
+        hint = ("Hunyuan3D-2.1 weights are missing: " + "; ".join(missing) + ". Run "
+                "python scripts/bootstrap_hunyuan_cuda.py --weights-only.")
+    return {
+        "schema_version": 1,
+        "build": {"present": built, "interpreter": str(HUNYUAN_CUDA_PYTHON),
+                  "wrapper": str(HUNYUAN_CUDA_WRAPPER), "hint": hint},
+        "weights": weights,
+        "missing_weights": missing,
+        "ready": ready,
+        "warning": "Not licensed in the EU, the UK or South Korea.",
+    }
+
+
+def _hunyuan_rocm_readiness() -> dict[str, Any]:
+    """Readiness of the AMD Hunyuan3D-2.1 route, same shape as the NVIDIA one.
+
+    The patches count as part of "built": the generator needs them, and a build marker
+    without them is a route that compiles and then crashes in the scheduler.
+    """
+    import backend_catalog
+    sys.path.insert(0, str(REPO / "scripts"))
+    from patch_hunyuan_rocm import is_patched
+
+    root = HUNYUAN_ROCM_VENDOR / "Hunyuan3D-2.1"
+    built = (HUNYUAN_ROCM_MARKER.is_file() and HUNYUAN_ROCM_PYTHON.is_file()
+             and HUNYUAN_ROCM_WRAPPER.is_file())
+    patched = is_patched(root) if built else False
+    weights = {w["label"]: {"label": w["label"], "present": w["present"],
+                            "human": w["human_present"]}
+               for w in backend_catalog.BY_ID["hunyuan-rocm"].describe()["weights"]}
+    missing = [label for label, w in weights.items() if not w["present"]]
+    hint = None
+    if not built:
+        hint = ("Hunyuan3D-2.1 for AMD is not installed. Set it up from Setup & Status, or "
+                "run python scripts/bootstrap_hunyuan_rocm.py (Linux with ROCm, ~19.5 GB).")
+    elif not patched:
+        hint = ("The Hunyuan3D-2.1 checkout is missing the AMD patches. Run "
+                "python scripts/patch_hunyuan_rocm.py first.")
+    elif missing:
+        hint = ("Hunyuan3D-2.1 weights are missing: " + "; ".join(missing) + ". Run "
+                "python scripts/bootstrap_hunyuan_rocm.py --weights-only.")
+    return {
+        "schema_version": 1,
+        "build": {"present": built and patched, "interpreter": str(HUNYUAN_ROCM_PYTHON),
+                  "wrapper": str(HUNYUAN_ROCM_WRAPPER), "hint": hint},
+        "weights": weights,
+        "missing_weights": missing,
+        "ready": built and patched and not missing,
+        # The one licence restriction with real teeth, on the route where it bites.
+        "warning": "Not licensed in the EU, the UK or South Korea.",
+    }
+
+
+def sf3d_spec(host: str | None = None) -> BackendSpec:
+    """SF3D for this machine: this interpreter on a Mac, its own venv on AMD.
+
+    The Apple route installs SF3D into the interpreter the viewer runs in, so both halves
+    share one. That was why SF3D could not be on Linux at all: its pins (numpy 1.26,
+    transformers 4.42, an old huggingface-hub) break the shared environment. The AMD route
+    gives it a venv of its own instead, so nothing it pins can reach the viewer -- which
+    means the interpreter is not the same one, and a spec pointing at `sys.executable`
+    would look for SF3D in a place it was never installed.
+
+    One id, two interpreters, the way TRELLIS.2 does it.
+    """
+    if (host or host_platform()) == AMD:
+        return BackendSpec(
+            id="sf3d", label="Stable Fast 3D (AMD)",
+            interpreter=SF3D_ROCM_PYTHON, wrapper=REPO / "pipeline.py",
+            default_settings=SF3D_DEFAULT_SETTINGS, stages=SF3D_STAGES,
+            stage_labels=SF3D_STAGE_LABELS, requires_alpha=False,
+            validate_settings=_sf3d_validate_settings, build_args=_sf3d_build_args,
+            parse_line=_sf3d_parse_line, readiness=_sf3d_readiness, finalize=_sf3d_finalize,
+        )
+    return BackendSpec(
+        id="sf3d", label="Stable Fast 3D",
+        interpreter=Path(sys.executable), wrapper=REPO / "pipeline.py",
+        default_settings=SF3D_DEFAULT_SETTINGS, stages=SF3D_STAGES,
+        stage_labels=SF3D_STAGE_LABELS, requires_alpha=False,
+        validate_settings=_sf3d_validate_settings, build_args=_sf3d_build_args,
+        parse_line=_sf3d_parse_line, readiness=_sf3d_readiness, finalize=_sf3d_finalize,
+    )
+
+
+BACKENDS.update({
+    "trellis": trellis_spec(),
+    "sf3d": sf3d_spec(),
+    "hunyuan-mlx": BackendSpec(
+        id="hunyuan-mlx", label="Hunyuan3D-MLX (dgrauet shape + Xiong paint)",
+        interpreter=HUNYUAN_PYTHON, wrapper=HUNYUAN_WRAPPER,
+        default_settings=HUNYUAN_DEFAULT_SETTINGS, stages=HUNYUAN_STAGES,
+        stage_labels=HUNYUAN_STAGE_LABELS, requires_alpha=True,  # its shape stage trusts alpha
+        validate_settings=_hunyuan_validate_settings, build_args=_hunyuan_build_args,
+        parse_line=_hunyuan_parse_line, readiness=_hunyuan_readiness,
+    ),
+    "hunyuan-mlx-xiong": BackendSpec(
+        id="hunyuan-mlx-xiong", label="Hunyuan3D-MLX (Xiong, full pipeline)",
+        interpreter=HUNYUAN_XIONG_SHAPE_VENV, wrapper=HUNYUAN_XIONG_WRAPPER,
+        default_settings=HUNYUAN_XIONG_DEFAULT_SETTINGS, stages=HUNYUAN_STAGES,
+        stage_labels=HUNYUAN_STAGE_LABELS, requires_alpha=True,  # its shape stage trusts alpha
+        validate_settings=_hunyuan_xiong_validate_settings, build_args=_hunyuan_xiong_build_args,
+        parse_line=_hunyuan_parse_line, readiness=_hunyuan_xiong_readiness,
+    ),
+    "pixal3d": BackendSpec(
+        id="pixal3d", label="Pixal3D (C++/GGML)",
+        interpreter=Path(sys.executable), wrapper=PIXAL3D_WRAPPER,
+        default_settings=PIXAL3D_DEFAULT_SETTINGS, stages=PIXAL3D_STAGES,
+        stage_labels=PIXAL3D_STAGE_LABELS, requires_alpha=False,
+        validate_settings=_pixal3d_validate_settings, build_args=_pixal3d_build_args,
+        parse_line=_pixal3d_parse_line, readiness=_pixal3d_readiness,
+        # The one block it could not allocate on a busy 24 GB card, rounded up: 11.1 GB at
+        # res 1024. Without this the run reaches the texture stage -- two minutes in --
+        # and aborts with a backtrace instead of a sentence.
+        gpu_memory_wanted=12 * 1024 ** 3,
+    ),
+    # Same stage names and progress lines as the MLX Hunyuan routes, so it shares their parser.
+    "hunyuan-cuda": BackendSpec(
+        id="hunyuan-cuda", label="Hunyuan3D-2.1 (NVIDIA)",
+        interpreter=HUNYUAN_CUDA_PYTHON, wrapper=HUNYUAN_CUDA_WRAPPER,
+        default_settings=HUNYUAN_CUDA_DEFAULT_SETTINGS, stages=HUNYUAN_STAGES,
+        stage_labels=HUNYUAN_STAGE_LABELS, requires_alpha=False,
+        validate_settings=_hunyuan_cuda_validate_settings,
+        build_args=_hunyuan_cuda_build_args,
+        parse_line=_hunyuan_parse_line, readiness=_hunyuan_cuda_readiness,
+    ),
+    # The AMD route fits its paint settings to the card, so views and resolution are NOT
+    # in its defaults: leaving them out is what lets fit_paint_settings decide. An explicit
+    # one still wins, which is why _hunyuan_rocm_validate_settings accepts them.
+    "hunyuan-rocm": BackendSpec(
+        id="hunyuan-rocm", label="Hunyuan3D-2.1 (AMD)",
+        interpreter=HUNYUAN_ROCM_PYTHON, wrapper=HUNYUAN_ROCM_WRAPPER,
+        default_settings=HUNYUAN_ROCM_DEFAULT_SETTINGS, stages=HUNYUAN_STAGES,
+        stage_labels=HUNYUAN_STAGE_LABELS, requires_alpha=False,
+        validate_settings=_hunyuan_rocm_validate_settings,
+        build_args=_hunyuan_rocm_build_args,
+        parse_line=_hunyuan_parse_line, readiness=_hunyuan_rocm_readiness,
+    ),
+})
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _job_status_payload(job: Job) -> dict[str, Any]:
+    """A single-shot snapshot of a job's current state -- the polling fallback for when
+    the SSE stream (_stream_events) drops and doesn't reconnect (found 2026-08-20: a fast
+    SF3D run finished server-side but the browser never learned it had, because nothing
+    covers a dead/never-recovered EventSource connection).
+
+    Deliberately the same event shape _run_job's "done"/"error" events already carry, so
+    the frontend can feed this straight into its existing applyGenerateProgress() renderer
+    instead of a separate code path."""
+    model = None
+    if job.status == "done" and OUTPUT_ROOT in job.output_path.parents and job.output_path.is_file():
+        # where the model landed, as the studio's Library names it, so a chain can carry on
+        model = job.output_path.relative_to(OUTPUT_ROOT).as_posix()
+    return {"status": job.status, "last_event": job.events[-1] if job.events else None, "model": model}
+
+
+class Handler(SimpleHTTPRequestHandler):
+    """Static repository server plus the local Generate job endpoints."""
+
+    extensions_map: ClassVar[dict[str, str]] = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        ".glb": "model/gltf-binary",
+        ".gltf": "model/gltf+json",
+        ".js": "text/javascript",
+    }
+
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def log_message(self, fmt, *args) -> None:
+        if "404" in (fmt % args):
+            super().log_message(fmt, *args)
+
+    def _send_json(self, status: int, value: Any) -> None:
+        body = _json_bytes(value)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _path_parts(self) -> list[str]:
+        return [unquote(p) for p in urlparse(self.path).path.split("/") if p]
+
+    # the key a studio reachable from a network needs (studio_auth); None on 127.0.0.1. Set by serve.py.
+    studio_token: ClassVar[str | None] = None
+
+    # one runner per server: it calls this server's own job endpoints, so a plan keeps going
+    # after the browser tab that started it is closed
+    _chain_runner: ClassVar[ChainRunner | None] = None
+
+    def _chains(self) -> ChainRunner:
+        cls = type(self)
+        if cls._chain_runner is None:
+            host, port = self.server.server_address[:2]
+            host = "127.0.0.1" if host in ("", "0.0.0.0") else host
+            cls._chain_runner = ChainRunner(OUTPUT_ROOT, activity_api.local_request(f"http://{host}:{port}", cls.studio_token))
+        return cls._chain_runner
+
+    def send_response(self, code, message=None) -> None:
+        self._status_code = int(code)   # what note_request counts a POST by
+        super().send_response(code, message)
+
+    def _refuse(self, status: int, message: str) -> None:
+        # read a small body first: closing on unread bytes resets the connection, and the
+        # caller would see a network error instead of the reason
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if 0 < length <= 1024 * 1024:
+            self.rfile.read(length)
+        else:
+            self.close_connection = True
+        self._send_json(status, {"error": message})
+
+    def _allowed(self, *, mutation: bool) -> bool:
+        """The studio page's own requests and local tools only (request_utils.check_request),
+        with the studio's key when it is reachable from a network (studio_auth)."""
+        verdict = studio_auth.check(token=type(self).studio_token, path=self.path, headers=self.headers)
+        if not verdict.ok:
+            self._refuse(401, "This studio needs its key: open the link it printed when it started "
+                              "(the one ending in ?token=...).")
+            return False
+        if verdict.redirect:
+            # the key came in the address: keep it in a cookie and drop it from the address bar
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", verdict.redirect)
+            self.send_header("Set-Cookie", verdict.set_cookie)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+        if studio_auth.hidden_path(self.path):
+            self._refuse(404, "Not found")
+            return False
+        try:
+            request_utils.check_request(self, mutation=mutation)
+        except PermissionError as exc:
+            self._refuse(403, str(exc))
+            return False
+        return True
+
+    def do_HEAD(self) -> None:
+        if self._allowed(mutation=False):
+            super().do_HEAD()
+
+    def do_POST(self) -> None:
+        self._status_code = None
+        try:
+            # every POST changes something: weights, the HF token, jobs, names
+            if self._allowed(mutation=True):
+                self._route_post()
+        finally:
+            usage_api.note_request(self._path_parts(), self.headers.get(usage_api.CLIENT_HEADER),
+                                   "POST", self._status_code)
+
+    def _route_post(self) -> None:
+        parts = self._path_parts()
+        if parts == ["api", "skins"]:
+            self._skins_post([])
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "skins"] and parts[3] in {"try", "approve", "build", "discard"}:
+            self._skins_post(parts[2:])
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "skins", "build"] and parts[4] == "cancel":
+            self._skins_post(parts[2:])
+            return
+        if parts == ["api", "chains"]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not upload_length_ok(length, CHAIN_UPLOAD_LIMIT):
+                    # refused before reading: an unbounded read (a negative length reads to the end)
+                    # let one request fill the memory
+                    self._send_json(413 if length > 0 else 400,
+                                    {"error": "That upload is too large (over 1 GB)." if length > 0
+                                     else "The request is empty."})
+                    return
+                chain = chain_from_form(parse_multipart(self.headers.get("Content-Type", ""), self.rfile.read(length)))
+                # Before the picture and the 3D model, not ten minutes later at Finish
+                if set(chain.steps) & activity_api.NEEDS_BLENDER and find_blender() is None:
+                    self._send_json(409, {"error": blender_missing_help() + " Or make it without Finish for now: "
+                                          "stop after the 3D model, and Finish it once Blender is in.",
+                                          "needs_blender": True})
+                    return
+                chain.client = usage_api.source_of(self.headers.get(usage_api.CLIENT_HEADER))
+                self._chains().submit(chain)
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(202, chain.to_dict())
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "chains"] and parts[3] == "cancel":
+            ok = self._chains().cancel(parts[2])
+            self._send_json(200 if ok else 404, {"cancelled": ok})
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "fix-spot"] and parts[2] in {"preview", "keep", "discard"}:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length)) if 0 < length <= 65536 else None
+            except (ValueError, json.JSONDecodeError):
+                payload = None
+            handler = {"preview": fixspot_api.preview_response, "keep": fixspot_api.keep_response,
+                       "discard": fixspot_api.discard_response}[parts[2]]
+            self._send_json(*fixspot_api.answer(handler, OUTPUT_ROOT, payload))
+            return
+        if parts == ["api", "blender", "install"]:
+            self._start_blender_install()
+            return
+        if parts == ["api", "models-folder"]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+                models_home.save(str(payload.get("path") or ""), MODELS_SETTING_REPO)
+            except (ValueError, json.JSONDecodeError, AttributeError) as exc:
+                self._send_json(422, {"error": str(exc) or "send {\"path\": \"/full/path\"}"})
+                return
+            self._send_json(200, models_home.describe(MODELS_STARTED_WITH, MODELS_SETTING_REPO))
+            return
+        if parts == ["api", "gltfpack", "install"]:
+            self._start_gltfpack_install()
+            return
+        if parts == ["api", "hf", "sign-in"]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else None
+            except (ValueError, json.JSONDecodeError):
+                payload = None
+            self._send_json(*hf_sign_in_response(payload))
+            return
+        if parts == ["api", "setup", "run"]:
+            self._start_setup()
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "setup"] and parts[3] in {"download", "rebuild", "cancel", "remove"}:
+            self._backend_download(parts[2], parts[3])
+            return
+        if parts == ["api", "generate"]:
+            self._create_job()
+            return
+        if parts == ["api", "trellis", "input-advice"]:
+            self._trellis_input_advice()
+            return
+        if parts == ["api", "rig", "rebind"]:
+            self._create_rig_job()
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "generate"] and parts[3] == "cancel":
+            self._cancel_job(parts[2])
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "rig", "rebind"] and parts[4] == "cancel":
+            self._cancel_rig_job(parts[3])
+            return
+        if parts == ["api", "finish"]:
+            self._create_finish_job()
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "finish"] and parts[3] == "cancel":
+            self._cancel_finish_job(parts[2])
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "finish", "runs"] and parts[4] == "resume":
+            self._resume_finish_job(parts[3])
+            return
+        if parts == ["api", "props"]:
+            self._create_props_job()
+            return
+        if parts == ["api", "animate", "rig"]:
+            self._create_animate_rig()
+            return
+        if parts == ["api", "animate", "play"]:
+            self._create_animate_play()
+            return
+        if parts == ["api", "motion"]:
+            self._create_motion_job()
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "motion"] and parts[3] == "cancel":
+            job = MOTION_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                cancel_motion_job(job)
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._send_json(202, {"job_id": job.id, "status": job.status})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "animate"] and parts[3] == "cancel":
+            job = ANIMATE_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                cancel_animate_job(job)
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._send_json(202, {"job_id": job.id, "status": job.status})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "props"] and parts[3] == "cancel":
+            self._cancel_props_job(parts[2])
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "props", "runs"] and parts[4] == "turn":
+            self._turn_prop(parts[3])
+            return
+        if parts == ["api", "image"]:
+            self._create_image_job()
+            return
+        if parts == ["api", "image", "back"]:
+            self._create_back_job()
+            return
+        if parts == ["api", "image", "brush"]:
+            self._create_brush_job()
+            return
+        if len(parts) == 4 and parts[:3] == ["api", "image", "versions"] and parts[3] in {"use", "delete"}:
+            self._change_back_version(parts[3])
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "assets"] and parts[3] == "name":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 2048 else {}
+                name = set_asset_name(OUTPUT_ROOT, parts[2], str(body.get("name", "")))
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            self._send_json(200, {"id": parts[2], "name": name})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "assets"] and parts[3] == "hidden":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 1024 else {}
+                set_asset_hidden(OUTPUT_ROOT, parts[2], bool(body.get("hidden", True)))
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            self._send_json(200, {"id": parts[2], "hidden": bool(body.get("hidden", True))})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "assets"] and parts[3] == "delete":
+            # a deletion cannot be undone, so the page must say so: a bare POST does nothing
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 1024 else {}
+                if body.get("confirm") is not True:
+                    raise ValueError("confirm the deletion first")
+                plan = delete_asset_version(OUTPUT_ROOT, parts[2])
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            self._send_json(200, {"id": parts[2], "deleted": [f["path"] for f in plan["folders"]], "bytes": plan["bytes"]})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "assets"] and parts[3] == "main":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 1024 else {}
+                set_asset_main(OUTPUT_ROOT, parts[2], bool(body.get("main", True)))
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            self._send_json(200, {"id": parts[2], "main": bool(body.get("main", True))})
+            return
+        if parts == ["api", "reveal"]:
+            self._reveal()
+            return
+        if parts == ["api", "bug-report"]:
+            self._bug_report_links()
+            return
+        if parts == ["api", "usage"]:
+            self._usage_choice()
+            return
+        if parts == ["api", "notices", "read"]:
+            # {ids: [...]}: the bell's notices the person has now seen
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+            except ValueError:
+                body = {}
+            ids = body.get("ids") if isinstance(body, dict) else None
+            notices_api.mark_read(ids if isinstance(ids, list) else [])
+            self._send_json(200, self._notices())
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "image"] and parts[3] == "cancel":
+            self._cancel_image_job(parts[2])
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _notices(self) -> dict:
+        """The bell's notices: ours from the site, plus a newer release (notices_api)."""
+        import image_to_3dlab
+        try:
+            update = update_check()
+        except Exception:
+            update = None
+        return notices_api.notices(image_to_3dlab.__version__, update)
+
+    def _create_back_job(self) -> None:
+        """Draw the back of a picture already in output/ (front + back builds)."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            # room for a 500-character "what to change" in any script (JSON escapes it 6x)
+            payload = json.loads(self.rfile.read(length)) if 0 < length <= 16384 else {}
+            front = image_api.back_source(OUTPUT_ROOT, str(payload.get("picture", "")))
+            seed = int(payload.get("seed", 3))
+            instruction = str(payload.get("instruction") or "")
+            # asked for by name: that engine. Otherwise the one Create drew the front with, else the
+            # one the front's record names (one model's pictures should match), else any that can
+            engine = image_api.choose_engine(str(payload.get("engine") or "") or None, front, edit=True,
+                                             prefer=str(payload.get("prefer_engine") or "") or None)
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        if not image_api.BINARY.exists():
+            self._send_json(503, {"error": "stable-diffusion.cpp is not installed.", "needs_setup": True})
+            return
+        waiting = busy_reason("image")
+        if waiting:
+            self._send_json(409, {"error": waiting})
+            return
+        try:
+            image_api.check_ready(engine, edit=True)
+        except image_api.MissingWeights as exc:
+            self._send_json(503, {"error": str(exc), "needs_setup": True, "missing": exc.missing})
+            return
+        try:
+            job = image_api.start_back(front, seed, engine, instruction)
+        except (ValueError, OSError) as exc:      # an unreadable or oversized front
+            self._send_json(422, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {"job_id": job.id, "settings": job.settings,
+                              "events_url": f"/api/image/{job.id}/events",
+                              "status_url": f"/api/image/{job.id}/status"})
+
+    def _create_brush_job(self) -> None:
+        """Repaint the painted area of a front or back picture (multipart: picture, mask, instruction)."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > BRUSH_UPLOAD_LIMIT:
+                raise ValueError("expected a picture path, a painted mask and what to change")
+            form = parse_multipart(self.headers.get("Content-Type", ""), self.rfile.read(length))
+            picture, stroke, instruction, seed, keep_old = brush_request(form)
+            asked = str((form.get("engine") or {}).get("value") or "").strip() or None
+        except ValueError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        if not image_api.BINARY.exists():
+            self._send_json(503, {"error": "stable-diffusion.cpp is not installed.", "needs_setup": True})
+            return
+        waiting = busy_reason("image")
+        if waiting:
+            self._send_json(409, {"error": waiting})
+            return
+        try:
+            # asked for by name, else the engine that drew this back, else any that is set up
+            engine = image_api.choose_engine(asked, picture, edit=False)
+            image_api.check_ready(engine)
+        except ValueError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        except image_api.MissingWeights as exc:
+            self._send_json(503, {"error": str(exc), "needs_setup": True, "missing": exc.missing})
+            return
+        try:
+            job = image_api.start_brush(picture, stroke, instruction, seed, engine, keep_old)
+        except ValueError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {"job_id": job.id, "settings": job.settings,
+                              "events_url": f"/api/image/{job.id}/events",
+                              "status_url": f"/api/image/{job.id}/status"})
+
+    def _change_back_version(self, action: str) -> None:
+        """Use or delete a kept version of a back (JSON: back, version)."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+        except (ValueError, json.JSONDecodeError):
+            body = {}
+        # a picture run may be about to swap this very back in when it finishes
+        if _running(image_api.MANAGER):
+            self._send_json(409, {"error": "a picture is being made; wait for it to finish"})
+            return
+        try:
+            payload = change_back_version(action, body)
+        except (ValueError, OSError) as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        self._send_json(200, payload)
+
+    def _create_image_job(self) -> None:
+        """Start one text-to-image run. The prompt is the only required field."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 64 * 1024:
+                self._send_json(400, {"error": "expected a small JSON body"})
+                return
+            payload = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"error": f"could not read the request: {exc}"})
+            return
+        prompt = str(payload.get("prompt", "")).strip()
+        if not prompt:
+            self._send_json(422, {"error": "a prompt is required"})
+            return
+        if len(prompt) > image_api.MAX_PROMPT:
+            self._send_json(422, {
+                "error": f"prompt is longer than {image_api.MAX_PROMPT} characters"
+            })
+            return
+        try:
+            engine = image_api.pick_engine(payload.get("engine") or None)
+        except ValueError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        if not image_api.BINARY.exists():
+            self._send_json(503, {
+                "error": "stable-diffusion.cpp is not installed (vendor/sdcpp/sd-cli).",
+                "needs_setup": True,
+            })
+            return
+        waiting = busy_reason("image")
+        if waiting:
+            self._send_json(409, {"error": waiting})
+            return
+        try:
+            image_api.resolve_weights(engine)
+        except image_api.MissingWeights as exc:
+            self._send_json(503, {"error": str(exc), "needs_setup": True,
+                                  "missing": exc.missing})
+            return
+        try:
+            job = image_api.start(prompt, payload.get("settings") or {}, engine,
+                                  picture_only=bool(payload.get("picture_only")))
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {
+            "job_id": job.id,
+            "settings": job.settings,
+            "events_url": f"/api/image/{job.id}/events",
+            "status_url": f"/api/image/{job.id}/status",
+        })
+
+    # ------------------------------------------------------------------ skins
+    def _small_json(self, limit: int = 8192) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > limit:
+            raise ValueError("the request is too large")
+        body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        if not isinstance(body, dict):
+            raise ValueError("expected a JSON object")
+        return body
+
+    def _skin_state(self, skin: skins_api.Skin) -> dict[str, Any]:
+        """The skin, plus the job working on it now: its newest picture try or its build."""
+        build = next((b for b in skins_api.BUILDS.jobs.values()
+                      if b.skin_id == skin.id and b.status not in skins_api.TERMINAL), None)
+        state = skins_api.STORE.state(skin, build_running=build is not None)
+        tries = [t for side in skins_api.SIDES for t in skin.tries[side] if t.get("job_id")]
+        newest = max(tries, key=lambda t: t.get("started", 0), default=None)
+        job = image_api.MANAGER.jobs.get(newest["job_id"]) if newest else None
+        state["picture_job"] = job.describe() if job else None
+        state["build_job"] = build.describe() if build else None
+        return state
+
+    def _start_skin_try(self, skin: skins_api.Skin, side: str, instruction: str | None) -> dict[str, Any] | None:
+        """Start one picture try, or answer why not (and return None)."""
+        # Checked before the try is recorded: a refused start must not leave a try with no picture.
+        waiting = busy_reason("image") or ("a picture is being made; wait for it to finish"
+                                           if _running(image_api.MANAGER) else None)
+        if waiting or skins_api.BUILDS.running():
+            self._send_json(409, {"error": waiting or "a skin is being made; wait for it to finish",
+                                  "skin": self._skin_state(skin)})
+            return None
+        if not image_api.BINARY.exists():
+            self._send_json(503, {"error": "The picture engine is not installed.", "needs_setup": True})
+            return None
+        try:
+            image_api.resolve_weights()
+            if image_api.resolve_vision() is None:
+                raise image_api.MissingWeights([image_api.VISION_FILE[1]])
+        except image_api.MissingWeights as exc:
+            self._send_json(503, {"error": str(exc), "needs_setup": True, "missing": exc.missing})
+            return None
+        reference, target, prompt, seed = skins_api.STORE.picture_try(skin, side, instruction)
+        job = image_api.start_edit(reference, target, prompt, seed)
+        skin.tries[side][-1].update(job_id=job.id, started=time.time())
+        skins_api.STORE.save(skin)
+        return {"job_id": job.id, "status_url": f"/api/image/{job.id}/status",
+                "events_url": f"/api/image/{job.id}/events"}
+
+    def _skins_get(self, rest: list[str]) -> None:
+        """GET /api/skins?finished=<path> (a model's finished skins), /api/skins/<id>,
+        /api/skins/build/<job>/status."""
+        try:
+            if not rest:
+                query = parse_qs(urlparse(self.path).query)
+                finished = (query.get("finished") or [""])[0]
+                if finished:
+                    self._send_json(200, {"skins": skins_api.STORE.skins_for(finished)})
+                else:
+                    self._send_json(200, {"skins": [s.to_dict() for s in skins_api.STORE.all()]})
+                return
+            query = parse_qs(urlparse(self.path).query)
+            if rest == ["all"]:
+                # one GLB of a model (`file`: its finished or rigged model) carrying every finished skin
+                file = (query.get("file") or [""])[0]
+                asset = next((a for a in list_assets(OUTPUT_ROOT) if a["id"] == (query.get("asset") or [""])[0]), None)
+                if asset is None or file not in {asset.get("finished"), asset.get("rigged")}:
+                    raise skins_api.SkinError("pick a model and its finished or rigged file")
+                skins = [skins_api.STORE.get(k["id"]) for k in asset.get("skins", [])]
+                self._send_json(200, {"file": skins_api.all_skins(OUTPUT_ROOT, file, skins)})
+                return
+            if len(rest) == 2 and rest[1] == "dressed":
+                skin = skins_api.STORE.get(rest[0])
+                self._send_json(200, {"file": skins_api.dressed(OUTPUT_ROOT, skin, (query.get("file") or [""])[0])})
+                return
+            if len(rest) == 3 and rest[0] == "build" and rest[2] == "status":
+                job = skins_api.BUILDS.jobs.get(rest[1])
+                self._send_json(200 if job else 404, job.describe() if job else {"error": "no such build"})
+                return
+            if len(rest) == 1:
+                self._send_json(200, self._skin_state(skins_api.STORE.get(rest[0])))
+                return
+        except skins_api.SkinError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except ValueError as exc:   # a model the skin's paint can't be put on
+            self._send_json(422, {"error": str(exc)})
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _skins_post(self, rest: list[str]) -> None:
+        """POST /api/skins {asset, instruction, name?}: a new skin, its first front try started.
+        /api/skins/<id>/try {side, instruction?}, /approve {side, number?}, /build,
+        /api/skins/build/<job>/cancel."""
+        try:
+            body = self._small_json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"error": f"could not read the request: {exc}"})
+            return
+        try:
+            if not rest:
+                asset = next((a for a in list_assets(OUTPUT_ROOT) if a["id"] == str(body.get("asset", ""))), None)
+                if asset is None:
+                    raise skins_api.SkinError("no such model in the Library")
+                skin = skins_api.STORE.create(asset, str(body.get("instruction", "")), body.get("name"))
+                started = self._start_skin_try(skin, "front", None)
+                if started is not None:
+                    self._send_json(202, {"skin": self._skin_state(skin), "picture_job": started})
+                return
+            if len(rest) == 3 and rest[0] == "build" and rest[2] == "cancel":
+                ok = skins_api.BUILDS.cancel(rest[1])
+                self._send_json(202 if ok else 409, {"cancelled": ok})
+                return
+            if len(rest) != 2:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            skin = skins_api.STORE.get(rest[0])
+            action = rest[1]
+            if action == "try":
+                started = self._start_skin_try(skin, str(body.get("side", "front")), body.get("instruction"))
+                if started is not None:
+                    self._send_json(202, {"skin": self._skin_state(skin), "picture_job": started})
+                return
+            if action == "approve":
+                if skins_api.BUILDS.running():
+                    self._send_json(409, {"error": "a skin is being made; wait for it to finish"})
+                    return
+                number = body.get("number")
+                skin = skins_api.STORE.approve(skin, str(body.get("side", "front")),
+                                               int(number) if number is not None else None)
+                started = None
+                # The back follows the front at once, with the same change asked for.
+                if skin.next_side() == "back" and not skin.tries["back"]:
+                    started = self._start_skin_try(skin, "back", None)
+                    if started is None:
+                        return
+                self._send_json(200, {"skin": self._skin_state(skin), "picture_job": started})
+                return
+            if action == "discard":
+                drawing = any(image_api.MANAGER.jobs.get(t.get("job_id")) is not None
+                              and image_api.MANAGER.jobs[t["job_id"]].status in {"queued", "running"}
+                              for side in skins_api.SIDES for t in skin.tries[side])
+                building = any(b.skin_id == skin.id and b.status not in skins_api.TERMINAL
+                               for b in skins_api.BUILDS.jobs.values())
+                if drawing or building:
+                    self._send_json(409, {"error": "This skin is being drawn or painted; wait for it to finish."})
+                    return
+                skins_api.STORE.discard(skin)
+                self._send_json(200, {"discarded": skin.id})
+                return
+            if action == "build":
+                waiting = busy_reason("skin")
+                if waiting:
+                    self._send_json(409, {"error": waiting})
+                    return
+                job = skins_api.BUILDS.start(skin)
+                self._send_json(202, {"job_id": job.id, "skin": skin.to_dict(),
+                                      "status_url": f"/api/skins/build/{job.id}/status"})
+                return
+        except skins_api.SkinError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _cancel_image_job(self, job_id: str) -> None:
+        if not _safe_id(job_id) or job_id not in image_api.MANAGER.jobs:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if not image_api.MANAGER.cancel(job_id):
+            self._send_json(409, {"error": "that image job is not running"})
+            return
+        self._send_json(202, {"job_id": job_id, "status": "cancelling"})
+
+    def _image_events(self, job_id: str) -> None:
+        job = image_api.MANAGER.jobs.get(job_id) if _safe_id(job_id) else None
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._start_event_stream()
+        index = 0
+        try:
+            while True:
+                with job.condition:
+                    if index >= len(job.events):
+                        job.condition.wait(timeout=15)
+                    pending = job.events[index:]
+                    index = len(job.events)
+                    terminal = (job.status in {"done", "error", "cancelled"}
+                                and not pending)
+                for event in pending:
+                    body = json.dumps(event, separators=(",", ":"))
+                    self.wfile.write(f"data: {body}\n\n".encode())
+                if not pending:
+                    self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                if terminal:
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _trellis_input_advice(self) -> None:
+        """Classify one upload without creating a generation job or retaining the image."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 50 * 1024 * 1024:
+                self._send_json(400, {"error": "image upload is missing or larger than 50 MiB"})
+                return
+            form = parse_multipart(
+                self.headers.get("Content-Type", ""), self.rfile.read(length)
+            )
+            image_field = form.get("image")
+            filename = str(image_field.get("filename")) if image_field else ""
+            suffix = Path(filename).suffix.lower()
+            if not image_field or suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+                self._send_json(422, {
+                    "error": "multipart field 'image' must be PNG, JPG, WebP, or BMP"
+                })
+                return
+            with tempfile.TemporaryDirectory(prefix="i2l-tinyclip-") as directory:
+                image_path = Path(directory) / f"input{suffix}"
+                image_path.write_bytes(image_field["data"])
+                payload = run_trellis_input_advisor(image_path)
+            self._send_json(200, payload)
+        except RuntimeError as exc:
+            self._send_json(503, {"error": str(exc), "advisory_only": True})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc), "advisory_only": True})
+
+    def list_directory(self, path):
+        # Never list folders: the server's root is the whole repository.
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def do_GET(self) -> None:
+        if not self._allowed(mutation=False):
+            return
+        if self.headers.get(usage_api.CLIENT_HEADER):
+            usage_api.note_request(self._path_parts(), self.headers.get(usage_api.CLIENT_HEADER), "GET", None)
+        if urlparse(self.path).path in ("", "/", "/viewer", "/viewer/"):
+            self.send_response(HTTPStatus.FOUND)  # the front door is the studio
+            self.send_header("Location", "/viewer/studio.html")
+            self.end_headers()
+            return
+        parts = self._path_parts()
+        if parts[:2] == ["api", "skins"]:
+            self._skins_get(parts[2:])
+            return
+        if parts == ["api", "models-folder"]:
+            self._send_json(200, models_home.describe(MODELS_STARTED_WITH, MODELS_SETTING_REPO))
+            return
+        if parts == ["api", "hf", "status"]:
+            self._send_json(200, hf_api.status())
+            return
+        if parts == ["api", "catalog"]:
+            self._send_json(200, catalog_payload())
+            return
+        if parts == ["api", "recipes"]:
+            # what we know about prompting each goal; the CLI and MCP read the same file
+            try:
+                self._send_json(200, json.loads((REPO / "image_to_3dlab" / "prompt_recipes.json").read_text(encoding="utf-8")))
+            except (OSError, ValueError) as exc:
+                self._send_json(500, {"error": f"prompt recipes unreadable: {exc}"})
+            return
+        if parts == ["api", "chains"]:
+            # the plan running now, else the newest few (so a reopened tab can pick its run back up)
+            runner = self._chains()
+            self._send_json(200, {"running": (c.to_dict() if (c := runner.running()) else None),
+                                  "recent": [c.to_dict() for c in runner.recent(5)]})
+            return
+        if len(parts) == 3 and parts[:2] == ["api", "chains"]:
+            chain = self._chains().chains.get(parts[2])
+            self._send_json(200 if chain else 404, chain.to_dict() if chain else {"error": "no such run"})
+            return
+        if parts == ["api", "thumb"]:
+            relative = parse_qs(urlparse(self.path).query).get("path", [""])[0]
+            try:
+                data = asset_thumbnail(OUTPUT_ROOT, relative).read_bytes()
+            except (ValueError, OSError) as exc:
+                self._send_json(404, {"error": str(exc)})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if parts == ["api", "activity"]:
+            self._send_json(200, {"history": read_history(OUTPUT_ROOT)})
+            return
+        if parts == ["api", "preview"]:
+            self._send_preview()
+            return
+        if parts == ["api", "model-info"]:
+            self._send_model_info()
+            return
+        if parts == ["api", "bug-report"]:
+            query = parse_qs(urlparse(self.path).query)
+            pick = {k: query.get(k, [""])[0] or None for k in ("chain", "step")}
+            failure = bug_report_api.find_failure(OUTPUT_ROOT, **pick)
+            self._send_json(200, {
+                "details": bug_report_api.details(OUTPUT_ROOT, include_prompt=query.get("prompt", [""])[0] == "1", **pick),
+                "failure": bool(failure), "has_prompt": bool(failure and failure.get("prompt")),
+            })
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "assets"] and parts[3] == "delete-plan":
+            try:
+                self._send_json(200, plan_asset_delete(OUTPUT_ROOT, parts[2]))
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+            return
+        if parts == ["api", "assets"]:
+            try:
+                self._send_json(200, assets_payload(OUTPUT_ROOT))
+            except Exception as exc:  # a broken run folder must not take the whole Library down
+                self._send_json(500, {"error": str(exc)})
+            return
+        if parts == ["api", "update-check"]:
+            self._send_json(200, update_check())
+            return
+        if parts == ["api", "notices"]:
+            self._send_json(200, self._notices())
+            return
+        if parts == ["api", "usage"]:
+            usage_api.send_soon()   # asked once per page load; at most one message a day goes out
+            self._send_json(200, usage_api.status())
+            return
+        if parts == ["api", "welcome"]:
+            since = parse_qs(urlparse(self.path).query).get("since", [None])[0]
+            self._send_json(200, welcome_payload(since))
+            return
+        if parts == ["api", "setup"]:
+            query = parse_qs(urlparse(self.path).query)
+            backend_id = query.get("backend", ["trellis"])[0]
+            # The catalogue decides what a route *is*; a backend spec, where one exists,
+            # adds the live detail only it can probe (which Hunyuan checkpoint is on disk,
+            # how many of the nine GGUF files arrived). Asking the specs first is what made
+            # the image route, which has no spec because it makes pictures rather than
+            # meshes, answer "unknown backend" for something the catalogue lists.
+            payload = catalog_readiness(backend_id)
+            if payload is None:
+                self._send_json(422, {"error": f"unknown backend {backend_id!r}"})
+                return
+            spec = backend_spec(backend_id)
+            if spec is not None:
+                live = spec.readiness()
+                # A spec that reports no weights is not saying "this backend has none",
+                # it is saying it does not track them -- SF3D and the dgrauet Hunyuan
+                # route both return an empty dict. Letting that overwrite the catalogue
+                # would hide the weight rows the Setup page shows for the same backend.
+                for key in ("weights", "missing_weights"):
+                    if not live.get(key):
+                        live.pop(key, None)
+                payload = {**payload, **live, "backend": spec.id}
+            self._send_json(200, payload)
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "image"]:
+            job = image_api.MANAGER.jobs.get(parts[2]) if _safe_id(parts[2]) else None
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if parts[3] == "events":
+                self._image_events(parts[2])
+                return
+            if parts[3] == "status":
+                self._send_json(200, job.describe())
+                return
+            if parts[3] == "result.png":
+                if job.status != "done" or not job.output_path.exists():
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                data = job.output_path.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if parts == ["api", "image", "versions"]:
+            try:
+                payload = back_versions_payload(parse_qs(urlparse(self.path).query).get("back", [""])[0])
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            self._send_json(200, payload)
+            return
+        if parts == ["api", "image", "defaults"]:
+            # The engine a picture would use now, at the top level as before; every engine below.
+            engine = image_api.pick_engine()
+            self._send_json(200, {
+                "engine": engine.id,
+                "defaults": engine.defaults,
+                "samplers": list(image_api.SAMPLERS),
+                "installed": image_api.is_installed(engine),
+                "license": {"name": engine.licence_name, "url": engine.licence_url,
+                            "attribution": engine.attribution},
+                "engines": picture_engines_payload(),
+            })
+            return
+        if parts == ["api", "backends"]:
+            self._send_json(200, backends_payload())
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "setup"] and parts[3] in {"events", "status"}:
+            run = DOWNLOADS.get(parts[2])
+            if run is not None:
+                if parts[3] == "events":
+                    self._stream_events(run)
+                else:
+                    self._send_json(200, download_status_payload(run))
+                return
+        # /api/setup/run/<id>/events: five parts, as _start_setup and the Blender
+        # install hand it out.
+        if len(parts) == 5 and parts[:3] == ["api", "setup", "run"] and parts[4] == "events":
+            run = SETUP_RUNS.get(parts[3]) if _safe_id(parts[3]) else None
+            if run is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self._stream_events(run)
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "generate"]:
+            job_id, action = parts[2], parts[3]
+            if action == "events":
+                self._events(job_id)
+                return
+            if action == "status":
+                self._status(job_id)
+                return
+            if action in {"result.glb", "manifest.json"}:
+                self._artifact(job_id, action)
+                return
+        if parts == ["api", "finish", "capabilities"]:
+            self._send_json(200, finish_capabilities())
+            return
+        if parts == ["api", "finish", "runs"]:
+            self._send_json(200, {"runs": list_finish_runs(FINISH_JOBS.output_root)})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "finish"]:
+            job_id, action = parts[2], parts[3]
+            if action == "events":
+                self._finish_events(job_id)
+                return
+            if action == "status":
+                self._finish_status(job_id)
+                return
+            if action in FINISH_ARTIFACTS:
+                self._finish_artifact(job_id, action)
+                return
+        if parts == ["api", "animate", "models"]:
+            try:
+                self._send_json(200, {"models": animate_models(OUTPUT_ROOT),
+                                      "presets": animate_presets(),
+                                      "aliases": animate_aliases(),
+                                      "installed": autorig_installed()})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+        if parts == ["api", "motion", "prompts"]:
+            try:
+                self._send_json(200, {"prompts": motion_presets(),
+                                      "installed": motion_installed(),
+                                      "missing_note": motion_missing_note()})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "animate"]:
+            job = ANIMATE_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if parts[3] == "events":
+                self._stream_events(job)
+                return
+            if parts[3] == "status":
+                self._send_json(200, animate_status_payload(job))
+                return
+        if len(parts) == 4 and parts[:2] == ["api", "motion"]:
+            job = MOTION_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if parts[3] == "events":
+                self._stream_events(job)
+                return
+            if parts[3] == "status":
+                self._send_json(200, motion_status_payload(job))
+                return
+        if parts == ["api", "props", "tools"]:
+            self._send_json(200, props_tools_payload())
+            return
+        if parts == ["api", "props", "runs"]:
+            try:
+                payload = {
+                    "runs": list_props_runs(PROPS_JOBS.output_root),
+                    "generated": generated_models(OUTPUT_ROOT),
+                    "tools": props_tools_payload(),
+                }
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+                return
+            self._send_json(200, payload)
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "props"]:
+            job = PROPS_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if parts[3] == "events":
+                self._stream_events(job)
+                return
+            if parts[3] == "status":
+                self._send_json(200, props_status_payload(job))
+                return
+        if len(parts) == 5 and parts[:3] == ["api", "rig", "rebind"]:
+            job_id, action = parts[3], parts[4]
+            if action == "events":
+                self._rig_events(job_id)
+                return
+            if action == "status":
+                self._rig_status(job_id)
+                return
+            if action in RIG_ARTIFACTS:
+                self._rig_artifact(job_id, action)
+                return
+        super().do_GET()
+
+    def _create_job(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 50 * 1024 * 1024:
+                self._send_json(400, {"error": "image upload is missing or larger than 50 MiB"})
+                return
+            body = self.rfile.read(length)
+            form = parse_multipart(self.headers.get("Content-Type", ""), body)
+            image_field = form.get("image")
+            if image_field is None or not image_field.get("filename"):
+                self._send_json(400, {"error": "multipart field 'image' is required"})
+                return
+            settings_value = form.get("settings", {}).get("value", "{}")
+            try:
+                raw_settings = json.loads(settings_value)
+            except json.JSONDecodeError as exc:
+                self._send_json(422, {"error": f"invalid settings JSON: {exc}"})
+                return
+            if not isinstance(raw_settings, dict):
+                self._send_json(422, {"error": "settings must be a JSON object"})
+                return
+            backend_id = raw_settings.pop("backend", "trellis")
+            output_name = raw_settings.pop("output_name", None)
+            debug = bool(raw_settings.pop("debug", False))
+            try:
+                output_base = _resolve_output_base(raw_settings.pop("output_dir", None))
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            spec = backend_spec(backend_id)
+            if spec is None:
+                self._send_json(422, {"error": f"unknown backend {backend_id!r}"})
+                return
+            if not spec.readiness()["ready"]:
+                self._send_json(503, {"error": f"{spec.label} is not installed/ready"})
+                return
+            # Free card memory is asked here, not discovered two minutes in by the GPU
+            # refusing an allocation. It warns rather than refuses: the floor is measured on
+            # one card, and a shared-memory chip (an AMD APU) can report a small VRAM figure
+            # while the GPU borrows system RAM, so a refusal would lock out runs that work.
+            busy = gpu_busy_check(spec)
+            waiting = busy_reason("generate")
+            if waiting:
+                self._send_json(409, {"error": waiting})
+                return
+            try:
+                settings = spec.validate_settings(raw_settings)
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except Exception as exc:
+                # A validator bug must not reach the browser as a bare repr. `KeyError` on a
+                # setting name printed as just `'max_num_view'`, with nothing on the server's
+                # terminal: the run looked like it had simply stopped. Name the exception and
+                # the route, and say where to look.
+                print(f"[generate] {backend_id} validate_settings raised "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                self._send_json(500, {"error": (
+                    f"{spec.label} could not read the settings for this run "
+                    f"({type(exc).__name__}: {exc}). This is a bug in the route's settings "
+                    f"check, not in your picture. The server's terminal has the traceback.")})
+                return
+            back_field = form.get("back")
+            if back_field is not None and back_field.get("filename"):
+                if backend_id != "pixal3d":
+                    self._send_json(422, {"error": "a back picture works with Pixal3D only"})
+                    return
+                ready, hint = pixal3d_front_back_ready()
+                if not ready:
+                    self._send_json(503, {"error": hint, "needs_setup": True})
+                    return
+                back_suffix = Path(str(back_field["filename"])).suffix.lower()
+                if back_suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                    self._send_json(422, {"error": "unsupported back picture; use PNG, JPG or WebP"})
+                    return
+                settings["back_name"] = f"back{back_suffix}"
+            else:
+                back_field = None
+            suffix = Path(str(image_field["filename"])).suffix.lower()
+            if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+                self._send_json(422, {"error": "unsupported image type; use PNG, JPG, WebP, or BMP"})
+                return
+            image_stem = _slugify(Path(str(image_field["filename"])).stem)
+            # Reserve a provisional directory only after validation, then persist the upload.
+            provisional = OUTPUT_ROOT / uuid.uuid4().hex
+            provisional.mkdir(parents=True, exist_ok=False)
+            image_path = provisional / f"input{suffix}"
+            with image_path.open("wb") as handle:
+                handle.write(image_field["data"])
+            if back_field is not None:
+                (provisional / settings["back_name"]).write_bytes(back_field["data"])
+            try:
+                cut_needed = spec.requires_alpha and needs_cut(image_path)
+            except RuntimeError as exc:
+                for child in provisional.iterdir():
+                    child.unlink()
+                provisional.rmdir()
+                self._send_json(500, {"error": str(exc)})
+                return
+            if cut_needed:
+                try:
+                    image_path, settings["matted_with"] = matte_upload(image_path)
+                except Exception as exc:
+                    for child in provisional.iterdir():
+                        child.unlink()
+                    provisional.rmdir()
+                    self._send_json(422, {
+                        "error": "This picture needs its background removed and the remover "
+                                 f"failed ({exc}). Upload a PNG with a transparent background."
+                    })
+                    return
+            # JobManager builds the real, human-readable job directory. Move the upload into it
+            # so the id and artifact URLs are stable, without ever accepting a client-provided path.
+            provisional_image = image_path
+            try:
+                job = JOBS.create(provisional_image, settings, backend_id, image_stem,
+                                  output_name, output_base, debug)
+            except RuntimeError as exc:
+                for child in provisional.iterdir():
+                    child.unlink()
+                provisional.rmdir()
+                self._send_json(409, {"error": str(exc)})
+                return
+            final_image = job.directory / image_path.name
+            for child in provisional.iterdir():  # the upload, plus the original if we cut it out
+                child.replace(job.directory / child.name)
+            provisional.rmdir()
+            job.image_path = final_image
+            warning = gpu_busy_warning(busy)
+            if warning:
+                job.append_log(warning)
+            threading.Thread(target=_run_job, args=(job,), daemon=True).start()
+            self._send_json(202, {"job_id": job.id, "events_url": f"/api/generate/{job.id}/events",
+                                  "output_dir": str(job.directory.relative_to(REPO)),
+                                  "warning": warning})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _create_rig_job(self) -> None:
+        try:
+            waiting = busy_reason("rebind")
+            if waiting:
+                self._send_json(409, {"error": waiting})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 768 * 1024 * 1024:
+                self._send_json(400, {"error": "rebind bundle is missing or larger than 768 MiB"})
+                return
+            form = parse_multipart(
+                self.headers.get("Content-Type", ""), self.rfile.read(length)
+            )
+            required = {"asset": ".glb", "scene": ".blend", "sidecar": ".rig.json"}
+            for field, suffix in required.items():
+                value = form.get(field)
+                filename = str(value.get("filename")) if value else ""
+                if not value or not filename.lower().endswith(suffix):
+                    self._send_json(422, {
+                        "error": f"multipart field {field!r} must be a {suffix} file"
+                    })
+                    return
+            try:
+                job = RIG_JOBS.create(
+                    str(form["asset"]["filename"]), form["asset"]["data"],
+                    form["scene"]["data"], form["sidecar"]["data"],
+                )
+            except (ValueError, RuntimeError) as exc:
+                self._send_json(422 if isinstance(exc, ValueError) else 409, {"error": str(exc)})
+                return
+            threading.Thread(
+                target=run_rig_job, args=(job,), daemon=True, name=f"rig-{job.id[:8]}"
+            ).start()
+            self._send_json(202, {
+                "job_id": job.id,
+                "events_url": f"/api/rig/rebind/{job.id}/events",
+                "status_url": f"/api/rig/rebind/{job.id}/status",
+            })
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _animate_blocked(self) -> str | None:
+        """Why an Animate job cannot start now. The auto-rig loads an ~8 GB model, so it
+        waits for anything else that holds the GPU or unified memory."""
+        waiting = busy_reason("animate")
+        if waiting:
+            return waiting
+        if not autorig_installed():
+            return "Auto-rig is not installed. Set it up on the Setup & Status page."
+        return None
+
+    def _start_animate(self, job) -> None:
+        threading.Thread(target=run_animate_job, args=(job,), daemon=True,
+                         name=f"animate-{job.id[:8]}").start()
+        self._send_json(202, {"job_id": job.id, "kind": job.kind,
+                              "events_url": f"/api/animate/{job.id}/events",
+                              "status_url": f"/api/animate/{job.id}/status"})
+
+    def _motion_blocked(self) -> str | None:
+        """Why a Motion job cannot start now. The sampler holds the GPU, so it waits for
+        anything else that does, and it needs UniMate's own environment and checkpoint."""
+        waiting = busy_reason("motion")
+        if waiting:
+            return waiting
+        note = motion_missing_note()
+        if note:
+            return f"UniMate motion is not ready. {note}"
+        return None
+
+    def _start_motion(self, job) -> None:
+        threading.Thread(target=run_motion_job, args=(job,), daemon=True,
+                         name=f"motion-{job.id[:8]}").start()
+        self._send_json(202, {"job_id": job.id, "kind": job.kind,
+                              "events_url": f"/api/motion/{job.id}/events",
+                              "status_url": f"/api/motion/{job.id}/status"})
+
+    def _create_motion_job(self) -> None:
+        """UniMate motion: JSON {model, prompt, cfg_scale, repetitions, seed, loop}, where
+        model is a rigged GLB's path, or multipart with a rigged GLB in field 'asset'."""
+        try:
+            blocked = self._motion_blocked()
+            if blocked:
+                self._send_json(409, {"error": blocked})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 512 * 1024 * 1024:
+                self._send_json(400, {"error": "request is missing or larger than 512 MiB"})
+                return
+            content_type = self.headers.get("Content-Type", "")
+            rigged: Path | None = None
+            body: dict[str, Any] = {}
+            if "multipart" in content_type:
+                form = parse_multipart(content_type, self.rfile.read(length))
+                asset = form.get("asset")
+                if asset and str(asset.get("filename", "")).lower().endswith(".glb"):
+                    source = None
+                    keep = OUTPUT_ROOT / "motion" / "uploads" / uuid.uuid4().hex[:10]
+                    keep.mkdir(parents=True, exist_ok=True)
+                    rigged = keep / str(asset["filename"])
+                    rigged.write_bytes(asset["data"])
+                else:
+                    self._send_json(422, {"error": "send a rigged .glb in 'asset'"})
+                    return
+                settings_value = str((form.get("settings") or {}).get("value", "")).strip()
+                try:
+                    body = json.loads(settings_value) if settings_value else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "invalid settings JSON"})
+                    return
+            else:
+                try:
+                    body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "expected a JSON object"})
+                    return
+            if not isinstance(body, dict):
+                self._send_json(422, {"error": "expected a JSON object"})
+                return
+            if rigged is None:
+                chosen = str(body.get("model", "")).strip()
+                if not chosen:
+                    self._send_json(422, {"error": "name the rigged model"})
+                    return
+                path = self._rigged_model_path(chosen)
+                if path is None:
+                    self._send_json(422, {"error": f"not a rigged model: {chosen!r}"})
+                    return
+                rigged, source = path, motion_source_record(path)
+            try:
+                job = MOTION_JOBS.create(
+                    rigged, str(body.get("prompt", "")), body.get("cfg_scale", 3.0),
+                    body.get("repetitions", 1), body.get("seed"), bool(body.get("loop")),
+                    source,
+                )
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._start_motion(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    @staticmethod
+    def _rigged_model_path(relative: str) -> Path | None:
+        """A rigged GLB's absolute path, from the relative path the Library / a plan names
+        it by. Refuses anything that is not a rig run's ``_rigged.glb``."""
+        try:
+            path = (OUTPUT_ROOT / relative).resolve()
+        except (OSError, ValueError):
+            return None
+        if OUTPUT_ROOT.resolve() not in path.parents or not path.is_file():
+            return None
+        if motion_api.rig_run_of(path) is None:
+            return None
+        return path
+
+    def _create_animate_rig(self) -> None:
+        """Rig a model: a GLB uploaded in field 'asset', or one the lab made, named in
+        field 'model' by the path /api/animate/models listed it under."""
+        try:
+            blocked = self._animate_blocked()
+            if blocked:
+                self._send_json(409, {"error": blocked})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 512 * 1024 * 1024:
+                self._send_json(400, {"error": "request is missing or larger than 512 MiB"})
+                return
+            form = parse_multipart(self.headers.get("Content-Type", ""), self.rfile.read(length))
+            asset = form.get("asset")
+            chosen = str((form.get("model") or {}).get("value", "")).strip()
+            if asset and str(asset.get("filename", "")).lower().endswith(".glb"):
+                name, data, record, origin = str(asset["filename"]), asset["data"], None, "uploaded"
+            elif chosen:
+                try:
+                    path = resolve_animate_model(chosen, OUTPUT_ROOT)
+                except ValueError as exc:
+                    self._send_json(422, {"error": str(exc)})
+                    return
+                name, data = path.name, path.read_bytes()
+                record, origin = animate_source_record(path), "generated"
+            else:
+                self._send_json(422, {"error": "send a .glb in 'asset' or a listed 'model'"})
+                return
+            try:
+                job = ANIMATE_JOBS.create_rig(name, data, record, origin)
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._start_animate(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _create_animate_play(self) -> None:
+        """Play a preset on a rigged model: JSON {model, preset, arm_spread, speed}."""
+        try:
+            blocked = self._animate_blocked()
+            if blocked:
+                self._send_json(409, {"error": blocked})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else None
+            except json.JSONDecodeError:
+                body = None
+            if not isinstance(body, dict):
+                self._send_json(422, {"error": "expected a JSON object"})
+                return
+            try:
+                rigged = resolve_animate_model(str(body.get("model", "")), OUTPUT_ROOT)
+                job = ANIMATE_JOBS.create_animation(rigged, str(body.get("preset", "")),
+                                                    body.get("arm_spread", 0), body.get("speed"),
+                                                    body.get("in_place"))
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._start_animate(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _create_finish_job(self) -> None:
+        """Retopologise, repaint and compress a GLB the viewer already has.
+
+        Deliberately refuses while a generation is running: the repaint stage loads its own
+        multi-gigabyte model, and two of those at once is how this machine runs out of
+        unified memory.
+        """
+        try:
+            active = JOBS.get(JOBS.active) if JOBS.active else None
+            if active is not None and active.status in {"queued", "running", "cancelling"}:
+                self._send_json(409, {"error": "a generation is running; wait for it to finish"})
+                return
+            if SETUP_ACTIVE is not None:
+                self._send_json(409, {"error": "setup is running; wait for it to finish"})
+                return
+            if _props_baking():
+                self._send_json(409, {"error": "a prop sheet is baking; wait for it to finish"})
+                return
+            if _animate_running():
+                self._send_json(409, {"error": "an auto-rig or animation is running; wait for it to finish"})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 768 * 1024 * 1024:
+                self._send_json(400, {"error": "finish bundle is missing or larger than 768 MiB"})
+                return
+            form = parse_multipart(
+                self.headers.get("Content-Type", ""), self.rfile.read(length)
+            )
+            asset = form.get("asset")
+            asset_name = str(asset.get("filename")) if asset else ""
+            if not asset or not asset_name.lower().endswith(".glb"):
+                self._send_json(422, {"error": "multipart field 'asset' must be a .glb file"})
+                return
+            # The picture is optional: without one, Finish cleans up and re-bakes the mesh
+            # alone (no Pixel Match), so a model uploaded with no picture can still finish.
+            image = form.get("image")
+            image_name = str(image.get("filename")) if image else ""
+            if image and Path(image_name).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                self._send_json(422, {
+                    "error": "multipart field 'image' must be the source art (PNG/JPG/WebP)"
+                })
+                return
+            try:
+                raw_settings = json.loads(form.get("settings", {}).get("value", "{}"))
+            except json.JSONDecodeError as exc:
+                self._send_json(422, {"error": f"invalid settings JSON: {exc}"})
+                return
+            if not isinstance(raw_settings, dict):
+                self._send_json(422, {"error": "settings must be a JSON object"})
+                return
+            # Checked here rather than a minute into the run, where a missing Blender used
+            # to surface as a bare worker exit code.
+            if find_blender() is None:
+                self._send_json(409, {"error": blender_missing_help()})
+                return
+            try:
+                job = FINISH_JOBS.create(
+                    asset_name, asset["data"], image["data"] if image else None, raw_settings,
+                )
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            threading.Thread(
+                target=run_finish_job, args=(job,), daemon=True, name=f"finish-{job.id[:8]}"
+            ).start()
+            self._send_json(202, {
+                "job_id": job.id,
+                "settings": job.settings,
+                "events_url": f"/api/finish/{job.id}/events",
+                "status_url": f"/api/finish/{job.id}/status",
+            })
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _finish_events(self, job_id: str) -> None:
+        job = FINISH_JOBS.get(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._stream_events(job)
+
+    def _finish_status(self, job_id: str) -> None:
+        job = FINISH_JOBS.get(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_json(200, finish_status_payload(job))
+
+    def _finish_artifact(self, job_id: str, action: str) -> None:
+        job = FINISH_JOBS.get(job_id)
+        if job is None or job.status != "done":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        attribute, content_type = FINISH_ARTIFACTS[action]
+        path = getattr(job, attribute)
+        if not path.is_file() or job.directory not in path.parents:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        data = path.read_bytes()
+        disposition = "inline" if action == "result.glb" else "attachment"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'{disposition}; filename="{path.name}"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _resume_finish_job(self, name: str) -> None:
+        """Re-run one existing run directory, skipping the stages it already completed.
+
+        No upload and no settings: both come from the directory, which is what makes the
+        resume faithful. A run that still needs its repaint costs six minutes; one that
+        only lost its compression costs a second.
+        """
+        with SETUP_LOCK:
+            waiting = busy_reason("finish")
+            if waiting:
+                self._send_json(409, {"error": waiting})
+                return
+        try:
+            if find_blender() is None:
+                raise RuntimeError(blender_missing_help())
+            job = FINISH_JOBS.adopt(name)
+        except (RuntimeError, ValueError) as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        threading.Thread(
+            target=run_finish_job, args=(job,), daemon=True, name=f"finish-{job.id[:8]}"
+        ).start()
+        self._send_json(202, {
+            "job_id": job.id,
+            "directory": job.directory.name,
+            "settings": job.settings,
+            "events_url": f"/api/finish/{job.id}/events",
+            "status_url": f"/api/finish/{job.id}/status",
+        })
+
+    def _cancel_finish_job(self, job_id: str) -> None:
+        job = FINISH_JOBS.get(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            cancel_finish_job(job)
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {"job_id": job.id, "status": job.status})
+
+    def _props_busy(self) -> str | None:
+        """Why a prop-sheet job cannot start now, or None.
+
+        Its bakes are Blender on the CPU, but a generation or a finishing repaint holds
+        gigabytes of model in unified memory, and a Blender bake on top of that is how
+        this machine starts swapping.
+        """
+        return busy_reason("props")
+
+    def _start_props_job(self, job) -> None:
+        threading.Thread(
+            target=run_props_job, args=(job,), daemon=True, name=f"props-{job.id[:8]}"
+        ).start()
+        self._send_json(202, {
+            "job_id": job.id,
+            "directory": job.directory.name,
+            "settings": job.settings,
+            "events_url": f"/api/props/{job.id}/events",
+            "status_url": f"/api/props/{job.id}/status",
+        })
+
+    def _create_props_job(self) -> None:
+        """Split a prop-sheet GLB into props and bake each one's LODs.
+
+        The GLB is an upload, or one the Generate tab already wrote, named by the path
+        `/api/props/runs` listed it under; nothing else on disk can be named.
+        """
+        try:
+            busy = self._props_busy()
+            if busy:
+                self._send_json(409, {"error": busy})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 768 * 1024 * 1024:
+                self._send_json(400, {"error": "prop sheet is missing or larger than 768 MiB"})
+                return
+            form = parse_multipart(
+                self.headers.get("Content-Type", ""), self.rfile.read(length)
+            )
+            asset = form.get("asset")
+            generated = str(form.get("generated", {}).get("value", "")).strip()
+            source_record, from_generated = None, False
+            if asset and str(asset.get("filename", "")).lower().endswith(".glb"):
+                asset_name, data = str(asset["filename"]), asset["data"]
+            elif generated:
+                try:
+                    path = generated_model(OUTPUT_ROOT, generated)
+                except RuntimeError as exc:
+                    self._send_json(422, {"error": str(exc)})
+                    return
+                asset_name, data = path.name, path.read_bytes()
+                source_record, from_generated = source_record_for(path), True
+            else:
+                self._send_json(422, {
+                    "error": "send a .glb as 'asset', or a generated model as 'generated'"
+                })
+                return
+            try:
+                raw_settings = json.loads(form.get("settings", {}).get("value", "{}"))
+            except json.JSONDecodeError as exc:
+                self._send_json(422, {"error": f"invalid settings JSON: {exc}"})
+                return
+            if not isinstance(raw_settings, dict):
+                self._send_json(422, {"error": "settings must be a JSON object"})
+                return
+            try:
+                job = PROPS_JOBS.create(asset_name, data, raw_settings, source_record,
+                                        generated=from_generated)
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._start_props_job(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _turn_prop(self, name: str) -> None:
+        """Turn one prop of a finished run about the vertical and re-bake only it."""
+        try:
+            busy = self._props_busy()
+            if busy:
+                self._send_json(409, {"error": busy})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 4096:
+                self._send_json(400, {"error": "expected a small JSON body"})
+                return
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("expected a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"error": f"could not read the request: {exc}"})
+            return
+        try:
+            job = PROPS_JOBS.turn(name, str(payload.get("prop", "")), payload.get("degrees", 90))
+        except ValueError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._start_props_job(job)
+
+    def _cancel_props_job(self, job_id: str) -> None:
+        job = PROPS_JOBS.get(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            cancel_props_job(job)
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {"job_id": job.id, "status": job.status})
+
+    def _find_job(self, job_id: str) -> Job | None:
+        return JOBS.get(job_id) if _safe_id(job_id) else None
+
+    def _events(self, job_id: str) -> None:
+        job = self._find_job(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._stream_events(job)
+
+    def _rig_events(self, job_id: str) -> None:
+        job = RIG_JOBS.get(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._stream_events(job)
+
+    def _rig_status(self, job_id: str) -> None:
+        job = RIG_JOBS.get(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_json(200, rig_status_payload(job))
+
+    def _rig_artifact(self, job_id: str, action: str) -> None:
+        job = RIG_JOBS.get(job_id)
+        if job is None or job.status != "done":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        attribute, content_type = RIG_ARTIFACTS[action]
+        path = getattr(job, attribute)
+        if not path.is_file() or job.directory not in path.parents:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        data = path.read_bytes()
+        disposition = "inline" if action == "result.glb" else "attachment"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'{disposition}; filename="{path.name}"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _cancel_rig_job(self, job_id: str) -> None:
+        job = RIG_JOBS.get(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            cancel_rig_job(job)
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        job.emit({"phase": "error", "message": "Cancellation requested"})
+        self._send_json(202, {"job_id": job.id, "status": "cancelling"})
+
+    def _start_event_stream(self) -> None:
+        """Headers for a server-sent event stream. X-Accel-Buffering stops proxies (nginx,
+        Cloudflare, RunPod's) from holding progress back and delivering it minutes late."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+    def _stream_events(self, run: Job | SetupRun) -> None:
+        """SSE pump shared by generation jobs and setup runs."""
+        self._start_event_stream()
+        index = 0
+        try:
+            while True:
+                with run.condition:
+                    if index >= len(run.events):
+                        run.condition.wait(timeout=15)
+                    pending = run.events[index:]
+                    index = len(run.events)
+                    terminal = run.status in {"done", "error", "cancelled"} and not pending
+                for event in pending:
+                    payload = json.dumps(event, separators=(",", ":"))
+                    self.wfile.write(f"data: {payload}\n\n".encode())
+                if not pending:
+                    self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                if terminal:
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _send_model_info(self) -> None:
+        """Stats and full path for one file: `?file=<output-relative>` (the studio panel), or
+        `?asset=<id>&stage=latest` (agents)."""
+        query = parse_qs(urlparse(self.path).query)
+        relative = query.get("file", [""])[0]
+        try:
+            if not relative:
+                asset_id = query.get("asset", [""])[0]
+                asset = next((a for a in list_assets(OUTPUT_ROOT) if a["id"] == asset_id), None)
+                if asset is None:
+                    raise ValueError(f"no such asset: {asset_id}")
+                found = preview_api.stage_file(asset, query.get("stage", ["latest"])[0])
+                if found is None:
+                    raise ValueError("this asset has no file for that step yet")
+                relative = found[1]
+            self._send_json(200, model_info_api.model_info(OUTPUT_ROOT, relative))
+        except ValueError as exc:
+            self._send_json(422, {"error": str(exc)})
+
+    def _bug_report_links(self) -> None:
+        """The three ways to send a report the person has read and edited: `{message, details}`."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length)) if 0 < length <= 64_000 else {}
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        message, details = str(body.get("message", "")).strip(), str(body.get("details", ""))
+        if not message:
+            self._send_json(422, {"error": "Say what went wrong first."})
+            return
+        self._send_json(200, bug_report_api.links(message, details))
+
+    def _usage_choice(self) -> None:
+        """The About page's usage box, `{share: true|false}`, or the first-start notice's `{noticed: true}`."""
+        if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
+            # A web page elsewhere can send a plain-text form here, but not JSON without asking first
+            self._send_json(415, {"error": "send JSON"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length)) if 0 < length <= 1_000 else {}
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        if body.get("noticed") is True:
+            self._send_json(200, usage_api.set_noticed())
+            return
+        if usage_api.source_of(self.headers.get(usage_api.CLIENT_HEADER)) == usage_api.AGENT:
+            # An agent may pass on the person's yes (above), never flip the box itself
+            self._send_json(403, {"error": "Only the user can turn usage counts on or off, on the About page."})
+            return
+        if not isinstance(body.get("share"), bool):
+            self._send_json(422, {"error": "share must be true or false"})
+            return
+        self._send_json(200, usage_api.set_sharing(body["share"]))
+
+    def _reveal(self) -> None:
+        """Show one output file in Finder / Explorer / the file manager, on this machine."""
+        if not model_info_api.is_local(self.client_address[0]):
+            self._send_json(403, {"error": "Show in folder only works on the computer running the studio. "
+                                           "Use Download instead."})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+            path = model_info_api.reveal(OUTPUT_ROOT, str(body.get("file", "")))
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self._send_json(503, {"error": f"could not open the folder: {exc}"})
+            return
+        self._send_json(200, {"shown": str(path)})
+
+    def _send_preview(self) -> None:
+        """One asset from four sides as a PNG (`?asset=<id>&stage=latest&look=paint`, or `&move=wave`
+        for four moments of a move), for agents."""
+        query = parse_qs(urlparse(self.path).query)
+        asset_id = query.get("asset", [""])[0]
+        asset = next((a for a in list_assets(OUTPUT_ROOT) if a["id"] == asset_id), None)
+        if asset is None:
+            self._send_json(404, {"error": f"no such asset: {asset_id}"})
+            return
+        try:
+            path, shown = preview_api.preview(OUTPUT_ROOT, asset, query.get("stage", ["latest"])[0],
+                                              query.get("look", ["paint"])[0], blender=find_blender(),
+                                              move=query.get("move", [""])[0] or None,
+                                              skin=query.get("skin", [""])[0] or None)
+            data = path.read_bytes()
+        except ValueError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            self._send_json(503, {"error": str(exc)})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Preview-Stage", shown.encode("ascii", "replace").decode())
+        self.send_header("X-Preview-Path", str(path.relative_to(OUTPUT_ROOT)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _backend_download(self, backend_id: str, action: str) -> None:
+        """Start or stop one backend's weight download.
+
+        Deliberately POST-only and per backend: this is the one call in the viewer that
+        spends the user's disk and bandwidth, and AGENTS.md requires it to name what it
+        is fetching before it runs. The page does the naming; this refuses to start a
+        second download while one is in flight.
+        """
+        try:
+            if action == "cancel":
+                cancel_download(backend_id)
+                self._send_json(202, {"backend": backend_id, "status": "cancelling"})
+                return
+            if action == "remove":
+                self._send_json(200, remove_weights(backend_id))
+                return
+            start_download(backend_id, rebuild=action == "rebuild")
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {
+            "backend": backend_id,
+            "events_url": f"/api/setup/{backend_id}/events",
+            "status_url": f"/api/setup/{backend_id}/status",
+        })
+
+    def _start_blender_install(self) -> None:
+        global SETUP_ACTIVE
+        with SETUP_LOCK:
+            active = JOBS.get(JOBS.active)
+            refusal = blender_install_refusal(
+                finish_capabilities(),
+                generating=active is not None
+                and active.status in {"queued", "running", "cancelling"},
+                setting_up=SETUP_ACTIVE is not None or download_active() is not None)
+            if refusal:
+                self._send_json(refusal[0], {"error": refusal[1]})
+                return
+            setup_id = uuid.uuid4().hex
+            SETUP_ACTIVE = setup_id
+            SETUP_RUNS[setup_id] = _start_setup_run(setup_id, blender_install_command())
+        self._send_json(202, {"setup_run_id": setup_id,
+                              "events_url": f"/api/setup/run/{setup_id}/events"})
+
+    def _start_gltfpack_install(self) -> None:
+        global SETUP_ACTIVE
+        with SETUP_LOCK:
+            active = JOBS.get(JOBS.active)
+            refusal = gltfpack_install_refusal(
+                props_tools_payload(),
+                generating=active is not None
+                and active.status in {"queued", "running", "cancelling"},
+                setting_up=SETUP_ACTIVE is not None or download_active() is not None)
+            if refusal:
+                self._send_json(refusal[0], {"error": refusal[1]})
+                return
+            setup_id = uuid.uuid4().hex
+            SETUP_ACTIVE = setup_id
+            SETUP_RUNS[setup_id] = _start_setup_run(setup_id, gltfpack_install_command())
+        self._send_json(202, {"setup_run_id": setup_id,
+                              "events_url": f"/api/setup/run/{setup_id}/events"})
+
+    def _start_setup(self) -> None:
+        global SETUP_ACTIVE
+        with SETUP_LOCK:
+            active = JOBS.get(JOBS.active)
+            if active is not None and active.status in {"queued", "running", "cancelling"}:
+                self._send_json(409, {"error": "a generation is running; wait for it to finish"})
+                return
+            if SETUP_ACTIVE is not None:
+                self._send_json(409, {"error": "setup is already running"})
+                return
+            if clean_port_build_present():
+                self._send_json(409, {"error": "the clean-port build is already installed — nothing to set up"})
+                return
+            ok, reason = setup_available()
+            if not ok:
+                self._send_json(503, {"error": reason})
+                return
+            setup_id = uuid.uuid4().hex
+            SETUP_ACTIVE = setup_id
+            SETUP_RUNS[setup_id] = _start_setup_run(setup_id)
+        self._send_json(202, {
+            "setup_run_id": setup_id,
+            "events_url": f"/api/setup/run/{setup_id}/events",
+        })
+
+    def _status(self, job_id: str) -> None:
+        job = self._find_job(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_json(200, _job_status_payload(job))
+
+    def _status(self, job_id: str) -> None:
+        job = self._find_job(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_json(200, _job_status_payload(job))
+
+    def _artifact(self, job_id: str, action: str) -> None:
+        job = self._find_job(job_id)
+        if job is None or job.status != "done":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        path = job.output_path if action == "result.glb" else job.manifest_path
+        if not path.is_file() or OUTPUT_ROOT not in path.parents:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        data = path.read_bytes()
+        content_type = "model/gltf-binary" if action == "result.glb" else "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'inline; filename="{path.name}"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _cancel_job(self, job_id: str) -> None:
+        job = self._find_job(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if job.status in {"done", "error", "cancelled"}:
+            self._send_json(409, {"error": f"job is already {job.status}"})
+            return
+        job.cancel_requested = True
+        job.status = "cancelling"
+        process = job.process
+        if process is not None and process.poll() is None:
+            _killpg_if_alive(process.pid)
+        job.emit({"phase": "error", "message": "Cancellation requested"})
+        self._send_json(202, {"job_id": job.id, "status": "cancelling"})

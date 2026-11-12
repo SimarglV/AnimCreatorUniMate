@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import json
+import os
+import struct
+import subprocess
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+_GLB_MAGIC = 0x46546C67
+_GLB_JSON_CHUNK = 0x4E4F534A
+
+
+def read_glb(path: Path) -> tuple[dict, list[list], int, int]:
+    """Split a GLB into (parsed JSON, all chunks, JSON chunk index, glTF version).
+
+    Editing a GLB's material means rewriting only its JSON chunk and leaving the binary
+    buffers — geometry and texture images — byte-for-byte intact. That property is what
+    makes it possible to restore a texture reference long after the fact, without
+    regenerating the asset: the image data never left the file.
+    """
+    data = path.read_bytes()
+    magic, version, length = struct.unpack_from("<III", data, 0)
+    if magic != _GLB_MAGIC:
+        raise RuntimeError(f"{path} is not a binary glTF (GLB) file")
+    offset = 12
+    chunks: list[list] = []
+    while offset < length:
+        chunk_len, chunk_type = struct.unpack_from("<II", data, offset)
+        chunks.append([chunk_type, data[offset + 8 : offset + 8 + chunk_len]])
+        offset += 8 + chunk_len
+    try:
+        json_index = next(i for i, c in enumerate(chunks) if c[0] == _GLB_JSON_CHUNK)
+    except StopIteration as exc:
+        raise RuntimeError(f"{path} has no glTF JSON chunk") from exc
+    return json.loads(chunks[json_index][1].decode("utf-8")), chunks, json_index, version
+
+
+def write_glb(path: Path, gltf: dict, chunks: list[list], json_index: int, version: int) -> None:
+    """Write chunks back out with `gltf` replacing the JSON chunk.
+
+    Chunks must be padded to a 4-byte boundary — JSON with spaces, binary with zeros —
+    or the file is silently unreadable by some loaders.
+    """
+    chunks[json_index][1] = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    body = b""
+    for chunk_type, chunk_data in chunks:
+        pad = (4 - (len(chunk_data) % 4)) % 4
+        filler = b"\x20" if chunk_type == _GLB_JSON_CHUNK else b"\x00"
+        chunk_data = chunk_data + filler * pad
+        body += struct.pack("<II", len(chunk_data), chunk_type) + chunk_data
+    path.write_bytes(struct.pack("<III", _GLB_MAGIC, version, 12 + len(body)) + body)
+
+
+@dataclass(frozen=True)
+class TrellisOptions:
+    repo: Path
+    seed: int = 42
+    pipeline_type: str = "512"
+    texture_size: int = 1024
+    bake_target_faces: int = 50_000
+    # None leaves generate.py's crude pre-simplify safety net at its 4,000,000 default.
+    # A value forces the I2L_PRE_CAP env var so the crude decimator threshold is
+    # controllable without editing the vendored generate.py.
+    pre_simplify_cap: int | None = None
+    steps: int | None = None
+    normalize_material: bool = True
+    material_mode: str = "pbr"
+    fix_winding: bool = True
+    # Off by default: at the port's own remesh_project of 0.9 this measurably worsens the
+    # mesh. Kept expressible because generate.py describes it as the only stage that
+    # targets boundary edges at source, and every asset we have produced is open.
+    remesh: bool = False
+    remesh_project: float = 0.0
+    remesh_band: float = 1.0
+
+
+@dataclass(frozen=True)
+class TrellisResult:
+    asset: Path
+    texture_backend: str
+    material_normalized: bool = False
+    material_mode: str | None = None
+    winding_repaired: bool = False
+    winding_inverted: bool = False
+
+
+def _repair_winding(path: Path) -> tuple[bool, bool]:
+    """Make every face point outward. Returns (repaired, inverted).
+
+    Generated meshes ship with inconsistent winding and frequently inside-out: a Flicker
+    run measured a signed volume of **-0.02369**. glTF materials are double-sided by
+    default, so a textured preview hides it completely -- but SceneKit, RealityKit and
+    every game engine cull backfaces, and the asset renders hollow. Assets from the
+    official TRELLIS.2 demo are winding-consistent with positive volume; ours were not.
+
+    This also corrected our diagnostics: "see-through holes" counted on culled renders,
+    and the tear metric this repo gated on, were substantially counting flipped faces
+    rather than missing geometry.
+
+    Best-effort -- a mesh that cannot be loaded is left untouched rather than failing a
+    16-minute generation at its last step.
+    """
+    try:
+        import trimesh
+
+        mesh = trimesh.load(str(path), force="mesh", process=False)
+        volume_before = float(mesh.volume)
+        mesh.fix_normals()
+        inverted = float(mesh.volume) < 0.0
+        if inverted:
+            mesh.invert()
+        mesh.export(str(path))
+        print(
+            f"  [image-to-3dlab] winding repaired: volume {volume_before:+.5f} -> "
+            f"{float(mesh.volume):+.5f}{' (inverted)' if inverted else ''}"
+        )
+        return True, inverted
+    except Exception as exc:
+        print(f"  [image-to-3dlab] winding repair skipped: {exc}")
+        return False, False
+
+
+def _normalize_glb_material(path: Path, mode: str = "pbr") -> int:
+    """Rewrite a GLB's material JSON so it renders correctly.
+
+    TRELLIS exports each material with ``alphaMode=BLEND`` and ``metallicFactor=1``
+    plus a metallic-roughness texture. Together these make a dense mesh render as
+    transparent, mirror-like shards instead of the baked albedo. We patch only the
+    JSON chunk in place; geometry and texture buffers are left byte-for-byte intact.
+
+    Both modes force ``alphaMode`` to ``OPAQUE`` (the actual cause of the glass
+    look). They then differ in how they treat metalness:
+
+    - ``pbr`` (default): keep the baked metallic-roughness map. This is what the
+      reference implementation ships, and our maps match its values closely —
+      moss fox roughness 0.765/metallic 0.412 against the reference's 0.784/0.384,
+      Flicker 0.396/0.000 against 0.404/0.004.
+    - ``matte``: drop all metalness (``metallicFactor`` 0, matte roughness,
+      metallic-roughness texture removed).
+
+    ``matte`` was the default until 2026-08-13, which was a mistake worth
+    recording. The bug being fixed at the time was ``alphaMode=BLEND`` (the glass
+    look) and **both** modes fix that; discarding metalness rode along in the same
+    change and was never revisited. The cost was that every organic asset shipped
+    mathematically flat — no specular response under any light — while the
+    metallic-roughness map sat unreferenced inside the same file.
+
+    Returns the number of material properties changed.
+    """
+    if mode not in {"matte", "pbr"}:
+        raise ValueError(f"material mode must be 'matte' or 'pbr', got {mode!r}")
+    gltf, chunks, json_index, version = read_glb(path)
+    changed = 0
+    for material in gltf.get("materials", []):
+        pbr = material.setdefault("pbrMetallicRoughness", {})
+        if material.get("alphaMode", "OPAQUE") != "OPAQUE":
+            material["alphaMode"] = "OPAQUE"
+            changed += 1
+        material.pop("alphaCutoff", None)
+        if mode == "matte":
+            if pbr.get("metallicFactor") != 0.0:
+                pbr["metallicFactor"] = 0.0
+                changed += 1
+            pbr["roughnessFactor"] = 1.0
+            if pbr.pop("metallicRoughnessTexture", None) is not None:
+                changed += 1
+        # "pbr" mode keeps metalness/roughness and the metallic-roughness texture.
+    write_glb(path, gltf, chunks, json_index, version)
+    return changed
+
+
+def build_generate_command(
+    python: Path,
+    generator: Path,
+    views: Sequence[Path],
+    output_base: Path,
+    options: TrellisOptions,
+) -> list[str]:
+    """The argv handed to the vendored ``generate.py``.
+
+    Pulled out of ``generate_trellis`` so the flags can be asserted without a 16-minute
+    run. A missing flag here is otherwise only discoverable by generating an asset and
+    measuring it afterwards, which is how ``--remesh`` went unpassed for the life of this
+    backend while we attributed the resulting open meshes to the model.
+    """
+    command = [
+        str(python),
+        str(generator),
+        *[str(path) for path in views],
+        "--seed",
+        str(options.seed),
+        "--output",
+        str(output_base),
+        "--pipeline-type",
+        options.pipeline_type,
+        "--texture-size",
+        str(options.texture_size),
+        "--bake-target-faces",
+        str(options.bake_target_faces),
+    ]
+    if options.steps is not None:
+        command.extend(("--steps", str(options.steps)))
+    if options.remesh:
+        # generate.py: "Narrow-band DC remeshing before UV unwrap ... Targets boundary
+        # edges at source". The port defaults remesh_project to 0.9, which snaps vertices
+        # almost all the way back to the original surface; measured on the Forest Variant
+        # that made boundary edges worse (6,008 -> 16,954), so the value is passed
+        # explicitly rather than inherited.
+        command.append("--remesh")
+        command.extend(("--remesh-project", str(options.remesh_project)))
+        command.extend(("--remesh-band", str(options.remesh_band)))
+    return command
+
+
+def _prepare_rgba(image: Path, destination: Path) -> Path:
+    from PIL import Image
+
+    from image_to_3dlab.matte import cut_out
+
+    source = Image.open(image).convert("RGBA")
+    alpha = source.getchannel("A")
+    if alpha.getextrema()[0] == 255:
+        source, _ = cut_out(source)
+    if source.getchannel("A").getextrema()[0] == 255:
+        raise RuntimeError(
+            "TRELLIS preprocessing did not produce a transparent foreground"
+        )
+    source.save(destination)
+    return destination
+
+
+def generate_trellis(
+    image: Path | Sequence[Path], output_dir: Path, options: TrellisOptions
+) -> TrellisResult:
+    repo = options.repo.expanduser().resolve()
+    python = repo / ".venv" / "bin" / "python"
+    generator = repo / "generate.py"
+    if not python.is_file() or not generator.is_file():
+        raise RuntimeError(
+            f"TRELLIS Mac environment not found at {repo}. This older --trellis route "
+            "runs a manual clone of shivampkumar/trellis-mac. For TRELLIS on a Mac, use "
+            "the studio's TRELLIS.2 route (Setup & Status)."
+        )
+    patched_pipeline = (
+        repo / "TRELLIS.2" / "trellis2" / "pipelines" / "trellis2_image_to_3d.py"
+    )
+    if "pipeline.rembg_model = None" not in patched_pipeline.read_text():
+        raise RuntimeError("TRELLIS BRIA-disable patch is missing; refusing to run")
+
+    # Generation never fetches weights: refuse unless TRELLIS.2 is already on disk, and pin
+    # the run offline so the vendored generate.py cannot fetch the rest either.
+    from image_to_3dlab.weight_gate import require_local
+
+    require_local("microsoft/TRELLIS.2-4B", backend="TRELLIS.2",
+                  route="--trellis (vendor/trellis-mac)", size="about 16.5 GB")
+
+    # One image, or several views of the same subject in the same pose. Extra views
+    # replace guessing: single-view runs invent whatever they cannot see, which is
+    # where the three-handled mug and the missing back of a head came from.
+    views = [image] if isinstance(image, Path) else list(image)
+    if not views:
+        raise ValueError("at least one input view is required")
+
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prepared_views = []
+    for index, view in enumerate(views):
+        suffix = "" if len(views) == 1 else f"_view{index}"
+        destination = output_dir / f"{view.stem}_trellis_input{suffix}.png"
+        _prepare_rgba(view, destination)
+        prepared_views.append(destination)
+    # Name outputs after the first view so a multi-view run stays traceable.
+    output_base = output_dir / f"{views[0].stem}_trellis2"
+    cpu_basecolor = Path(f"{output_base}_basecolor.png")
+    cpu_basecolor.unlink(missing_ok=True)
+    command = build_generate_command(python, generator, prepared_views, output_base, options)
+    env = os.environ.copy()
+    env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    if options.pre_simplify_cap is not None:
+        env["I2L_PRE_CAP"] = str(options.pre_simplify_cap)
+    xcode_developer_dir = Path("/Applications/Xcode.app/Contents/Developer")
+    if xcode_developer_dir.is_dir():
+        env.setdefault("DEVELOPER_DIR", str(xcode_developer_dir))
+    try:
+        subprocess.run(command, cwd=repo, env=env, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"TRELLIS generation failed with exit code {exc.returncode}"
+        ) from exc
+    result = output_base.with_suffix(".glb")
+    if not result.is_file():
+        raise RuntimeError(f"TRELLIS reported success but did not create {result}")
+    texture_backend = "kdtree-cpu" if cpu_basecolor.is_file() else "metal-o-voxel"
+
+    # Winding repair comes BEFORE material normalisation, because that step rewrites the
+    # GLB's JSON chunk in place and expects the geometry buffers it was given.
+    winding_repaired = False
+    winding_inverted = False
+    if options.fix_winding:
+        winding_repaired, winding_inverted = _repair_winding(result)
+
+    material_normalized = False
+    material_mode = None
+    if options.normalize_material:
+        _normalize_glb_material(result, options.material_mode)
+        material_normalized = True
+        material_mode = options.material_mode
+    return TrellisResult(
+        asset=result,
+        texture_backend=texture_backend,
+        material_normalized=material_normalized,
+        material_mode=material_mode,
+        winding_repaired=winding_repaired,
+        winding_inverted=winding_inverted,
+    )

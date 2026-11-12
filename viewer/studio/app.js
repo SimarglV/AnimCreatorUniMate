@@ -1,0 +1,929 @@
+// UniMate studio: Library | one viewer | Steps.
+// Steps run here through the server's job APIs, prop-sheet splitting included.
+
+import { STEPS, stepCount, stepDone, stepState, statusText, displayModel, stepFile, canViewStep, canFixShown, fixBlockedNote, servedUrl, visibleFamilies, madeVersion, engineOf, engineChoices, openingView, isModelFile, duration, canViewPictures, sizeText, deletionWords, linkedAssetId, statsRows, canReveal } from './library.js';
+import { createStudioViewer } from './viewer.js';
+import { readyEngines, readableLog, copyDetails, logScroll, moveBox, resizeBox } from './jobs.js';
+import { stepBody, wireStep, wireBrush, wireVersions } from './steps.js';
+import { retryWant } from './plan.js';
+import { closeBrushStage } from './brush.js';
+import { openCreate, runChain } from './create.js';
+import { openActivity, openAbout, openGuide, openReport, closeSheet, usageNotice, openNews, refreshNews } from './pages.js';
+import { STEP_LABELS, stoppedLine, stoppedStep } from './plan.js';
+import { mountSkins } from './skins.js';
+import { installTooltips } from './tooltips.js';
+import { setLibraryLoading, showLibraryError, showLibraryLoadError, runLibraryLoad } from './library-loading.js';
+import { createLibraryPictureLoader } from './library-picture.js';
+import { libraryRowSelection, libraryFamilyOpen } from './library-selection.js';
+import { modelChoices, activeChoice } from './model-switch.js';
+import { thumbFile, createThumbCache, createThumbQueue } from './model-thumbs.js';
+import { createThumbnailRenderer } from './model-thumb-renderer.js';
+
+const $ = (id) => document.getElementById(id);
+const LOGO = './studio/mark.svg';
+installTooltips();
+const libraryRoot = document.querySelector('.lib');
+
+// Rows with no picture get a thumbnail rendered from their model: one at a time, only when
+// the row is on screen, cached afterwards. A hidden tab renders nothing.
+const thumbRenderer = createThumbnailRenderer();
+const thumbCache = createThumbCache({ storage: (() => { try { return window.localStorage; } catch { return null; } })() });
+const thumbQueue = createThumbQueue({
+  render: (file) => thumbRenderer.render(url(file)),
+  cache: thumbCache,
+  onThumb: ({ id }, data) => {
+    const image = $('assetList').querySelector(`[data-thumb-id="${id}"]`);
+    if (!image) return;   // the row was re-rendered or filtered away
+    image.src = data;
+    image.classList.remove('mark');   // the logo's size and dimming belong to the logo
+  },
+  isHidden: () => document.hidden,
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) thumbQueue.resume(); });
+const thumbItems = new WeakMap();
+let thumbObserver = null;
+
+function watchThumb(image, asset) {
+  const item = { id: asset.id, file: thumbFile(asset) };
+  if (!item.file) return;
+  if (thumbQueue.offer(item) === 'cached') return;
+  if (typeof IntersectionObserver === 'undefined') { thumbQueue.enqueue(item); return; }
+  if (!thumbObserver) {
+    thumbObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        thumbObserver.unobserve(entry.target);
+        thumbQueue.enqueue(thumbItems.get(entry.target));
+      }
+    }, { root: libraryRoot.querySelector('.scroll'), rootMargin: '120px' });
+  }
+  thumbItems.set(image, item);
+  thumbObserver.observe(image);
+}
+
+let base = '/output/';
+let assets = [];
+let filter = 'all', query = '', showHidden = false, limit = 30;
+let stageFilter = 'all', engineFilter = 'all', starredOnly = false, sortBy = 'newest';
+let current = null;
+let engines = [], presets = [], motionPrompts = [], motionReady = null, motionNote = null, recipes = null, frontBack = null, pictureEngines = [], busy = false, playNext = null;
+let libraryReady = false;
+let libraryLoadToken = 0;
+let blenderReady = true;  // Finish and Split need Blender; the Finish step says so before anyone clicks
+let making = null, viewingMaking = false;  // the asset Create is making right now
+let createHandle = null;
+let libraryInputId = null;
+let cardPlace = null;  // where the user dragged or resized the progress card; null keeps it centred
+let viewingPictures = false;  // the viewer shows the asset's pictures instead of its model
+let viewingStep = null;       // a step id when the viewer shows that step's own model (the raw one, say)
+let viewingSkin = null;       // a skin id when the viewer shows one of the model's skins
+const openFamilies = new Set();  // families whose versions are listed under their row
+
+const viewer = createStudioViewer({ stage: $('stage'), logoUrl: LOGO, onClipChange: (clip) => setDownload(clip.file), fixSession: {
+  // only a finished model on screen (not a rigged one, a move or the raw model)
+  canFix: () => canFixShown(current, { step: viewingStep, pictures: viewingPictures }),
+  blockedNote: () => fixBlockedNote(current),
+  patch: async (spots, base) => {
+    const body = await postFix('preview', { from: current.finished, base, spots });
+    return { preview: body.preview, url: url(body.preview) };
+  },
+  keep: async (preview) => {
+    const before = assets, family = current.family || current.id;
+    const body = await postFix('keep', { from: current.finished, preview });
+    await loadLibrary(null, { pick: false });
+    show(madeVersion(before, assets, family) ?? assets.find((a) => a.finished === body.file) ?? current);
+  },
+  discard: (preview) => postFix('discard', { preview }).catch(() => {}),
+} });
+
+async function postFix(action, payload) {
+  const response = await fetch(`/api/fix-spot/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload) });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || 'That did not work.');
+  return body;
+}
+
+const escape = (text) => String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const url = (relative) => servedUrl(base, relative);
+const fileName = (relative) => relative?.split('/').pop() ?? '';
+
+function assetButton(asset, { sub = false } = {}) {
+  const pips = STEPS.slice(0, stepCount(asset)).map((step) => `<i class="${stepDone(asset, step.id) ? 'done' : ''}"></i>`).join('');
+  // a small server-made copy, not the full picture (often a megabyte each); a model with no
+  // picture gets one rendered in the browser, so the row is not just the logo
+  const thumb = asset.picture
+    ? `<img src="/api/thumb?path=${encodeURIComponent(asset.picture)}" alt="" loading="lazy">`
+    : `<img class="mark" data-thumb-id="${escape(asset.id)}" src="${LOGO}" alt="">`;
+  const when = new Date(asset.updated * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  const name = sub ? `v${asset.version} · ${statusText(asset)}` : asset.name;
+  return `<button class="asset${sub ? ' sub' : ''}${asset.hidden ? ' is-hidden' : ''}" data-id="${escape(asset.id)}" title="${escape(when)}" aria-current="${libraryRowSelection(asset, { current, inputId: libraryInputId, viewingMaking })}">
+      <span class="thumb">${thumb}</span>
+      <span style="min-width:0"><span class="nm">${asset.main ? '<b class="star" title="Main version">★</b> ' : ''}${escape(name)}</span><span class="st"><span class="pips" aria-hidden="true">${pips}</span>${sub ? escape(when) : escape(statusText(asset))}</span></span>
+    </button>`;
+}
+
+function renderEngineChoices() {
+  const select = $('engineFilter'), choices = engineChoices(assets);
+  if (engineFilter !== 'all' && !choices.includes(engineFilter)) engineFilter = 'all';
+  select.innerHTML = `<option value="all">Any engine</option>${choices.map((c) => `<option value="${escape(c)}">${escape(c)}</option>`).join('')}`;
+  select.value = engineFilter;
+}
+
+function renderLibrary() {
+  if (!libraryReady) return;
+  renderEngineChoices();
+  const { rows: list, more, hiddenCount } = visibleFamilies(assets, { filter, query, showHidden, limit, stage: stageFilter, engine: engineFilter, starred: starredOnly, sort: sortBy });
+  $('assetList').innerHTML = makingRow() + (list.length ? list.map(({ key, shown, members }) => {
+    if (members.length < 2) return `<li>${assetButton(shown)}</li>`;
+    const open = libraryFamilyOpen(members, { key, openFamilies, current, inputId: libraryInputId });
+    return `<li class="family">${assetButton(shown)}
+      <button type="button" class="vers" data-family="${escape(key)}" aria-expanded="${open}">${members.length} versions <span aria-hidden="true">${open ? '▾' : '▸'}</span></button>
+      ${open ? `<ul class="versions">${members.map((m) => `<li>${assetButton(m, { sub: true })}</li>`).join('')}</ul>` : ''}</li>`;
+  }).join('') : `<li class="empty-lib">${assets.length ? 'Nothing matches.' : 'No assets yet. Press + Create to make your first.'}</li>`)
+    + (more ? `<li><button class="ghost more" id="showMore">Show ${Math.min(more, 30)} more of ${more}</button></li>` : '');
+  thumbObserver?.disconnect();   // every row is a new node, so old observations are stale
+  $('assetList').querySelectorAll('[data-thumb-id]').forEach((image) => {
+    const asset = assets.find((a) => a.id === image.dataset.thumbId);
+    if (asset) watchThumb(image, asset);
+  });
+  const shown = assets.filter((a) => !a.hidden).length;
+  $('libFoot').textContent = `${shown} asset${shown === 1 ? '' : 's'} · saved in output/ on this machine`;
+  document.querySelector('.hidden-toggle').hidden = !hiddenCount && !showHidden;
+  $('hiddenLabel').textContent = `Show hidden (${assets.filter((a) => a.hidden).length})`;
+  $('showMore')?.addEventListener('click', () => { limit += 30; renderLibrary(); });
+}
+
+function summaries(asset) {
+  const faces = fileName(asset.finished).match(/_(\d+k)\.glb$/)?.[1];
+  const out = {
+    picture: asset.picture ? 'Done' : 'No picture kept (model uploaded or older run)',
+    model: asset.model ? engineOf(asset.model) : asset.finished ? 'Made outside the app' : '',
+    finished: asset.kind === 'prop set' ? `${asset.props.length} props cut out, each with detail levels` : faces ? `${faces.replace('k', ',000')} triangles` : /_full\.glb$/.test(fileName(asset.finished)) ? 'Full detail · every triangle, for renders' : /_hero\.glb$/.test(fileName(asset.finished)) ? 'Hero · sharper face, built on its own' : 'Done',
+    rigged: 'Auto-rig',
+    animated: asset.clips.map((c) => c.name.replace(/_/g, ' ')).join(', '),
+  };
+  if (asset.pixel_match && asset.kind !== 'prop set') out.finished += ` · Pixel Match: ${asset.pixel_match}`;
+  return out;
+}
+
+function renderSteps(asset) {
+  closeBrushStage($('stage'));   // a brush layer belongs to the panel being replaced
+  $('sideKind').textContent = { 'prop set': 'Prop set', prop: 'Prop', character: 'Character', model: '3D model', picture: 'Picture' }[asset.kind] || '';
+  const total = stepCount(asset), sum = summaries(asset);
+  $('steps').innerHTML = STEPS.map((step, i) => {
+    if (i >= total) return `<li class="step na"><header><span class="dot">–</span><span><h3>${step.label}</h3><div class="sum">Not needed for props</div></span></header></li>`;
+    const state = stepState(asset, step.id);
+    const dot = state === 'done' ? '✓' : i + 1;
+    // a finished model can be finished again at another detail level; a rigged one gets more moves
+    const redo = state === 'done' && ({
+      // a picture no model is made from yet can still be fixed with the brush
+      picture: !!asset.prompt || (!!asset.picture && (!asset.model || !!asset.back || !!frontBack?.ready)), model: !!asset.picture && !!engines.length, finished: asset.kind !== 'prop set',
+      rigged: asset.kind !== 'prop set', animated: true,
+    }[step.id]);
+    const body = state === 'now' || redo ? `<div class="body">${stepBody(step.id, asset, ctx)}</div>` : '';
+    return `<li class="step ${state}" data-step="${step.id}"><header><span class="dot">${dot}</span><span style="min-width:0"><h3>${step.label}</h3>${state === 'done' ? `<div class="sum">${escape(sum[step.id])}${stepLink(asset, step.id)}</div>` : ''}</span>${state === 'done' && asset.timings?.[step.id] ? `<span class="time">${duration(asset.timings[step.id])}</span>` : ''}</header>${body}</li>`;
+  }).join('');
+  $('steps').querySelectorAll('.step').forEach((card) => {
+    if (card.querySelector('.body [data-run]')) wireStep(card, card.dataset.step, asset, ctx);
+    wireBrush(card, asset, ctx);
+    wireVersions(card, asset, ctx);
+    card.querySelector('[data-newpicture]')?.addEventListener('click', () => openCreateSheet({
+      text: asset.prompt, want: retryWant(asset.picture_want, asset.kind),
+      pictureSettings: asset.picture_settings,
+    }));
+  });
+  $('steps').querySelector('[data-pictures]')?.addEventListener('click', () => {
+    if (viewingPictures) { show(asset); return; }
+    viewingPictures = true;
+    viewingStep = null;
+    viewer.setClips([]);
+    // the back keeps its name when drawn again, so ask past the browser's copy
+    viewer.showImage(fresh(asset.picture), 'What the model was made from.', asset.back ? fresh(asset.back) : null);
+    renderSteps(asset);
+  });
+  $('steps').querySelectorAll('[data-viewstep]').forEach((button) => button.addEventListener('click', () => {
+    showStep(asset, button.dataset.viewstep);
+  }));
+  const skin = viewingSkin && (asset.skins || []).find((k) => k.id === viewingSkin);
+  // a character wearing a skin: the move picker points the download at the dressed move
+  if (!(skin && asset.rigged && asset.clips.length)) {
+    setDownload(skin ? skin.file : viewingStep ? stepFile(asset, viewingStep) : displayModel(asset));
+  }
+  renderModelSwitch(asset);
+  mountSkins($('steps'), asset, skinCtx);
+}
+
+// what the Skins card needs from the page (viewer/studio/skins.js)
+const skinCtx = {
+  url: (relative) => url(relative),
+  asset: () => current,
+  viewing: () => viewingSkin,
+  view: async (skin) => {
+    if (!skin) { show(current); return; }
+    const asset = current;
+    viewingSkin = skin.id;
+    viewingStep = null;
+    viewingPictures = false;
+    if (asset.rigged && asset.clips.length) {
+      // a character: its rest pose and every move, each wearing the skin (made once, then kept)
+      const dress = async (file) => (await (await fetch(`/api/skins/${skin.id}/dressed?file=${encodeURIComponent(file)}`)).json()).file;
+      try {
+        const rest = await dress(asset.rigged);
+        const clips = [];
+        for (const clip of asset.clips) clips.push({ name: clip.name.replace(/_/g, ' '), file: await dress(clip.file) });
+        if (current !== asset || viewingSkin !== skin.id) return;   // moved on while dressing
+        viewer.setFacing(asset.facing);
+        viewer.setClips(clips.map((c) => ({ ...c, url: url(c.file) })), { restUrl: url(rest) });
+      } catch { viewer.showEmpty('Could not put this skin on the rigged model.'); }
+    } else {
+      viewer.setFacing(null);
+      viewer.setClips([]);
+      viewer.load(url(skin.file), { label: `${asset.name} · ${skin.name}` });
+    }
+    renderSteps(asset);   // the card offers to delete the skin on show; the download follows it
+  },
+  onBusy: (on) => ctx.onBusy(on),
+  // a skin's original and new picture, full size where the model usually is
+  compare: (original, fresh, caption, version) => {
+    viewingSkin = null;
+    viewingStep = null;
+    viewingPictures = true;
+    viewer.setFacing(null);
+    viewer.setClips([]);
+    viewer.showImage(url(original), escape(caption), `${url(fresh)}?v=${version}`, ['Original', 'New']);
+  },
+  // a finished skin: reload the Library and show the model wearing it
+  onDone: async (skin) => {
+    const keepId = current?.id;
+    await loadLibrary(null, { pick: false });
+    const asset = assets.find((a) => a.id === keepId) ?? current;
+    show(asset);
+    const made = skin && (asset?.skins || []).find((k) => k.id === skin.id);
+    if (made) { skinCtx.view(made); renderSteps(asset); }
+  },
+};
+
+function stepLink(asset, stepId) {
+  if (stepId === 'picture' && canViewPictures(asset)) {
+    return ` · <button type="button" class="linkish" data-pictures>${viewingPictures ? 'Show model' : `View picture${asset.back ? 's' : ''}`}</button>`;
+  }
+  const file = stepFile(asset, stepId);
+  const view = canViewStep(asset, stepId)
+    ? ` · <button type="button" class="linkish" data-viewstep="${stepId}">${viewingStep === stepId ? 'Show latest' : 'View'}</button>` : '';
+  return file ? `${view} · <a class="step-dl" href="${escape(url(file))}" download="${escape(fileName(file))}">Download GLB</a>` : '';
+}
+
+/** The chips above the model: every version of it this asset has. */
+function renderModelSwitch(asset) {
+  const host = $('modelSwitch');
+  const choices = modelChoices(asset);
+  host.hidden = choices.length < 2;   // a single file needs no switcher
+  if (host.hidden) { host.innerHTML = ''; return; }
+  const active = activeChoice(choices, { step: viewingStep, latest: viewingPictures ? null : displayModel(asset) });
+  host.innerHTML = choices.map((choice) => `<button type="button" class="chip" data-model-step="${escape(choice.step)}" aria-pressed="${choice.step === active}">${escape(choice.label)}</button>`).join('');
+  host.querySelectorAll('[data-model-step]').forEach((button) => {
+    button.addEventListener('click', () => showStep(asset, button.dataset.modelStep));
+  });
+}
+
+/** Show one step's own model. The file the asset opens on goes through show(), so a rigged
+ *  character keeps its moves and the camera returns home. */
+function showStep(asset, stepId) {
+  const file = stepFile(asset, stepId);
+  if (!file || file === displayModel(asset) || viewingStep === stepId) { show(asset); return; }
+  viewingStep = stepId;
+  viewingPictures = false;
+  viewer.setFacing(null);
+  viewer.setClips([]);
+  viewer.load(url(file), { label: `${asset.name} · ${STEPS.find((step) => step.id === stepId)?.label ?? stepId}` });
+  renderSteps(asset);
+  setDownload(file);
+  // the subtitle follows the file on screen, not the asset's furthest stage
+  $('vMeta').textContent = STEPS.find((step) => step.id === stepId)?.label ?? statusText(asset);
+}
+
+function setDownload(file) {
+  const download = $('download');
+  download.hidden = !file;
+  if (file) { download.href = url(file); download.setAttribute('download', fileName(file)); }
+  showModelInfo(file);
+}
+
+// The stats and path of the file the panel's Download button points at. A newer file wins a
+// race: the answer for one the user has already moved on from is dropped.
+let infoFor = null;
+async function showModelInfo(file) {
+  infoFor = file;
+  const stats = $('modelStats');
+  const actions = $('fileActions');
+  $('fileCard').hidden = true;
+  if (!file) return;
+  const response = await fetch(`/api/model-info?file=${encodeURIComponent(file)}`).catch(() => null);
+  const info = response?.ok ? await response.json() : null;
+  if (infoFor !== file || !info) return;
+  const tips = { Triangles: 'GLB files store triangles only, so there is no quad count.' };
+  stats.innerHTML = statsRows(info.stats).map(([label, value]) => {
+    const classes = [tips[label] && 'tip-left', label === 'Textures' && 'wide'].filter(Boolean).join(' ');
+    return `<div${classes ? ` class="${classes}"` : ''}${tips[label] ? ` data-tip="${escape(tips[label])}"` : ''}><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`;
+  }).join('');
+  stats.hidden = !info.stats;
+  $('revealBtn').hidden = !canReveal(location.hostname);
+  $('fileCard').hidden = false;
+  actions.dataset.file = info.file;
+  actions.dataset.path = info.path;
+}
+
+$('revealBtn').addEventListener('click', () => {
+  fetch('/api/reveal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file: $('fileActions').dataset.file }) });
+});
+
+$('copyPathBtn').addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  try {
+    await navigator.clipboard.writeText($('fileActions').dataset.path);
+    button.textContent = 'Copied';
+  } catch {
+    button.textContent = 'Copy failed';
+  }
+  setTimeout(() => { button.textContent = 'Copy path'; }, 1500);
+});
+
+// A picture redrawn, brushed or swapped keeps its file name: ask past the browser's copy
+const fresh = (relative) => `${url(relative)}?v=${Date.now()}`;
+const libraryPictureLoader = createLibraryPictureLoader({
+  fetchPicture: (picture) => fetch(picture),
+  freshUrl: fresh,
+  getTarget: () => createHandle,
+  makeFile: (parts, name, options) => new File(parts, name, options),
+  onUsed: (asset) => { libraryInputId = asset.id; renderLibrary(); },
+});
+
+// what the step actions need from the page
+const ctx = {
+  get engines() { return engines; },
+  get presets() { return presets; },
+  get motionPrompts() { return motionPrompts; },
+  get motionReady() { return motionReady; },
+  get motionNote() { return motionNote; },
+  get blenderReady() { return blenderReady; },
+  get frontBack() { return frontBack; },
+  get pictureEngines() { return pictureEngines; },
+  url: (relative) => url(relative),
+  stage: () => $('stage'),
+  // one back (a kept version, or the one in use) full size, beside the front
+  showBack: (file) => {
+    if (!current?.picture) return;
+    viewingPictures = true;
+    viewingStep = null;
+    viewer.setClips([]);
+    viewer.showImage(fresh(current.picture), file === current.back ? 'The back in use.' : 'A kept version of the back.', fresh(file));
+    const toggle = $('steps').querySelector('[data-pictures]');
+    if (toggle) toggle.textContent = 'Show model';
+  },
+  asset: () => current,
+  // a Steps-panel run goes through the same chain as Create: a reopened studio picks it back
+  // up, and the server runs one big job at a time whoever starts it
+  startChain: (plan) => startChain(plan),
+  onBusy: (on) => { busy = on; document.body.classList.toggle('busy', on); },
+  // after a new move, open the asset on that move
+  onDone: async (stepId, { preset } = {}) => {
+    playNext = preset;
+    const before = assets, keepId = current?.id, family = current?.family || keepId;
+    await loadLibrary(null, { pick: false });
+    // a redo makes a new version: open that one, not the one it branched from
+    show(madeVersion(before, assets, family) ?? assets.find((a) => a.id === keepId) ?? assets[0] ?? null);
+  },
+};
+
+function show(asset) {
+  closeSheet($('stage'));   // Create/Activity/How to use/About cover the viewer; get them out of the way
+  current = asset;
+  viewingMaking = false;
+  viewingPictures = false;
+  viewingStep = null;
+  viewingSkin = null;
+  $('progress').hidden = true;
+  renderLibrary();
+  $('vTitle').textContent = asset?.name ?? '';
+  $('vTitle').classList.toggle('long', (asset?.name ?? '').length > 60);
+  $('vMeta').textContent = asset ? statusText(asset) : '';
+  if (!asset) {
+    viewer.showEmpty('Nothing to show yet. Pick an asset on the left.');
+    $('steps').innerHTML = '';
+    renderModelSwitch(null);
+    return;
+  }
+  renderSteps(asset);
+  renderHideButton();
+  // only rigged files are turned: the skeleton is what says which way the feet point
+  viewer.setFacing(asset.rigged && (asset.clips.length || displayModel(asset) === asset.rigged) ? asset.facing : null);
+  if (asset.kind === 'character' && asset.clips.length) {
+    // open on the move just made, else a calm one (idle, then walk), never alphabetically first ("death")
+    const prefer = [playNext, 'idle', 'walk'].map((name) => asset.clips.findIndex((c) => c.name === name)).find((i) => i >= 0);
+    const index = prefer ?? 0;
+    playNext = null;
+    viewer.setClips(asset.clips.map((c) => ({ name: c.name.replace(/_/g, ' '), url: url(c.file), file: c.file })), { restUrl: url(asset.rigged), index });
+  } else if (asset.kind === 'prop set' && asset.props.length) {
+    viewer.setClips(asset.props.map((p) => ({ name: p.name.replace(/[_-]/g, ' '), url: url(p.file), file: p.file })), { still: true });
+  } else {
+    viewer.setClips([]);
+    const model = displayModel(asset);
+    if (model) viewer.load(url(model), { label: asset.name });
+    else if (asset.picture) {
+      const inRun = making && !making.finished && !making.failed && making.made?.picture === asset.picture;
+      viewer.showImage(fresh(asset.picture), inRun ? 'Being made into 3D now. Its progress is above.'
+        : 'A picture so far. Make it 3D from the Steps panel.', asset.back ? fresh(asset.back) : null);
+    }
+    else viewer.showEmpty('Nothing to show for this asset yet.');
+  }
+}
+
+$('assetList').addEventListener('click', (event) => {
+  const toggle = event.target.closest('[data-family]');
+  if (toggle) {
+    const key = toggle.dataset.family;
+    if (openFamilies.has(key)) openFamilies.delete(key); else openFamilies.add(key);
+    renderLibrary();
+    return;
+  }
+  const button = event.target.closest('.asset');
+  if (!button) return;  // the "Show more" row has its own handler
+  if (button.dataset.making != null) { showMaking(); return; }
+  const asset = assets.find((a) => a.id === button.dataset.id);
+  if (asset?.picture && createHandle?.canUseLibraryPicture()) { useLibraryPicture(asset); return; }
+  if (asset && (asset !== current || viewingMaking)) show(asset);
+});
+
+$('search').addEventListener('input', (event) => { query = event.target.value; limit = 30; renderLibrary(); });
+$('stageFilter').addEventListener('change', (event) => { stageFilter = event.target.value; limit = 30; renderLibrary(); });
+$('engineFilter').addEventListener('change', (event) => { engineFilter = event.target.value; limit = 30; renderLibrary(); });
+$('sortBy').addEventListener('change', (event) => { sortBy = event.target.value; renderLibrary(); });
+$('starredOnly').addEventListener('change', (event) => { starredOnly = event.target.checked; limit = 30; renderLibrary(); });
+$('showHidden').addEventListener('change', (event) => { showHidden = event.target.checked; renderLibrary(); });
+$('hideBtn').addEventListener('click', async () => {
+  if (!current) return;
+  const hidden = !current.hidden;
+  const response = await fetch(`/api/assets/${current.id}/hidden`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hidden }) });
+  if (!response.ok) return;
+  current.hidden = hidden;
+  renderLibrary();
+  renderHideButton();
+});
+
+$('mainBtn').addEventListener('click', async () => {
+  if (!current) return;
+  const main = !current.main;
+  const response = await fetch(`/api/assets/${current.id}/main`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ main }) });
+  if (!response.ok) return;
+  await refreshAssets();
+  renderHideButton();
+});
+
+$('deleteBtn').addEventListener('click', async () => {
+  if (!current) return;
+  const bar = $('deleteBar');
+  const response = await fetch(`/api/assets/${current.id}/delete-plan`);
+  const plan = await response.json().catch(() => ({}));
+  const close = () => { bar.hidden = true; bar.innerHTML = ''; };
+  bar.hidden = false;
+  if (!response.ok || plan.refused) {
+    bar.innerHTML = `<p>${escape(plan.refused || plan.error || 'This could not be checked.')}</p><div class="row end"><button class="ghost small" data-close>OK</button></div>`;
+    bar.querySelector('[data-close]').onclick = close;
+    return;
+  }
+  bar.innerHTML = `<p><b>Delete this version?</b> This removes ${escape(deletionWords(plan))} from your disk and frees ${escape(sizeText(plan.bytes))}. It cannot be undone.</p>
+    <div class="row end"><button class="ghost small" data-close>Keep it</button><button class="danger small" data-delete>Delete</button></div>`;
+  bar.querySelector('[data-close]').onclick = close;
+  bar.querySelector('[data-delete]').onclick = async (event) => {
+    event.target.disabled = true;
+    const family = current.family;
+    const done = await fetch(`/api/assets/${current.id}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true }) });
+    if (!done.ok) { bar.innerHTML = `<p>${escape((await done.json().catch(() => ({}))).error || 'Could not delete.')}</p><div class="row end"><button class="ghost small" data-close>OK</button></div>`; bar.querySelector('[data-close]').onclick = close; return; }
+    close();
+    await loadLibrary(null, { pick: false });
+    show(assets.find((x) => x.family === family) ?? assets[0] ?? null);
+  };
+});
+
+function renderHideButton() {
+  $('deleteBtn').hidden = !current;
+  $('deleteBar').hidden = true;
+  const star = $('mainBtn');
+  star.hidden = !current || (current.versions || 1) < 2;   // a lone version needs no star
+  star.textContent = current?.main ? '★ Main' : '☆ Main';
+  star.dataset.tip = current?.main ? 'This is the main version. Click to clear it.' : 'Mark this version as the main one: the one to export and use in your game.';
+
+  const button = $('hideBtn');
+  button.hidden = !current;
+  button.textContent = current?.hidden ? 'Unhide' : 'Hide';
+}
+
+document.querySelectorAll('.seg [data-filter]').forEach((button) => {
+  button.onclick = () => {
+    filter = button.dataset.filter;
+    document.querySelectorAll('.seg [data-filter]').forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
+    renderLibrary();
+  };
+});
+
+async function loadLibrary(keepId = null, { pick = true } = {}) {
+  const requestId = ++libraryLoadToken;
+  if (!libraryReady) setLibraryLoading(libraryRoot, true);
+  await runLibraryLoad({
+    requestId,
+    isCurrent: () => requestId === libraryLoadToken,
+    fetchAssets: async () => {
+      const response = await fetch('/api/assets');
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || response.statusText);
+      return payload;
+    },
+    onSuccess: (payload) => {
+    base = payload.base;
+    assets = payload.assets;
+    libraryReady = true;
+    setLibraryLoading(libraryRoot, false);
+    show(pick ? assets.find((a) => a.id === keepId) ?? assets[0] ?? null : null);
+    },
+    onError: (error) => {
+    if (libraryReady) {
+      showLibraryError(libraryRoot, error.message, () => {
+        $('libFoot').textContent = 'Trying again…';
+        loadLibrary(null, { pick: false });
+      });
+    } else {
+      showLibraryLoadError(libraryRoot, error.message, () => loadLibrary(null, { pick: false }));
+    }
+    viewer.showEmpty('The Library did not load. Is the viewer server running?');
+    },
+  });
+}
+
+async function refreshAssets() {
+  const response = await fetch('/api/assets');
+  const payload = await response.json();
+  if (!response.ok) return;
+  base = payload.base;
+  assets = payload.assets;
+  if (current) current = assets.find((a) => a.id === current.id) ?? current;
+  renderLibrary();
+}
+
+async function loadTools() {
+  const [catalog, animate, finishCaps, motion] = await Promise.all([
+    fetch('/api/catalog').then((r) => r.json()).catch(() => null),
+    fetch('/api/animate/models').then((r) => r.json()).catch(() => null),
+    fetch('/api/finish/capabilities').then((r) => r.json()).catch(() => null),
+    fetch('/api/motion/prompts').then((r) => r.json()).catch(() => null),
+  ]);
+  blenderReady = finishCaps ? !!finishCaps.ready : true;   // unknown: let the server say
+  engines = readyEngines(catalog);
+  frontBack = catalog?.front_back || null;
+  pictureEngines = catalog?.picture_engines || [];
+  presets = animate?.installed ? animate.presets : [];
+  motionPrompts = motion?.prompts || [];
+  motionReady = motion ? !!motion.installed : null;         // null: unknown, let the server say
+  motionNote = motion?.missing_note || null;
+  recipes = await fetch('/api/recipes').then((r) => r.json()).catch(() => null);
+}
+
+// ------------------------------------------------------------------ Create
+function openCreateSheet(prefill = null) {
+  closeSheet($('stage'));
+  createHandle = openCreate({ stage: $('stage'), recipes, engines, presets, motionPrompts, frontBack, pictureEngines, prefill,
+    onSourceChange: () => { libraryInputId = null; renderLibrary(); }, onStart: (plan) => startChain(plan) });
+}
+
+async function useLibraryPicture(asset) {
+  return libraryPictureLoader.load(asset);
+}
+
+$('createBtn').addEventListener('click', () => {
+  if (making && !making.failed && !making.finished) { showMaking(); return; }
+  openCreateSheet();
+});
+
+const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+function makingRow() {
+  if (!making) return '';
+  const n = making.plan.steps.length, done = making.done.length;
+  const pips = making.plan.steps.map((s) => `<i class="${making.done.includes(s) ? 'done' : s === making.current && !making.cancelled ? (making.failed ? 'stop' : 'run') : ''}"></i>`).join('');
+  const thumb = making.made.picture ? `<img src="${url(making.made.picture)}" alt="">` : `<img class="mark glow" src="${LOGO}" alt="">`;
+  const status = making.cancelled ? 'Cancelled' : making.failed ? stoppedLine(making.current) : making.finished ? 'Done' : `${STEP_LABELS[making.current] || 'Starting'}… step ${Math.min(done + 1, n)} of ${n}`;
+  return `<li><button class="asset making" data-making aria-current="${viewingMaking}">
+    <span class="thumb">${thumb}</span>
+    <span style="min-width:0"><span class="nm">${escape(making.title)}</span><span class="st"><span class="pips" aria-hidden="true">${pips}</span>${escape(status)}</span></span>
+  </button></li>`;
+}
+
+/** The viewer, Steps and Library while Create is making something. */
+function showMaking() {
+  if (!making) return;
+  closeSheet($('stage'));
+  viewingMaking = true;
+  renderModelSwitch(null);
+  renderLibrary();
+  $('vTitle').textContent = making.title;
+  $('vTitle').classList.toggle('long', making.title.length > 60);
+  $('vMeta').textContent = making.cancelled ? 'Cancelled' : making.failed ? 'Stopped' : making.finished ? 'Done' : 'Making…';
+  $('hideBtn').hidden = true;
+  viewer.setFacing(null);  // a run in progress shows its files as they come
+  setDownload(null);
+  $('sideKind').textContent = { character: 'Character', prop: 'Prop', set: 'Prop set', picture: 'Picture' }[making.plan.want] || '';
+  $('steps').innerHTML = making.plan.steps.map((step, i) => {
+    const state = making.done.includes(step) ? 'done' : step === making.current ? 'now' : 'later';
+    const dot = state === 'done' ? '✓' : making.cancelled && step === making.current ? '–' : making.failed && step === making.current ? '■' : i + 1;
+    const sum = state === 'done' ? 'Done' : state === 'now' ? (making.cancelled ? 'Cancelled' : making.failed ? 'Stopped. The reason is in the viewer.' : 'Running now') : making.cancelled ? 'Not run' : 'Waiting';
+    const took = state === 'done' ? duration(making.seconds?.[step]) : '';
+    return `<li class="step ${state}"><header><span class="dot">${dot}</span><span><h3>${STEP_LABELS[step]}</h3><div class="sum">${sum}</div></span>${took ? `<span class="time">${took}</span>` : ''}</header></li>`;
+  }).join('');
+  // show the newest result while the next step runs
+  const m = making.made;
+  viewer.setClips([]);
+  const shown = m.rigged || m.finished || m.model;
+  if (shown && making.shown !== shown) { viewer.load(url(shown), { label: making.title }); making.shown = shown; }
+  else if (!shown && m.picture && making.shown !== `${m.picture}|${m.back || ''}`) {
+    viewer.showImage(url(m.picture), '', m.back ? url(m.back) : null);   // front + back side by side
+    making.shown = `${m.picture}|${m.back || ''}`;
+  }
+  else if (!shown && !m.picture && making.shown !== 'empty') { viewer.showEmpty(''); making.shown = 'empty'; }
+  drawProgress();
+}
+
+function cardBounds(root) {
+  return { w: root.clientWidth, h: root.clientHeight };
+}
+
+function cardBox(card, root) {
+  const cardRect = card.getBoundingClientRect();
+  const rootRect = root.getBoundingClientRect();
+  return { x: cardRect.left - rootRect.left, y: cardRect.top - rootRect.top, w: cardRect.width, h: cardRect.height };
+}
+
+function applyCardPlace(card) {
+  if (!card || !cardPlace) return;
+  card.classList.add('placed');
+  card.style.left = `${cardPlace.x}px`;
+  card.style.top = `${cardPlace.y}px`;
+  card.style.width = `${cardPlace.w}px`;
+  card.style.height = `${cardPlace.h}px`;
+}
+
+function trackPointer(target, event, onMove) {
+  event.preventDefault();
+  event.stopPropagation();
+  const pointer = event.pointerId;
+  target.setPointerCapture(pointer);
+  const move = (e) => { if (e.pointerId === pointer) onMove(e); };
+  const end = (e) => {
+    if (e.pointerId !== pointer) return;
+    target.removeEventListener('pointermove', move);
+    target.removeEventListener('pointerup', end);
+    target.removeEventListener('pointercancel', end);
+  };
+  target.addEventListener('pointermove', move);
+  target.addEventListener('pointerup', end);
+  target.addEventListener('pointercancel', end);
+}
+
+function wireCard(card) {
+  if (!card || card.dataset.wired) return;
+  card.dataset.wired = '1';
+  const root = card.parentElement;
+  card.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || event.target.closest('.log, button, a, input, textarea')) return;
+    const start = { x: event.clientX, y: event.clientY, box: cardBox(card, root) };
+    cardPlace = start.box;
+    applyCardPlace(card);
+    trackPointer(card, event, (e) => {
+      cardPlace = moveBox(start.box, e.clientX - start.x, e.clientY - start.y, cardBounds(root));
+      applyCardPlace(card);
+    });
+  });
+  card.querySelector('.grip')?.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const start = { x: event.clientX, y: event.clientY, box: cardPlace || cardBox(card, root) };
+    cardPlace = start.box;
+    applyCardPlace(card);
+    trackPointer(card, event, (e) => {
+      cardPlace = resizeBox(start.box, e.clientX - start.x, e.clientY - start.y, cardBounds(root));
+      applyCardPlace(card);
+    });
+  });
+}
+
+function updateRunCard(card, { list, width, message, stall }) {
+  card.querySelector('.chain-steps').innerHTML = list;
+  const bar = card.querySelector('.bigbar span');
+  bar.style.width = `${width}%`;
+  bar.classList.toggle('busy', making.percent == null);
+  card.querySelector('.job-msg').textContent = message;
+  const note = card.querySelector('.stallnote');
+  if (stall) { if (!note) card.querySelector('.job-msg').insertAdjacentHTML('afterend', stall); }
+  else note?.remove();
+  let log = card.querySelector('.log');
+  if (making.log) {
+    if (!log) {
+      card.querySelector('.row.end').insertAdjacentHTML('beforebegin', '<pre class="log" aria-label="Live log"></pre>');
+      log = card.querySelector('.log');
+    }
+    if (log.textContent !== making.log) {
+      const kept = { scrollTop: log.scrollTop, clientHeight: log.clientHeight, scrollHeight: log.scrollHeight };
+      log.textContent = making.log;
+      log.scrollTop = logScroll(kept, log.scrollHeight);
+    }
+  } else log?.remove();
+}
+
+function drawProgress() {
+  const box = $('progress');
+  if (!making || !viewingMaking) { box.hidden = true; return; }
+  const compact = !!(making.made.picture || making.made.model) && !making.failed && !making.finished;
+  box.hidden = false;
+  box.className = `progress${compact ? ' compact' : ''}${making.stalled ? ' stalled' : ''}${making.failed && !making.cancelled ? ' failed' : ''}`;
+  const kind = compact ? 'compact' : making.cancelled ? 'cancelled' : making.failed ? 'failed' : making.finished ? 'finished' : 'run';
+  const list = making.plan.steps.map((s) => `<li class="${making.done.includes(s) ? 'done' : s === making.current && !making.cancelled ? (making.failed ? 'bad' : 'cur') : ''}"><b>${making.done.includes(s) ? '✓' : s === making.current ? (making.cancelled ? '–' : making.failed ? '■' : '●') : '○'}</b>${STEP_LABELS[s]}</li>`).join('');
+  const width = making.finished ? 100 : making.percent ?? 0;
+  const message = making.failed ? making.why : making.finished ? 'All done. It is in your Library.'
+    : `${making.message || 'Starting…'} · ${clock(Date.now() - making.stepStarted)}`;
+  const stall = making.stalled && !making.failed ? '<p class="stallnote">No news from this step for a few minutes. It may be stuck: keep waiting, or cancel.</p>' : '';
+  const sameRun = kind === 'run' && box.dataset.kind === 'run' && box.querySelector('.pcard');
+  if (sameRun) { updateRunCard(box.querySelector('.pcard'), { list, width, message, stall }); return; }
+  const previous = box.querySelector('.log');
+  box.dataset.kind = kind;
+  const buttons = making.cancelled ? '<button class="ghost" data-close>Close</button>'
+    : making.failed ? '<button class="ghost" data-report>Report this</button><button class="ghost" data-copy>Copy details</button><button class="ghost" data-close>Close</button>'
+    : making.finished ? '<button class="ghost" data-close>Close</button>' : '<button class="ghost" data-x>Cancel</button>';
+  box.innerHTML = compact
+    ? `<div class="pc"><span class="meta">${escape(STEP_LABELS[making.current] || '')}</span><div class="bigbar"><span class="${making.percent == null ? 'busy' : ''}" style="width:${width}%"></span></div><span class="job-msg">${escape(message)}</span>${buttons}</div>${stall}`
+    : `<div class="pcard">${making.failed || making.finished ? '' : `<img class="glow" src="${LOGO}" alt="">`}
+        <ol class="chain-steps">${list}</ol>
+        <div class="bigbar"><span class="${making.percent == null && !making.finished ? 'busy' : ''}" style="width:${width}%"></span></div>
+        <p class="job-msg">${escape(message)}</p>${stall}
+        ${making.log ? `<pre class="log" aria-label="Live log">${escape(making.log)}</pre>` : ''}
+        <div class="row end">${buttons}</div>
+        <button type="button" class="grip" aria-label="Resize"></button></div>`;
+  const card = box.querySelector('.pcard');
+  if (card) { applyCardPlace(card); wireCard(card); }
+  const log = box.querySelector('.log');
+  if (log) log.scrollTop = logScroll(previous, log.scrollHeight);
+  box.querySelector('[data-x]')?.addEventListener('click', (e) => { e.target.disabled = true; making.cancel?.(); });
+  box.querySelector('[data-report]')?.addEventListener('click', () => openReport($('stage')));   // the newest failure is this one
+  box.querySelector('[data-copy]')?.addEventListener('click', () => copyDetails(making.why, making.fullLog));
+  box.querySelector('[data-close]')?.addEventListener('click', () => { const keep = making.result; making = null; show(keep ?? current ?? assets[0] ?? null); });
+}
+
+async function startChain(plan, attach = null) {
+  making = { plan, title: plan.description || plan.file?.name || 'New asset', done: [], current: null, made: {},
+    percent: null, message: '', log: '', stepStarted: Date.now(), failed: false, finished: false, why: '', shown: null };
+  ctx.onBusy(true);
+  showMaking();
+  const timer = setInterval(() => { if (viewingMaking && !making?.failed && !making?.finished) drawProgress(); }, 1000);
+  const ui = {
+    begin: () => {},
+    step: (step) => { Object.assign(making, { current: step, percent: null, message: '', log: '', stepStarted: Date.now(), stalled: false }); renderLibrary(); if (viewingMaking) showMaking(); },
+    cancelWith: (fn) => { making.cancel = fn; },
+    progress: ({ event, percent, log, stalled }) => {
+      Object.assign(making, { percent, message: event.message || event.phase || 'Working…', log: readableLog(log, 80), fullLog: log, stalled });
+      if (viewingMaking) drawProgress();
+    },
+    done: (step, made, seconds) => { making.done.push(step); making.made = made; making.seconds = seconds || {}; renderLibrary(); if (viewingMaking) showMaking(); },
+    cancelled: (step) => {
+      Object.assign(making, { current: stoppedStep(making.current, step, making.plan.steps), failed: true, cancelled: true, why: 'Cancelled. Everything finished before this step is kept.', log: '', fullLog: '' });
+      renderLibrary(); if (viewingMaking) showMaking();
+    },
+    fail: (step, why, log) => {
+      Object.assign(making, { current: stoppedStep(making.current, step, making.plan.steps), failed: true, why, log: readableLog(log, 80), fullLog: log });
+      renderLibrary(); if (viewingMaking) showMaking();
+    },
+    finish: (mine) => {
+      making.finished = true;
+      making.result = assets.find(mine) ?? null;
+      // land on the finished asset, playing its first move if it has one
+      if (viewingMaking && making.result) { playNext = making.plan.firstMove; const result = making.result; making = null; show(result); }
+      else renderLibrary();
+    },
+  };
+  try {
+    await runChain(plan, { ui, attach, ctx: { url, reload: async () => { await refreshAssets(); } } });
+  } finally {
+    clearInterval(timer);
+    ctx.onBusy(false);
+  }
+}
+
+// a run keeps going on the server after its tab closes: a reopened studio picks it back up
+async function runningChain() {
+  try { return (await (await fetch('/api/chains')).json()).running ?? null; }
+  catch { return null; }  // an older server without runs: nothing to resume
+}
+
+// open on a run still going, else on Create; the Library beside it holds the recent work
+async function boot() {
+  usageNotice(() => openAbout($('stage')));   // also sends the daily count, unless sharing is off
+  await loadTools();
+  await loadLibrary(null, { pick: false });
+  const running = await runningChain();
+  if (openingView(running) === 'running') {
+    if (!making) startChain({ steps: running.steps, description: running.title, firstMove: running.first_move, want: running.want }, running.id);
+  } else if (!showLinked()) openCreateSheet();
+}
+
+// an agent's "open in the studio" link: studio.html#asset=<id>
+function showLinked() {
+  const id = linkedAssetId(location.hash);
+  const asset = id && assets.find((a) => a.id === id);
+  if (!asset) return false;
+  show(asset);
+  return true;
+}
+window.addEventListener('hashchange', async () => {
+  if (linkedAssetId(location.hash) && !assets.some((a) => a.id === linkedAssetId(location.hash))) await refreshAssets();
+  showLinked();
+});
+
+// rename: click the title, type, Enter (Escape keeps the old name). Only the Library's label
+// changes; files keep their names.
+$('vTitle').title = 'Click to rename';
+$('vTitle').addEventListener('click', () => {
+  if (!current || viewingMaking || $('vTitle').querySelector('input')) return;
+  const asset = current;
+  const input = document.createElement('input');
+  input.className = 'rename';
+  input.value = asset.name;
+  input.maxLength = 80;
+  input.setAttribute('aria-label', 'Name');
+  $('vTitle').replaceChildren(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    $('vTitle').textContent = asset.name;
+    if (!save || name === asset.name) return;
+    try {
+      const response = await fetch(`/api/assets/${asset.id}/name`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+      if (!response.ok) throw new Error((await response.json()).error);
+      await refreshAssets();
+      if (current?.id === asset.id) $('vTitle').textContent = current.name;
+    } catch { $('vTitle').textContent = asset.name; }
+  };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); });
+  input.addEventListener('blur', () => finish(true));
+});
+
+// ------------------------------------------------------------------ Open a GLB
+// look at any GLB from this computer: view only, nothing is copied into the Library
+let openedUrl = null;
+
+function openFile(file) {
+  if (!file) return;
+  closeSheet($('stage'));
+  current = null;
+  viewingMaking = false;
+  $('progress').hidden = true;
+  renderLibrary();
+  $('hideBtn').hidden = true;
+  setDownload(null);
+  $('sideKind').textContent = '';
+  $('vTitle').textContent = file.name;
+  if (!isModelFile(file.name)) {
+    $('vMeta').textContent = '';
+    $('steps').innerHTML = '';
+    viewer.setClips([]);
+    viewer.showEmpty('Only GLB files open here. To make a picture into 3D, use + Create.');
+    return;
+  }
+  $('vMeta').textContent = 'Opened from your computer · not in your Library';
+  $('steps').innerHTML = '<li class="hint opened-note">Just looking. To rig, animate or finish this model, use + Create and start from "3D model".</li>';
+  if (openedUrl) URL.revokeObjectURL(openedUrl);
+  openedUrl = URL.createObjectURL(file);
+  viewer.setFacing(null);
+  viewer.setClips([]);
+  viewer.load(openedUrl, { label: file.name, autoplay: true });
+}
+
+$('openBtn').addEventListener('click', () => $('openFile').click());
+$('openFile').addEventListener('change', (event) => { openFile(event.target.files[0]); event.target.value = ''; });
+// a file dropped anywhere opens in the viewer, instead of the browser downloading it.
+// Create's sheet takes its own drops first (and marks them handled).
+window.addEventListener('dragover', (event) => event.preventDefault());
+window.addEventListener('drop', (event) => {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  openFile(event.dataTransfer?.files?.[0]);
+});
+
+$('guideBtn').addEventListener('click', () => openGuide($('stage')));
+$('activityBtn').addEventListener('click', () => openActivity($('stage')));
+$('newsBtn').addEventListener('click', () => openNews($('stage'), $('newsBtn')));
+refreshNews($('newsBtn'));   // the count only: the list opens when the person asks
+$('aboutBtn').addEventListener('click', () => openAbout($('stage')));
+$('reportBtn').addEventListener('click', () => openReport($('stage')));
+
+boot();

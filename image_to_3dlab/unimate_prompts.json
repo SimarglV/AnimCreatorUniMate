@@ -1,0 +1,17 @@
+{
+  "prompts": [
+    {"id": "walk", "label": "Walk forward", "text": "An object walks forward."},
+    {"id": "run", "label": "Run forward", "text": "An object runs forward."},
+    {"id": "jump", "label": "Jump in place", "text": "An object jumps in place."},
+    {"id": "turn", "label": "Turn around", "text": "An object turns around in place."},
+    {"id": "idle", "label": "Look around", "text": "An object stands and looks around."},
+    {"id": "sit", "label": "Sit down", "text": "An object sits down."},
+    {"id": "attack", "label": "Attack forward", "text": "An object attacks forward."},
+    {"id": "dance", "label": "Dance in place", "text": "An object dances in place."},
+    {"id": "cheer", "label": "Cheer", "text": "An object cheers with its arms raised."},
+    {"id": "wings", "label": "Flap wings", "text": "An object flaps its wings."},
+    {"id": "swim", "label": "Swim and turn", "text": "An object swims and turns around."},
+    {"id": "slither", "label": "Slither forward", "text": "An object slithers forward."}
+  ],
+  "aliases": {}
+}

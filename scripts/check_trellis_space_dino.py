@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Capture the exact preprocessed image and DINO conditioning tensor."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+DEFAULT_ROOT = REPO / "vendor/trellis-space-mac"
+
+
+def pin_hub_offline() -> None:
+    """Force the hub offline. A shell value of 0 must not win."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image", type=Path)
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "mps"),
+        default="auto",
+        help="conditioning device; auto selects MPS when available",
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    root = args.root.resolve()
+    output = args.output.resolve()
+
+    pin_hub_offline()
+    os.environ.setdefault("ATTN_BACKEND", "sdpa")
+    os.environ.setdefault("SPARSE_ATTN_BACKEND", "metal_flash")
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
+    os.environ.setdefault(
+        "FLEX_GEMM_AUTOTUNE_CACHE_PATH",
+        str(root / "cache/flex_gemm_autotune.json"),
+    )
+    sys.path.insert(0, str(root / "TRELLIS.2"))
+
+    import numpy as np
+    import torch
+    import transformers
+    from PIL import Image
+    from trellis2.modules.image_feature_extractor import DinoV3FeatureExtractor
+    from trellis2.pipelines.trellis2_image_to_3d import Trellis2ImageTo3DPipeline
+
+    device = (
+        "mps"
+        if args.device == "auto" and torch.backends.mps.is_available()
+        else "cpu"
+        if args.device == "auto"
+        else args.device
+    )
+    if device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS is unavailable")
+
+    image = Image.open(args.image)
+    pipeline = Trellis2ImageTo3DPipeline()
+    processed = pipeline.preprocess_image(image)
+    processed_array = np.asarray(processed)
+    processed_digest = hashlib.sha256(processed_array.tobytes()).hexdigest()
+
+    extractor = DinoV3FeatureExtractor(
+        "facebook/dinov3-vitl16-pretrain-lvd1689m",
+        image_size=args.resolution,
+    )
+    extractor.to(device)
+    features = extractor([processed]).detach().cpu().float().contiguous()
+    feature_digest = hashlib.sha256(features.numpy().tobytes()).hexdigest()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tensor_path = output.with_suffix(".pt")
+    image_path = output.with_suffix(".png")
+    json_path = output.with_suffix(".json")
+    torch.save(features, tensor_path)
+    processed.save(image_path)
+    report = {
+        "source": str(args.image.resolve()),
+        "root": str(root),
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "resolution": args.resolution,
+        "device": device,
+        "processed_shape": list(processed_array.shape),
+        "processed_sha256": processed_digest,
+        "feature_shape": list(features.shape),
+        "feature_sha256": feature_digest,
+        "feature_mean": features.mean().item(),
+        "feature_std": features.std().item(),
+        "feature_min": features.min().item(),
+        "feature_max": features.max().item(),
+        "tensor": str(tensor_path),
+    }
+    json_path.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

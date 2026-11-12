@@ -1,0 +1,412 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+from .provenance import (
+    finalize_output,
+    load_run_manifest,
+    validate_run_policy,
+)
+
+# Manifest values for these keys use the same choices as the CLI flags.
+_MANIFEST_CHOICES = {
+    "remesh": ("none", "triangle", "quad"),
+    "pipeline_type": ("512", "1024", "1024_cascade"),
+    "texture_size": (512, 1024, 2048),
+    "material_mode": ("matte", "pbr"),
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Turn one image into a 3D asset with SF3D or ComfyUI/Hunyuan3D."
+    )
+    parser.add_argument("image", nargs="?", type=Path, help="PNG/JPEG/WebP input image")
+    parser.add_argument(
+        "--run-manifest", type=Path, help="JSON run manifest (schema v1)"
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--fast", action="store_true", help="Run SF3D in this process")
+    mode.add_argument(
+        "--quality",
+        action="store_true",
+        help="Run an API-format Hunyuan3D ComfyUI workflow",
+    )
+    mode.add_argument(
+        "--trellis", action="store_true", help="Run TRELLIS.2 through the Mac port"
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    parser.add_argument(
+        "--view",
+        dest="views",
+        type=Path,
+        action="append",
+        help=(
+            "extra view of the same subject in the same pose (repeatable, trellis2 "
+            "only). Views must orbit the camera, not change the pose."
+        ),
+    )
+
+    fast = parser.add_argument_group("SF3D options")
+    fast.add_argument("--sf3d-repo", type=Path, default=Path("vendor/stable-fast-3d"))
+    fast.add_argument("--model", default="stabilityai/stable-fast-3d")
+    fast.add_argument("--texture-resolution", type=int, default=1024)
+    fast.add_argument("--foreground-ratio", type=float, default=0.85)
+    fast.add_argument("--remesh", choices=("none", "triangle", "quad"), default="none")
+    fast.add_argument("--target-vertices", type=int, default=-1)
+    fast.add_argument("--cpu", action="store_true", help="Force SF3D to CPU")
+    fast.add_argument(
+        "--no-cpu-fallback",
+        action="store_true",
+        help="Do not retry on CPU after an MPS OOM",
+    )
+
+    trellis = parser.add_argument_group("TRELLIS.2 options")
+    trellis.add_argument(
+        "--trellis-repo", type=Path, default=Path("vendor/trellis-mac")
+    )
+    trellis.add_argument("--seed", type=int, default=42)
+    trellis.add_argument(
+        "--pipeline-type", choices=("512", "1024", "1024_cascade"), default="512"
+    )
+    trellis.add_argument(
+        "--trellis-texture-size", choices=(512, 1024, 2048), type=int, default=1024
+    )
+    trellis.add_argument(
+        "--trellis-bake-target-faces",
+        type=int,
+        default=50_000,
+        help="Triangle budget used by the CPU UV/texture fallback",
+    )
+    trellis.add_argument(
+        "--trellis-pre-simplify-cap",
+        type=int,
+        default=None,
+        help="Face count above which generate.py's crude pre-simplify safety net runs "
+             "(maps to the I2L_PRE_CAP env var). Leave unset to use the port's default "
+             "of 4,000,000; a manifest may override it via 'pre_simplify_cap'.",
+    )
+    trellis.add_argument("--steps", type=int)
+    trellis.add_argument(
+        "--trellis-raw-material",
+        dest="trellis_normalize_material",
+        action="store_false",
+        help="Keep TRELLIS's raw material instead of normalizing it (leaves it transparent)",
+    )
+    trellis.add_argument(
+        "--trellis-remesh",
+        action="store_true",
+        help="Narrow-band DC remeshing before UV unwrap. generate.py calls this the stage "
+             "that targets boundary edges at source; every asset we ship is open",
+    )
+    trellis.add_argument(
+        "--trellis-remesh-project",
+        type=float,
+        default=0.0,
+        help="How far remeshed vertices snap back to the original surface. The vendored "
+             "port defaults to 0.9, which measurably worsened boundary edges "
+             "(6,008 -> 16,954 on the Forest Variant), so we default to 0.0",
+    )
+    trellis.add_argument(
+        "--trellis-material-mode",
+        choices=("matte", "pbr"),
+        default="pbr",
+        help="pbr keeps TRELLIS's metallic-roughness map, matching the reference "
+             "implementation; matte discards it and renders mathematically flat",
+    )
+
+    quality = parser.add_argument_group("ComfyUI/Hunyuan3D options")
+    quality.add_argument(
+        "--workflow", type=Path, help="Workflow exported with ComfyUI Export (API)"
+    )
+    quality.add_argument("--comfy-url", default="http://127.0.0.1:8188")
+    quality.add_argument(
+        "--image-node", help="LoadImage node ID; auto-detected when unambiguous"
+    )
+    quality.add_argument(
+        "--output-node", help="Output node ID; otherwise all outputs are searched"
+    )
+    quality.add_argument(
+        "--timeout", type=float, default=3600, help="Job timeout in seconds"
+    )
+    quality.add_argument("--poll-interval", type=float, default=2)
+    return parser
+
+
+def _extract_workflow_model_identity(workflow_path: Path) -> str | None:
+    """Read a ComfyUI API-format workflow and return the checkpoint name(s) it loads.
+
+    The canonical Hunyuan3D-2.1 checkpoint is listed in the backend's licence profile;
+    anything else is treated as unverified unless the manifest explicitly allows it.
+    """
+    try:
+        workflow = json.loads(workflow_path.expanduser().read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read workflow {workflow_path}: {exc}") from exc
+    if not isinstance(workflow, dict):
+        raise ValueError(
+            "workflow JSON must be an API-format object, not a UI workflow array"
+        )
+    names = []
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        if isinstance(class_type, str) and "CheckpointLoader" in class_type:
+            ckpt_name = node.get("inputs", {}).get("ckpt_name")
+            if isinstance(ckpt_name, str):
+                names.append(ckpt_name)
+    if not names:
+        return None
+    return ", ".join(names)
+
+
+def _resolve_model_identity(args: argparse.Namespace) -> str | None:
+    """Return the actual model identity for the selected backend, if known."""
+    if args.fast:
+        return args.model
+    if args.trellis:
+        return "microsoft/TRELLIS.2-4B"
+    if args.quality:
+        if args.workflow is None:
+            return None
+        return _extract_workflow_model_identity(args.workflow)
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    source_manifest = None
+    manifest_data = None
+    if args.run_manifest:
+        source_manifest = args.run_manifest.expanduser().resolve()
+        try:
+            manifest_data = load_run_manifest(source_manifest)
+            model = manifest_data["model"]
+            backend = model["backend"]
+            # A manifest may name one image, or several views of the same subject in
+            # the same pose. Extra views replace guessing about unseen sides.
+            manifest_input = manifest_data["input"]
+            if "views" in manifest_input:
+                args.views = [
+                    source_manifest.parent / view for view in manifest_input["views"]
+                ]
+                args.image = args.views[0]
+            else:
+                args.image = source_manifest.parent / manifest_input["path"]
+            args.fast = backend == "sf3d"
+            args.quality = backend == "hunyuan-comfyui"
+            args.trellis = backend == "trellis2"
+            if not (args.fast or args.quality or args.trellis):
+                raise ValueError(f"backend {backend!r} is not implemented yet")
+            parameters = model.get("parameters", {})
+            for key, allowed in _MANIFEST_CHOICES.items():
+                if key in parameters and parameters[key] not in allowed:
+                    listed = ", ".join(str(item) for item in allowed)
+                    raise ValueError(
+                        f"{key} must be one of {listed}; got {parameters[key]!r}"
+                    )
+            args.model = model.get("id", args.model)
+            for key in (
+                "texture_resolution",
+                "foreground_ratio",
+                "remesh",
+                "target_vertices",
+            ):
+                if key in parameters:
+                    setattr(args, key, parameters[key])
+            for key in ("seed", "pipeline_type", "steps"):
+                if key in parameters:
+                    setattr(args, key, parameters[key])
+            if "texture_size" in parameters:
+                args.trellis_texture_size = parameters["texture_size"]
+            if "bake_target_faces" in parameters:
+                args.trellis_bake_target_faces = parameters["bake_target_faces"]
+            if "pre_simplify_cap" in parameters:
+                args.trellis_pre_simplify_cap = parameters["pre_simplify_cap"]
+            if "normalize_material" in parameters:
+                args.trellis_normalize_material = bool(parameters["normalize_material"])
+            if "material_mode" in parameters:
+                args.trellis_material_mode = parameters["material_mode"]
+            if "trellis_remesh" in parameters:
+                args.trellis_remesh = bool(parameters["trellis_remesh"])
+            if "trellis_remesh_project" in parameters:
+                args.trellis_remesh_project = float(parameters["trellis_remesh_project"])
+            if "workflow" in manifest_data:
+                workflow = manifest_data["workflow"]
+                if not isinstance(workflow, str) or not workflow:
+                    raise ValueError("workflow must be a path")
+                args.workflow = source_manifest.parent / workflow
+            args.output_dir = Path(
+                manifest_data.get("output", {}).get("directory", args.output_dir)
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"error: invalid run manifest: {exc}", file=sys.stderr)
+            return 2
+    elif args.image is None or sum((args.fast, args.quality, args.trellis)) != 1:
+        print(
+            "error: provide --run-manifest, or IMAGE with exactly one mode",
+            file=sys.stderr,
+        )
+        return 2
+
+    manifest_views = manifest_data is not None and "views" in manifest_data["input"]
+    inputs = args.views if manifest_views else [args.image, *(args.views or [])]
+    views = [v.expanduser().resolve() for v in inputs]
+    missing = [str(v) for v in views if not v.is_file()]
+    if missing:
+        print(f"error: input image does not exist: {', '.join(missing)}", file=sys.stderr)
+        return 2
+    # Provenance and output naming follow the first view.
+    image = views[0]
+    if len(views) > 1 and not args.trellis:
+        print("error: multiple views are only supported by the trellis2 backend", file=sys.stderr)
+        return 2
+    intent = {
+        "use_case": manifest_data.get("use_case", "showcase")
+        if manifest_data
+        else "showcase",
+        "distribution": manifest_data.get("distribution", "private")
+        if manifest_data
+        else "private",
+        "commercial_intent": manifest_data.get("commercial_intent", False)
+        if manifest_data
+        else False,
+    }
+    backend = "sf3d" if args.fast else "trellis2" if args.trellis else "hunyuan-comfyui"
+    policy = manifest_data.get("license_policy", {}) if manifest_data else {}
+    try:
+        model_identity = _resolve_model_identity(args)
+        profile = validate_run_policy(
+            backend,
+            intent["use_case"],
+            intent["distribution"],
+            policy.get("allow_conditional", True),
+            model_identity=model_identity,
+            allow_unverified=policy.get("allow_unverified", False),
+            commercial_intent=bool(intent["commercial_intent"]),
+            allow_research_only=bool(policy.get("allow_research_only", True)),
+        )
+    except ValueError as exc:
+        print(f"error: license policy: {exc}", file=sys.stderr)
+        return 2
+    working_output_dir = args.output_dir / ".working"
+    working_output_dir.mkdir(parents=True, exist_ok=True)
+    trellis_texture_backend = None
+    trellis_material_normalized = None
+    trellis_material_mode = None
+
+    if not 0 < args.foreground_ratio <= 1:
+        print("error: --foreground-ratio must be in (0, 1]", file=sys.stderr)
+        return 2
+    if args.texture_resolution <= 0:
+        print("error: --texture-resolution must be positive", file=sys.stderr)
+        return 2
+    if args.trellis_bake_target_faces <= 0:
+        print("error: --trellis-bake-target-faces must be positive", file=sys.stderr)
+        return 2
+
+    try:
+        if args.fast:
+            if args.cpu:
+                os.environ["SF3D_USE_CPU"] = "1"
+            from .sf3d_backend import SF3DOptions, generate_sf3d
+
+            result = generate_sf3d(
+                image,
+                working_output_dir,
+                SF3DOptions(
+                    repo=args.sf3d_repo,
+                    model=args.model,
+                    texture_resolution=args.texture_resolution,
+                    foreground_ratio=args.foreground_ratio,
+                    remesh=args.remesh,
+                    target_vertices=args.target_vertices,
+                    cpu_fallback=not args.no_cpu_fallback,
+                ),
+            )
+        elif args.trellis:
+            from .trellis_backend import TrellisOptions, generate_trellis
+
+            trellis_result = generate_trellis(
+                views,
+                working_output_dir,
+                TrellisOptions(
+                    repo=args.trellis_repo,
+                    seed=args.seed,
+                    pipeline_type=args.pipeline_type,
+                    texture_size=args.trellis_texture_size,
+                    bake_target_faces=args.trellis_bake_target_faces,
+                    steps=args.steps,
+                    normalize_material=args.trellis_normalize_material,
+                    material_mode=args.trellis_material_mode,
+                    pre_simplify_cap=args.trellis_pre_simplify_cap,
+                    remesh=args.trellis_remesh,
+                    remesh_project=args.trellis_remesh_project,
+                ),
+            )
+            result = trellis_result.asset
+            trellis_texture_backend = trellis_result.texture_backend
+            trellis_material_normalized = trellis_result.material_normalized
+            trellis_material_mode = trellis_result.material_mode
+        else:
+            if args.workflow is None:
+                raise ValueError(
+                    "--quality requires --workflow (ComfyUI API-format JSON)"
+                )
+            from .comfyui_backend import ComfyUIClient
+
+            result = ComfyUIClient(args.comfy_url).generate(
+                image=image,
+                workflow_path=args.workflow,
+                output_dir=working_output_dir,
+                image_node=args.image_node,
+                output_node=args.output_node,
+                timeout=args.timeout,
+                poll_interval=args.poll_interval,
+            )
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    parameters = {
+        "model": args.model if args.fast or args.trellis else None,
+        "texture_resolution": args.texture_resolution if args.fast else None,
+        "foreground_ratio": args.foreground_ratio if args.fast else None,
+        "remesh": args.remesh if args.fast else None,
+        "target_vertices": args.target_vertices if args.fast else None,
+        "seed": args.seed if args.trellis else None,
+        "pipeline_type": args.pipeline_type if args.trellis else None,
+        "texture_size": args.trellis_texture_size if args.trellis else None,
+        "bake_target_faces": args.trellis_bake_target_faces if args.trellis else None,
+        "texture_backend": trellis_texture_backend if args.trellis else None,
+        "material_normalized": trellis_material_normalized if args.trellis else None,
+        "material_mode": trellis_material_mode if args.trellis else None,
+        "trellis_remesh": args.trellis_remesh if args.trellis else None,
+        "trellis_remesh_project": (
+            args.trellis_remesh_project if args.trellis and args.trellis_remesh else None
+        ),
+        "steps": args.steps if args.trellis else None,
+        "pre_simplify_cap": args.trellis_pre_simplify_cap if args.trellis else None,
+    }
+    result, sidecar = finalize_output(
+        generated=result,
+        image=image,
+        output_root=args.output_dir,
+        backend=backend,
+        profile=profile,
+        intent=intent,
+        parameters=parameters,
+        source_manifest=source_manifest,
+        backend_repo=(
+            args.sf3d_repo if args.fast else args.trellis_repo if args.trellis else None
+        ),
+        model_identity=model_identity,
+    )
+    print(result)
+    print(sidecar)
+    return 0

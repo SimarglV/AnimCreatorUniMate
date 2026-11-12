@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""Finish a generated asset: retopologise, repaint, bake detail, compress — one command.
+
+    python scripts/retopo_repaint.py generated.glb source.png finished.glb
+
+**Why this exists.** The route that works on this repo's assets is four separate commands
+run by hand, each with its own flags, in an order that matters:
+
+    blender_retopo_bake.py → run_paint_pbr.py → blender_bake_detail.py → compress_glb_textures.py
+
+Run by hand across several assets, each gets slightly different treatment and the
+comparison between them stops meaning anything. It also takes ~8 minutes of attention per
+asset, most of it waiting. This runs the chain, keeps every intermediate, and writes a
+JSON record of what was actually done.
+
+**What the route is for.** TRELLIS.2's geometry is good and its 1024 texture stage bleaches
+flat-illustration inputs. So: take the geometry, throw the texture away, and repaint from
+the source image with Hunyuan 2.1 PBR. Retopology in the middle is what makes the repaint
+affordable — xatlas takes 12 seconds on a 40k mesh against minutes at 500k, and the paint
+stage's face-count ceiling stops being reachable.
+
+**Stages, and why each is where it is:**
+
+1. **Retopologise** (`blender_retopo_bake.py`, headless Blender). Voxel-remesh first, then
+   decimate. The ordering is load-bearing: decimating the raw mesh shatters thin geometry,
+   measured. Also bakes the original texture across as a fallback, so the intermediate is
+   viewable even if the paint stage fails.
+2. **Repaint** (`hunyuan_mlx/paint`, its own venv). Reuses `run_paint` from
+   `hunyuan_mlx_xiong_generate.py` rather than re-deriving the env-var contract.
+3. **Bake detail** (`blender_bake_detail.py`, headless Blender). A normal map from the
+   original high-poly, so the retopo keeps its relief, plus the source's
+   metallic-roughness map when there was no repaint (a repaint makes its own). After the
+   repaint because the repaint re-unwraps: a map baked onto the retopo's UVs would land
+   in the wrong place. Seconds, not minutes.
+4. **Compress** (`compress_glb_textures.py`). The paint stage emits two uncompressed
+   4096² PNGs, which is 30 MB of a 32 MB asset.
+
+**Surface response is per-asset and this does not guess it.** The retopology stage bakes
+only base colour, so `--metallic/--roughness/--ior` stand in for the source's material
+until the bake-detail stage replaces them with the source's own map (and always, with
+`--skip-bake`). The defaults are neutral
+organic; the Snag wanted 0.648 / 0.686 / 1.4 by eye. Whatever is used is recorded in the
+JSON so the next asset can be judged against a known setting rather than a remembered one.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+SCRIPTS = REPO / "scripts"
+sys.path.insert(0, str(REPO))
+
+from image_to_3dlab import pixal3d_native
+from image_to_3dlab.blender import MAC_APP, find_blender, missing_help
+from image_to_3dlab.host import APPLE, host_platform
+from image_to_3dlab.provenance import set_glb_generator
+
+# Only a default for the command builders; main() finds the real one on every OS.
+BLENDER = MAC_APP
+REPAINT_OFF_MAC = ("The repaint runs on Apple Silicon only (it uses MLX). Pass --skip-paint: "
+                   "Pixel Match still keeps the front exact, and the sides and back keep "
+                   "the generator's own paint.")
+
+# The viewer's job API parses these to drive its progress panel. Same contract as
+# `scripts/blender_rebind.py`, so one parser serves both.
+STAGE_MARKER = "I2L_STAGE"
+
+
+def emit_stage(phase: str, message: str) -> None:
+    """Announce a stage boundary on stdout, for whatever is watching."""
+    print(f"{STAGE_MARKER}::{phase}::{message}", flush=True)
+
+
+def native_or_classic(classic, dump: Path, source: Path, output: Path, faces: int, atlas: int,
+                      log: Path) -> dict | None:
+    """Pixal3D's own clean-up, or the classic route when its frame check objects or the
+    clean-up itself crashes. The model still gets finished; only the route changes, and the
+    log says why."""
+    try:
+        return pixal3d_native.native_retopo(dump, source, output, faces, atlas, log)
+    except (pixal3d_native.FrameMismatch, pixal3d_native.ReplayFailed, OSError) as exc:
+        print(f"[retopo-repaint] note: {exc}; using the classic route", flush=True)
+        classic()
+        return None
+
+
+def finish_route(native_dump: Path | None, keep_mesh: bool, replay_available: bool) -> bool:
+    """Whether this run takes Pixal3D's own clean-up instead of the classic retopology.
+
+    Needs the run's dump and a post-replay build. Full detail keeps the generator's mesh,
+    so there is nothing to clean up again.
+    """
+    return native_dump is not None and not keep_mesh and replay_available
+
+
+def stage_plan(skip_paint: bool, skip_compress: bool, skip_bake: bool = False,
+               photo: bool = False, keep_mesh: bool = False, calm: bool = False) -> list[str]:
+    """The stages this run will execute, in order.
+
+    Named separately from the running of them so a caller — the viewer's job API, say —
+    can show the sequence before anything starts, and so the order is testable.
+    `keep_mesh` finishes the generator's own mesh as it is: no retopology, so nothing
+    to repaint or bake detail onto, just Pixel Match and the texture squeeze.
+    `calm` (High detail) smooths small bumps where the pictures paint, so it needs them.
+    `orient` turns round triangles a picture camera sees from behind (needs the pictures too).
+    """
+    if keep_mesh:
+        return (["photo"] if photo else []) + ([] if skip_compress else ["compress"])
+    stages = ["retopologise"]
+    if calm and photo:
+        stages.append("calm")
+    if photo:
+        stages.append("orient")   # triangles the pictures see from behind are turned round
+    if not skip_paint:
+        stages.append("repaint")
+    if photo:
+        stages.append("photo")
+    if not skip_bake:
+        stages.append("bake")
+    if not skip_compress:
+        stages.append("compress")
+    return stages
+
+
+def headless(blender: Path, script: str) -> list[str]:
+    """Blender, headless, running one of this repo's scripts; its arguments follow.
+
+    Blender exits 0 when a ``--python`` script raises unless ``--python-exit-code`` comes
+    first, and a stage that crashed would then read as done.
+    """
+    return [str(blender), "--background", "--python-exit-code", "1",
+            "--python", str(SCRIPTS / script), "--"]
+
+
+def retopo_command(
+    source: Path, output: Path, faces: int, atlas: int, angle: float,
+    voxel: float, metallic: float, roughness: float, ior: float,
+    blender: Path = BLENDER,
+) -> list[str]:
+    """The headless Blender invocation, as a list.
+
+    `blender_retopo_bake.py` takes positional arguments after `--`, in a fixed order, and
+    getting that order wrong silently produces a differently-tuned asset rather than an
+    error. Built here so it can be asserted in a test.
+    """
+    return [
+        *headless(blender, "blender_retopo_bake.py"),
+        str(source), str(output), str(faces), str(atlas), str(angle),
+        str(voxel), str(metallic), str(roughness), str(ior),
+    ]
+
+
+def bake_command(
+    source: Path, target: Path, output: Path, size: int, blender: Path = BLENDER,
+    fade: Path | None = None,
+) -> list[str]:
+    """The headless bake-detail invocation: original high-poly onto the current mesh.
+
+    `fade` is a mask (normal_fade_mask) of where the normal map goes flat.
+    """
+    return [
+        *headless(blender, "blender_bake_detail.py"),
+        str(source), str(target), str(output), str(size),
+        *([str(fade)] if fade is not None else []),
+    ]
+
+
+def normal_fade_mask(weights_png: Path, size: int, output: Path) -> Path:
+    """Pixel Match's trust map as the bake's fade mask: at the normal map's size, edges
+    softened so the fade leaves no seam. White = painted from the picture = flat normals.
+
+    The blur is 4 px at 2048 and scales with the map.
+    """
+    from PIL import Image, ImageFilter
+
+    with Image.open(weights_png) as trust:
+        mask = trust.convert("L").resize((size, size), Image.BILINEAR)
+    mask.filter(ImageFilter.GaussianBlur(4 * size / 2048)).save(output)
+    return output
+
+
+def reuse(path: Path, resume: bool) -> bool:
+    """Whether a stage can be skipped because its artifact is already there.
+
+    A zero-byte file is a stage that died mid-write, not one that finished; treating it
+    as complete would hand the next stage a truncated GLB instead of re-running the stage
+    that actually failed.
+    """
+    return resume and path.is_file() and path.stat().st_size > 0
+
+
+def shown(command: list[str]) -> str:
+    """The start of a stage's command, for its progress line: through the script it runs,
+    which is what tells one Blender stage from another."""
+    end = command.index("--python") + 2 if "--python" in command else 4
+    return " ".join(command[:end])
+
+
+def _run(command: list[str], log: Path, label: str) -> None:
+    """Run one stage, tee its output to a log, and fail loudly."""
+    print(f"[{label}] {shown(command)} ...", flush=True)
+    with log.open("w") as handle:
+        process = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, check=False)
+    if process.returncode != 0:
+        tail = pixal3d_native.log_tail(log, 15)
+        raise SystemExit(f"[{label}] failed (exit {process.returncode}); last lines:\n{tail}")
+
+
+def photo_settings(edge_fade: bool = True, nudge: bool = True):
+    """Pixel Match's settings. `edge_fade=False` stops it fading the picture out beside inner
+    depth edges: on a full-detail mesh deep eye sockets and hair layers count as edges, so the
+    fade can swallow a small eye and leave coloured specks along hair (2026-10-16 knight).
+    `nudge=False` paints from the pictures as they are: fitting the picture's outline to the
+    body's can slide a face off its features (2026-10-16 gator: a ghost eye on the snout)."""
+    sys.path.insert(0, str(REPO))
+    from image_to_3dlab import photo_paint as pp
+
+    return pp.Settings(align=nudge, **({} if edge_fade else {"inner_edge": 0.0}))
+
+
+def photo_stage(model: Path, views_dir: Path, output: Path, weights_png: Path,
+                edge_fade: bool = True, nudge: bool = True) -> dict:
+    """Paint `model` with the real pixels of the photos in `views_dir`; see
+    image_to_3dlab/photo_paint.py. In-process: numpy only, seconds on a Finish mesh."""
+    sys.path.insert(0, str(REPO))
+    import numpy as np
+    from PIL import Image
+
+    from image_to_3dlab import photo_paint as pp
+
+    positions, uvs, faces, texture = pp.read_glb(model)
+    views, mesh_scale = pp.load_views(views_dir)
+    painted, weight = pp.paint_texture(texture, positions, uvs, faces, views, mesh_scale,
+                                       settings=photo_settings(edge_fade, nudge))
+    output.write_bytes(pp.replace_base_colour(model.read_bytes(), pp.encode_png(painted)))
+    Image.fromarray(np.rint(weight * 255).astype(np.uint8)).save(weights_png)
+    share = round(float((weight > 0.5).mean()), 3)
+    print(f"[photo] {len(views)} view(s); {share:.0%} of the texture from the photo", flush=True)
+    return {"count": len(views), "texture_share": share, "edge_fade": edge_fade, "nudge": nudge}
+
+
+def step_paths(output: Path, steps_dir: Path | None = None) -> dict[str, Path]:
+    """Where each in-between file goes.
+
+    Without `steps_dir`, beside the output with a suffix (`out_retopo.glb`), as always.
+    With it, inside that folder and numbered by the order the stages run
+    (`1_retopo.glb`), so a finished run's folder shows the final model and nothing else
+    that looks like one. Numbers are fixed per stage, so a skipped stage leaves a gap
+    rather than renumbering what a resume looks for.
+    """
+    if steps_dir is None:
+        stem = str(output.with_suffix(""))
+        names = {"retopo": f"{stem}_retopo.glb", "retopo_log": f"{stem}_retopo.log",
+                 "calm": f"{stem}_calm.glb", "orient": f"{stem}_orient.glb",
+                 "painted": f"{stem}_painted.glb", "photo": f"{stem}_photo.glb",
+                 "photo_weights": f"{stem}_photo_weights.png",
+                 "photo_fade": f"{stem}_photo_fade.png",
+                 "baked": f"{stem}_baked.glb", "bake_log": f"{stem}_bake.log"}
+        return {key: Path(value) for key, value in names.items()}
+    return {
+        "retopo": steps_dir / "1_retopo.glb", "retopo_log": steps_dir / "1_retopo.log",
+        "calm": steps_dir / "1_calm.glb", "orient": steps_dir / "1_orient.glb",
+        "painted": steps_dir / "2_painted.glb", "photo": steps_dir / "3_photo.glb",
+        "photo_weights": steps_dir / "3_photo_weights.png",
+        "photo_fade": steps_dir / "3_photo_fade.png",
+        "baked": steps_dir / "4_baked.glb", "bake_log": steps_dir / "4_bake.log",
+    }
+
+
+def preflight(blender: Path | None, skip_paint: bool, platform: str | None = None,
+              find=find_blender) -> tuple[Path | None, str | None]:
+    """(Blender to use, why the run cannot start). Checked before any work: a missing
+    Blender or an off-Mac repaint used to fail minutes in, or with a bare exit code."""
+    blender = blender or find()
+    if blender is None or not blender.is_file():
+        return blender, missing_help()
+    if not skip_paint and (platform or host_platform()) != APPLE:
+        return blender, REPAINT_OFF_MAC
+    return blender, None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line surface, separately from running it.
+
+    Extracted so a test can assert the flags and their defaults without a Blender run:
+    every one of these reaches a stage that costs minutes, and a default that silently
+    drifts produces a differently-tuned asset rather than an error.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("source", type=Path, help="generated GLB to finish")
+    parser.add_argument("image", type=Path, help="source concept art, for the repaint")
+    parser.add_argument("output", type=Path, help="finished GLB to write")
+    parser.add_argument("--source-record", type=Path, help="source licence record")
+    parser.add_argument("--faces", type=int, default=None,
+                        help="retopology target (default: 20,000, or 50,000 with --detail high)")
+    parser.add_argument(
+        "--detail", choices=("standard", "high"), default="standard",
+        help="high: more faces, and the surface calmed where the pictures paint, for cleaner "
+             "faces from the side (needs --views). Recommended for realistic humans",
+    )
+    parser.add_argument("--atlas", type=int, default=2048)
+    parser.add_argument("--angle", type=float, default=89.0)
+    parser.add_argument(
+        "--voxel", type=float, default=0.004,
+        help="voxel size as a fraction of the asset; 0 skips the remesh, which shatters "
+             "thin geometry on everything tested so far",
+    )
+    parser.add_argument("--metallic", type=float, default=0.25)
+    parser.add_argument("--roughness", type=float, default=0.65)
+    parser.add_argument("--ior", type=float, default=1.45)
+    parser.add_argument("--paint-seed", type=int, default=0)
+    parser.add_argument("--paint-res", type=int, default=512)
+    parser.add_argument("--paint-steps", type=int, default=15)
+    parser.add_argument("--paint-tex", type=int, default=4096)
+    parser.add_argument("--texture-size", type=int, default=2048,
+                        help="cap for colour textures in the compress stage")
+    parser.add_argument("--skip-paint", action="store_true",
+                        help="stop after retopology, keeping the transferred texture")
+    parser.add_argument("--skip-bake", action="store_true",
+                        help="skip the normal-map and metallic-roughness bake from the "
+                             "original; the asset keeps flat surface settings")
+    parser.add_argument("--skip-compress", action="store_true")
+    parser.add_argument(
+        "--keep-mesh", action="store_true",
+        help="full detail: keep every triangle of the source (no retopology, repaint or "
+             "bake); Pixel Match paints it directly. For renders and stills, not games",
+    )
+    parser.add_argument(
+        "--views", type=Path, default=None,
+        help="transforms.json directory holding the source photo(s) and their cameras "
+             "(a Pixal3D run's .svviews). Given, every surface a photo can see takes the "
+             "photo's real pixels after the repaint, which keeps text and logos exact",
+    )
+    parser.add_argument(
+        "--no-edge-fade", action="store_true",
+        help="Pixel Match paints right up to inner edges (an ear in front of a head) instead of "
+             "fading out beside them. Try it when hair gets coloured specks or small eyes go dark",
+    )
+    parser.add_argument(
+        "--no-nudge", action="store_true",
+        help="Pixel Match paints from the pictures as they are instead of first nudging them onto "
+             "the model. Try it when a feature lands twice (a ghost eye) or slides off its place",
+    )
+    parser.add_argument(
+        "--native-dump", type=Path, default=None,
+        help="Pixal3D's own clean-up input (<run>.post.bin, saved by pixal3d_generate.py): "
+             "rerun Pixal3D's clean-up at --faces instead of retopologising. Cleaner on "
+             "every model tested. Falls back to the classic route when post-replay is missing",
+    )
+    parser.add_argument(
+        "--steps-dir", type=Path, default=None,
+        help="put the in-between files in this folder, numbered by stage "
+             "(1_retopo.glb, 2_painted.glb, ...), instead of beside the output",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="reuse any stage artifact already sitting beside the output instead of "
+             "recomputing it. The repaint is five to six minutes of a six-minute run, so "
+             "a run that died in compression must not pay for it twice. Only safe with "
+             "the settings the intermediates were made with -- change one and start over",
+    )
+    parser.add_argument("--blender", type=Path, default=None,
+                        help="Blender executable; found automatically when omitted")
+    return parser
+
+
+def face_target(args: argparse.Namespace) -> int:
+    """The retopology target: an explicit --faces, else the detail level's."""
+    if args.faces is not None:
+        return args.faces
+    from image_to_3dlab import surface_calm
+
+    return surface_calm.HIGH_FACES if args.detail == "high" else 20000
+
+
+def required_inputs(args: argparse.Namespace) -> list[Path]:
+    """The files this run must find. The picture feeds only the repaint and the photo
+    stage, so a run with neither (a model that came with no picture) needs just the mesh."""
+    dump = [args.native_dump] if getattr(args, "native_dump", None) is not None else []
+    if args.skip_paint and args.views is None:
+        return [args.source, *dump]
+    return [args.source, args.image, *dump]
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    from image_to_3dlab.provenance import read_model_record, write_derived_sidecar
+
+    source_record = None
+    if args.source_record is not None:
+        source_record = json.loads(args.source_record.read_text(encoding="utf-8"))
+        if not isinstance(source_record, dict) or not source_record.get("license"):
+            raise ValueError("The source licence record must name its licence.")
+
+    for path in required_inputs(args):
+        if not path.is_file():
+            raise SystemExit(f"not found: {path}")
+    args.blender, problem = preflight(args.blender, args.skip_paint)
+    if problem:
+        raise SystemExit(problem)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    stem = args.output.with_suffix("")
+    steps = step_paths(args.output, args.steps_dir)
+    if args.steps_dir is not None:
+        args.steps_dir.mkdir(parents=True, exist_ok=True)
+    if args.views is not None and not (args.views / "transforms.json").is_file():
+        raise SystemExit(f"--views has no transforms.json: {args.views}")
+    if args.keep_mesh:
+        args.skip_paint = args.skip_bake = True   # nothing simplified, so nothing to repaint or bake onto
+    args.faces = face_target(args)
+    calm = args.detail == "high"
+    stages = stage_plan(args.skip_paint, args.skip_compress, args.skip_bake,
+                        photo=args.views is not None, keep_mesh=args.keep_mesh, calm=calm)
+    print(f"[retopo-repaint] {args.source.name} -> {args.output.name}: "
+          f"{' -> '.join(stages)}", flush=True)
+
+    started = time.time()
+    timings: dict[str, float] = {}
+
+    native = finish_route(args.native_dump, args.keep_mesh, pixal3d_native.replay_available())
+    native_record = None
+    retopo_glb = steps["retopo"]
+    step = time.time()
+    if args.keep_mesh:
+        retopo_glb = args.source   # full detail: Pixel Match works on the generator's own mesh
+    elif reuse(retopo_glb, args.resume):
+        emit_stage("retopologise", f"Reusing {retopo_glb.name}")
+    else:
+        def classic() -> None:
+            emit_stage("retopologise", f"Retopologising to {args.faces:,} faces")
+            _run(
+                retopo_command(
+                    args.source, retopo_glb, args.faces, args.atlas, args.angle,
+                    args.voxel, args.metallic, args.roughness, args.ior, args.blender,
+                ),
+                steps["retopo_log"], "retopologise",
+            )
+
+        if native:
+            emit_stage("retopologise", f"Pixal3D's own clean-up to {args.faces:,} faces")
+            native_record = native_or_classic(classic, args.native_dump, args.source, retopo_glb,
+                                              args.faces, args.atlas, steps["retopo_log"])
+            native = native_record is not None
+        else:
+            if args.native_dump is not None and not args.keep_mesh:
+                print("[retopo-repaint] note: post-replay is not built here, so Pixal3D's own "
+                      "clean-up cannot run; using the classic route", flush=True)
+            classic()
+    if not args.keep_mesh:
+        timings["retopologise"] = round(time.time() - step, 1)
+
+    current = retopo_glb
+    calm_record = None
+    if "calm" in stages:
+        from image_to_3dlab import surface_calm
+
+        calm_glb = steps["calm"]
+        step = time.time()
+        if reuse(calm_glb, args.resume):
+            emit_stage("calm", f"Reusing {calm_glb.name}")
+        else:
+            emit_stage("calm", "High detail: smoothing small bumps where the picture paints")
+            calm_record = surface_calm.calm_glb(
+                current, calm_glb, surface_calm.front_weights(current, args.views))
+            print(f"[calm] {calm_record['vertices']:,} vertices calmed, "
+                  f"{calm_record['rounds']} rounds", flush=True)
+        timings["calm"] = round(time.time() - step, 1)
+        current = calm_glb
+
+    orient_record = None
+    if "orient" in stages:
+        from image_to_3dlab import winding
+
+        orient_glb = steps["orient"]
+        step = time.time()
+        if reuse(orient_glb, args.resume):
+            emit_stage("orient", f"Reusing {orient_glb.name}")
+        else:
+            emit_stage("orient", "Turning round triangles the pictures see from behind")
+            orient_record = winding.face_the_cameras(current, orient_glb, args.views)
+            print(f"[orient] {orient_record['flipped']:,} triangles turned round", flush=True)
+        timings["orient"] = round(time.time() - step, 1)
+        current = orient_glb
+
+    component_records = []
+    if not args.skip_paint:
+        painted = steps["painted"]
+        step = time.time()
+        if reuse(painted, args.resume):
+            emit_stage("repaint", f"Reusing {painted.name}")
+        else:
+            # Imported here, not at the top: it pulls in MLX and the paint venv, which a
+            # resume that already has the painted GLB has no reason to wait for.
+            sys.path.insert(0, str(SCRIPTS))
+            from hunyuan_mlx_xiong_generate import run_paint
+
+            emit_stage("repaint", f"Repainting from {args.image.name} at {args.paint_res}px")
+            run_paint(
+                current, args.image, painted, args.paint_seed, args.paint_res,
+                args.paint_steps, args.paint_tex, started,
+            )
+        timings["repaint"] = round(time.time() - step, 1)
+        current = painted
+        component_records.append(read_model_record(painted) or {
+            "license": {"name": "Unverified — paint stage record unavailable", "verified": False,
+                        "conditions": ["Verify the paint model's licence before use."]},
+            "output": {"classification": "unverified"},
+        })
+
+    photo_record = None
+    if args.views is not None:
+        photo_glb = steps["photo"]
+        step = time.time()
+        if reuse(photo_glb, args.resume):
+            emit_stage("photo", f"Reusing {photo_glb.name}")
+        else:
+            emit_stage("photo", "Pixel Match: keeping the photo's real pixels where it can see")
+            photo_record = photo_stage(current, args.views, photo_glb,
+                                       steps["photo_weights"], edge_fade=not args.no_edge_fade,
+                                       nudge=not args.no_nudge)
+        timings["photo"] = round(time.time() - step, 1)
+        current = photo_glb
+
+    fade = None
+    if not args.skip_bake:
+        baked = steps["baked"]
+        step = time.time()
+        if reuse(baked, args.resume):
+            emit_stage("bake", f"Reusing {baked.name}")
+            fade = steps["photo_fade"] if steps["photo_fade"].is_file() else None
+        else:
+            emit_stage("bake", "Baking normal map and surface from the original")
+            # Flat normals where the picture painted: it carries its own shading there.
+            if args.views is not None and steps["photo_weights"].is_file():
+                fade = normal_fade_mask(steps["photo_weights"], args.atlas, steps["photo_fade"])
+            _run(bake_command(args.source, current, baked, args.atlas, args.blender, fade),
+                 steps["bake_log"], "bake")
+        timings["bake"] = round(time.time() - step, 1)
+        current = baked
+
+    if not args.skip_compress:
+        sys.path.insert(0, str(SCRIPTS))
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "compress_glb_textures", SCRIPTS / "compress_glb_textures.py"
+        )
+        compress_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(compress_module)
+
+        step = time.time()
+        emit_stage("compress", f"Compressing textures to {args.texture_size}px")
+        data = current.read_bytes()
+        out_bytes, report = compress_module.compress(data, max_size=args.texture_size)
+        args.output.write_bytes(out_bytes)
+        timings["compress"] = round(time.time() - step, 1)
+        print(f"[compress] {len(data) / 1048576:.1f} -> "
+              f"{len(out_bytes) / 1048576:.1f} MB", flush=True)
+    else:
+        args.output.write_bytes(current.read_bytes())
+        report = []
+
+    set_glb_generator(args.output)   # the finished file, after every export that touched it
+    record = {
+        "resumed": args.resume,
+        "source": str(args.source),
+        "image": str(args.image),
+        "output": str(args.output),
+        "stages": stages,
+        "seconds": timings,
+        "total_seconds": round(time.time() - started, 1),
+        "retopology": None if args.keep_mesh else (
+            {**native_record, "atlas": args.atlas} if native_record else
+            {"route": "pixal3d" if native else "classic", "faces": args.faces,
+             "atlas": args.atlas, "voxel": args.voxel, "angle": args.angle}),
+        "full_detail": args.keep_mesh,
+        "detail": args.detail,
+        "calm": None if "calm" not in stages else (calm_record or {"reused": True}),
+        "orient": None if "orient" not in stages else (orient_record or {"reused": True}),
+        "surface": {"metallic": args.metallic, "roughness": args.roughness, "ior": args.ior},
+        "bake": None if args.skip_bake else {"size": args.atlas,
+                                             "flat_where_photo": fade is not None},
+        "paint": None if args.skip_paint else {
+            "seed": args.paint_seed, "res": args.paint_res,
+            "steps": args.paint_steps, "texture": args.paint_tex,
+        },
+        "photo": None if args.views is None else {
+            "views": str(args.views), **(photo_record or {"reused": True}),
+        },
+        "textures": report,
+        "size_bytes": args.output.stat().st_size,
+    }
+    write_derived_sidecar(args.source, args.output, operation="finish", source_record=source_record,
+                          component_records=component_records)
+    record_path = Path(f"{stem}.retopo-repaint.json")
+    record_path.write_text(json.dumps(record, indent=2))
+
+    emit_stage("done", f"Finished at {record['size_bytes'] / 1048576:.1f} MB")
+    print(f"[retopo-repaint] done in {record['total_seconds']:.0f}s -> {args.output} "
+          f"({record['size_bytes'] / 1048576:.1f} MB); record {record_path.name}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

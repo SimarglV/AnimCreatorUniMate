@@ -25,3 +25,52 @@ Thumbs.db
 .vscode/
 *.swp
 assets/dataset_overview.png
+
+# ---- merged from AssetFurnace (studio) ----
+.env
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+output/
+
+# Personal/local-network artifacts.
+/scripts/image_gallery.py
+
+# Investigation/session logs.
+/journal/
+
+# Reference photos exchanged between collaborators.
+/images_for_you/
+
+# Multi-GB backend checkouts.
+/vendor/
+
+# hunyuan_mlx weights and outputs are downloaded, not committed.
+/hunyuan_mlx/shape/weights/
+/hunyuan_mlx/paint/weights/
+/hunyuan_mlx/paint/outputs/
+/hunyuan_mlx/shape/outputs/
+
+# Generated video content.
+videos/
+
+# Reference meshes and source art used to evaluate backends.
+assets_to_test/
+
+# Per-character rigs and animations.
+characters/
+
+# Own run records; the template stays tracked.
+manifests/*.json
+!manifests/example-trellis2.json
+
+# Private agent rules.
+AGENTS.local.md
+CLAUDE.local.md
+
+# UniMate webui history
+outputs/webui/
+.venv-studio/
+models/

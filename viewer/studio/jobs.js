@@ -1,0 +1,141 @@
+// Running a step: start a job, follow it, report progress, a live log, and how it ended.
+// Every step's API answers a start with {job_id, status_url | events_url} and its status
+// endpoint with {status, last_event, log_tail}; this follows any of them the same way.
+
+export const TERMINAL = new Set(['done', 'error', 'cancelled']);
+const STALL_SECONDS = 180;
+
+/** The best ready 3D engine first, then the other ready ones (from GET /api/catalog). */
+export function readyEngines(catalog) {
+  return (catalog?.backends || [])
+    // The server's state, the same one Setup shows: a built TRELLIS is ready even before its
+    // weights arrive (they fetch on first run), so counting files here hid it from the picker.
+    .filter((b) => b.kind === '3d' && b.state === 'ready')
+    .sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99))
+    .map((b) => ({ id: b.id, label: b.label, license: b.license?.name || '', caveat: b.caveat || null }));
+}
+
+/** Where to poll a job: the start response's status_url, or the conventional path. */
+export function statusUrlFor(kind, start) {
+  if (start.status_url) return start.status_url;
+  return `/api/${kind}/${start.job_id}/status`;
+}
+
+/** A progress number from an event, if the step reports one (0-100), else null. */
+export function percentOf(event) {
+  for (const key of ['overall_pct', 'pct', 'percent', 'progress']) {
+    const value = Number(event?.[key]);
+    if (Number.isFinite(value)) return Math.max(0, Math.min(100, value <= 1 && key === 'progress' ? value * 100 : value));
+  }
+  return null;
+}
+
+/** Turn a raw failure into words a person can act on. */
+/** Copy a failure to paste elsewhere, scrubbed by the server exactly as a bug report is, so no
+ *  path carries the person's user name. Nothing is copied if the server can't scrub it. */
+export async function copyDetails(why, log = '', { send = globalThis.fetch, clipboard = globalThis.navigator?.clipboard } = {}) {
+  const details = String(log || '').slice(-30000);   // the server takes 64 kB; the end explains the failure
+  const response = await send('/api/bug-report', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: String(why || '').trim() || 'A step failed', details }) });
+  if (!response.ok) return false;
+  const { text } = await response.json();
+  await clipboard?.writeText(text);
+  return true;
+}
+
+export function plainError(message = '') {
+  const text = String(message);
+  // already written for a person (how to install Blender): shown as it is
+  if (/Install Blender|blender\.org/.test(text)) return text;
+  const rules = [
+    [/memory|MemoryError|out of memory|Killed/i, 'This Mac ran out of memory. Close other big apps and try again, or pick a lower detail or texture size.'],
+    [/not installed|is not installed\/ready|needs_setup/i, 'This engine is not installed yet. Install it from Setup, then try again.'],
+    [/is running; wait|wait for it to finish/i, 'Another job is running. This one can start when it finishes.'],
+    [/humanoid|map.*SOMA|could not map/i, "This doesn't look like a humanoid, so the preset moves can't fit it. You can still download the rig and animate it in Blender."],
+    [/Blender/i, 'Blender stopped with an error. The full log is below; "Copy details" makes it easy to report.'],
+  ];
+  for (const [pattern, words] of rules) if (pattern.test(text)) return words;
+  return text || 'The step stopped without saying why. The log below has the details.';
+}
+
+/**
+ * Follow a started job until it ends. Calls onUpdate({status, event, percent, log, stalled})
+ * every poll, then resolves with the final status payload. Polling (not an event stream)
+ * because a dropped stream that never reconnects makes a finished job look hung.
+ */
+export function followJob(statusUrl, { onUpdate, interval = 1200, fetchImpl = fetch, now = () => Date.now() } = {}) {
+  let stopped = false;
+  let lastChange = now(), lastKey = '';
+  const done = new Promise((resolve, reject) => {
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const response = await fetchImpl(statusUrl);
+        const payload = await response.json();
+        const event = payload.last_event || {};
+        const key = JSON.stringify(event) + (payload.log_tail || '').length;
+        if (key !== lastKey) { lastKey = key; lastChange = now(); }
+        const stalled = (now() - lastChange) / 1000 > STALL_SECONDS;
+        onUpdate?.({ status: payload.status, event, percent: percentOf(event), log: payload.log_tail || '', stalled });
+        if (TERMINAL.has(payload.status)) { resolve(payload); return; }
+      } catch (error) {
+        // a missed poll is not a failure; the next one catches up
+      }
+      setTimeout(tick, interval);
+    };
+    tick().catch(reject);
+  });
+  return { done, stop() { stopped = true; } };
+}
+
+// engine chatter that means nothing to a person: kernel compiles, verbose/debug lines, blanks
+// engine chatter, and the picture model's tokenizer dumps (<|im_start|>, token lists with Ġ/Ċ markers)
+const NOISE = /\[(VERBOSE|DEBUG)\]|ggml_|kernel_|compile_pipeline|th_max|^\s*[|\-=]*\s*$|^\s*0x[0-9a-f]+|<\|im_(start|end)\|>|\btokens \[|[\u0120\u010a]/i;
+
+/** Where a live log sits after its text is replaced.
+
+A reader at the bottom stays there, so a new line does not hide under the edge.
+A reader who scrolled up keeps that place. The first paint has no box, so it
+starts at the bottom. */
+export function logScroll(box, nextHeight) {
+  if (!box) return nextHeight;
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 2;
+  return atBottom ? nextHeight : box.scrollTop;
+}
+
+
+const CARD_MIN = { w: 280, h: 220 };
+
+/** Keep a progress card inside the viewer after a drag or a resize. */
+export function clampCard(box, bounds) {
+  const w = Math.min(Math.max(box.w, CARD_MIN.w), bounds.w);
+  const h = Math.min(Math.max(box.h, CARD_MIN.h), bounds.h);
+  return {
+    x: Math.min(Math.max(0, box.x), Math.max(0, bounds.w - w)),
+    y: Math.min(Math.max(0, box.y), Math.max(0, bounds.h - h)),
+    w, h,
+  };
+}
+
+export function moveBox(box, dx, dy, bounds) {
+  return clampCard({ ...box, x: box.x + dx, y: box.y + dy }, bounds);
+}
+
+export function resizeBox(box, dw, dh, bounds) {
+  return clampCard({ ...box, w: box.w + dw, h: box.h + dh }, bounds);
+}
+
+
+/** The last `count` lines of a log worth showing to a person. */
+export function readableLog(text, count = 4) {
+  return String(text || '').split('\n').map((line) => line.trimEnd()).filter((line) => line && !NOISE.test(line)).slice(-count).join('\n');
+}
+
+/**
+ * How a finished step reads: a cancel is calm and has no log (nothing to debug); a failure
+ * says why in plain words and keeps its log.
+ */
+export function jobEnd(final) {
+  if (final.status === 'cancelled') return { cancelled: true, why: 'Cancelled. Everything finished before this step is kept.', log: '' };
+  return { cancelled: false, why: plainError(final.last_event?.message || final.log_tail || ''), log: final.log_tail || '' };
+}

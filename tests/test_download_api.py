@@ -1,0 +1,760 @@
+"""Tests for the weight-download runner.
+
+The parts worth testing are the ones a user reads when something goes wrong: the progress
+line, the stall verdict, and the sentence shown instead of "exited with code 1". The
+subprocess itself is not exercised here; it downloads gigabytes.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# Plain import for the same reason `test_backend_catalog.py` uses one: `generate_api`
+# imports `download_api`, so a hand-loaded second copy leaves the two holding different
+# objects and a patch here never reaches the code being tested.
+import download_api as dl
+import pytest
+
+
+def test_progress_bars_are_stripped_to_their_last_frame():
+    # tqdm redraws with \r, so everything before the last frame is a stale repaint that
+    # would otherwise pile up in the browser log.
+    assert dl.strip_ansi("10%|##        |\r50%|#####     |\r90%|######### |") == "90%|######### |"
+    assert dl.strip_ansi("\x1b[32mdone\x1b[0m") == "done"
+    assert dl.strip_ansi("  plain line  ") == "plain line"
+
+
+def test_rate_needs_two_samples_before_it_claims_anything():
+    assert dl.rate_and_eta([], 100) == (None, None)
+    assert dl.rate_and_eta([(0.0, 0)], 100) == (None, None)
+
+
+def test_rate_and_eta_are_measured_over_the_window():
+    rate, eta = dl.rate_and_eta([(0.0, 0), (10.0, 1000)], remaining=2000)
+    assert rate == 100.0
+    assert eta == 20.0
+
+
+def test_a_window_with_no_growth_reports_no_eta():
+    rate, eta = dl.rate_and_eta([(0.0, 500), (10.0, 500)], remaining=2000)
+    assert rate == 0.0
+    assert eta is None
+
+
+def _backend():
+    return dl.BY_ID["pixal3d"]
+
+
+def test_progress_never_claims_completion_before_the_process_exits():
+    # The expected size is an estimate, so a download that overshoots it must not show
+    # 100% while the process is still running; only a clean exit says done.
+    event = dl.describe_progress(_backend(), present=10 ** 13, rate=1.0, eta=1.0, stalled=False)
+    assert event["overall_pct"] == 99
+
+
+def test_a_stall_is_named_rather_than_shown_as_slow_progress():
+    event = dl.describe_progress(_backend(), present=1000, rate=0.0, eta=None, stalled=True)
+    assert "stalled" in event["detail"]
+    assert event["stalled"] is True
+
+
+def test_progress_states_both_numbers_not_just_a_percentage():
+    # The percentage inherits the catalogue's approximate sizes; the raw bytes do not.
+    event = dl.describe_progress(_backend(), present=2 * 1024 ** 3, rate=None, eta=None,
+                                 stalled=False)
+    assert "2.0 GB of" in event["detail"]
+
+
+def test_before_any_weights_arrive_the_step_is_shown_not_zero_bytes():
+    # Pixal3D fetches a 674 MB build before its weights; "0 B of 8.4 GB" read as stuck.
+    event = dl.describe_progress(_backend(), present=0, rate=None, eta=None, stalled=False,
+                                 step="Downloading trellis-cuda12-linux-x64.tar.gz (674 MB)...")
+    assert event["detail"] == "Downloading trellis-cuda12-linux-x64.tar.gz (674 MB)..."
+    assert "0 B" not in event["detail"]
+
+
+def test_once_weights_arrive_bytes_win_over_the_step():
+    event = dl.describe_progress(_backend(), present=2 * 1024 ** 3, rate=None, eta=None,
+                                 stalled=False, step="Fetching weights")
+    assert "2.0 GB of" in event["detail"]
+
+
+def test_no_stall_is_claimed_before_the_first_weight_byte():
+    # A slow connection spends more than the stall window on the build download alone.
+    assert dl.is_stalled(present=0, idle_seconds=10 * dl.STALL_SECONDS) is False
+    assert dl.is_stalled(present=1, idle_seconds=dl.STALL_SECONDS + 1) is True
+    assert dl.is_stalled(present=1, idle_seconds=dl.STALL_SECONDS - 1) is False
+
+
+def test_a_gated_repo_is_explained_as_a_login_problem():
+    message = dl._explain(1, ["Traceback", "401 Client Error: Unauthorized for url"])
+    assert "login" in message and "retry" in message
+
+
+def test_a_repo_named_tokens_is_not_mistaken_for_a_login_problem():
+    """A Windows user's symlink error was blamed on Hugging Face sign-in, because the old
+    check matched "token" inside SkinTokens' own path."""
+    log = ["Fetching experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt",
+           ("OSError: [WinError 1314] A required privilege is not held by the client: "
+            "'C:\\hub\\models--VAST-AI--SkinTokens\\grpo_1400.ckpt'")]
+    assert "Hugging Face" not in dl._explain(1, log)
+
+
+def test_a_full_disk_is_explained_as_a_full_disk():
+    assert "disk space" in dl._explain(1, ["OSError: [Errno 28] No space left on device"])
+
+
+def test_a_network_failure_is_explained_as_one():
+    assert "network" in dl._explain(1, ["ConnectionError: Max retries exceeded"])
+
+
+def test_an_unrecognised_failure_still_quotes_the_last_line():
+    message = dl._explain(2, ["something specific went wrong"])
+    assert "code 2" in message and "something specific went wrong" in message
+
+
+def test_every_catalogued_backend_either_has_a_command_or_says_it_has_none():
+    # A Download button that 500s is worse than one that explains itself.
+    for backend_id in dl.BY_ID:
+        if backend_id in dl.COMMANDS:
+            continue
+        try:
+            dl.start(backend_id)
+        except RuntimeError as exc:
+            assert "no automated setup" in str(exc)
+        else:
+            raise AssertionError(f"{backend_id} started without a command")
+
+
+def test_an_unknown_backend_is_rejected():
+    import pytest
+    with pytest.raises(KeyError):
+        dl.start("not-a-backend")
+
+
+def test_hunyuan_setup_builds_both_venvs_not_only_the_weights():
+    """Weights alone left the paint venv unbuilt: "done", yet "not installed" (issue #97)."""
+    command = dl.COMMANDS["hunyuan_xiong"]
+    assert Path(command[1]).name == "bootstrap_hunyuan_xiong.py" and "--yes" in command
+
+
+def test_removal_refuses_paths_outside_the_repo_and_cache(tmp_path, monkeypatch):
+    """The guard that stops a bad catalogue entry deleting something else.
+
+    Nothing in the shipped catalogue points outside, which is exactly why this needs a
+    test: the day one does, it must fail loudly rather than run `rmtree` on it.
+    """
+    import dataclasses
+
+    import pytest
+    stray = tmp_path / "somewhere-else"
+    stray.mkdir()
+    (stray / "w.bin").write_bytes(b"x")
+    real = dl.BY_ID["pixal3d"]
+    # WeightSet is frozen, so build a stand-in rather than mutating the shipped one.
+    rogue = dataclasses.replace(
+        real, weights=(dataclasses.replace(real.weights[0], path=stray),),
+    )
+    monkeypatch.setitem(dl.BY_ID, "rogue", rogue)
+
+    with pytest.raises(RuntimeError, match="refusing to delete"):
+        dl.remove("rogue")
+    assert stray.is_dir(), "the guard let a delete through"
+
+
+def test_paths_inside_the_repo_or_cache_are_allowed():
+    assert dl._inside_known_roots(dl.REPO / "vendor" / "x") is True
+    assert dl._inside_known_roots(dl.HF_HUB_DIR / "models--a--b") is True
+    assert dl._inside_known_roots(Path("/etc")) is False
+
+
+def test_removing_an_unknown_backend_is_rejected():
+    import pytest
+    with pytest.raises(KeyError):
+        dl.remove("not-a-backend")
+
+
+def test_removal_is_refused_while_that_backend_is_downloading(monkeypatch):
+    import pytest
+    run = dl.DownloadRun(dl.BY_ID["pixal3d"])
+    run.status = "running"
+    monkeypatch.setitem(dl.DOWNLOADS, "pixal3d", run)
+    with pytest.raises(RuntimeError, match="downloading right now"):
+        dl.remove("pixal3d")
+
+
+# --- Starting a command that is not there -----------------------------------------------
+# A Windows user reported "[WinError 2] The system cannot find the file specified" after
+# logging into Hugging Face. `Popen` had been handed `.venv/bin/python`, which on Windows
+# is spelled `.venv\\Scripts\\python.exe`, and the raw OSError went straight to the browser.
+
+
+def test_a_missing_venv_is_explained_rather_than_reported_as_errno_2(tmp_path):
+    absent = tmp_path / "shape" / ".venv" / "bin" / "python"
+    message = dl._missing_executable(str(absent))
+    assert message is not None
+    assert "uv sync" in message
+    assert str(tmp_path / "shape") in message
+
+
+def test_a_missing_program_names_itself():
+    assert "not-a-real-program" in dl._missing_executable("not-a-real-program")
+
+
+def test_a_command_that_exists_is_not_second_guessed(tmp_path):
+    assert dl._missing_executable(sys.executable) is None
+    assert dl._missing_executable("sh") is None or os.name == "nt"
+
+
+def test_an_unsupported_machine_is_refused_before_anything_downloads(monkeypatch):
+    """The refusal belongs here too: the API is what spends the bandwidth."""
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog, "host_platform", lambda: "other")
+    with pytest.raises(RuntimeError) as raised:
+        dl.start("hunyuan_xiong")
+    assert "Apple Silicon" in str(raised.value)
+    assert "Nothing has been downloaded" in str(raised.value)
+    assert "hunyuan_xiong" not in dl.DOWNLOADS
+
+
+def test_a_mac_too_old_for_the_route_is_told_so_not_that_it_is_the_wrong_machine(monkeypatch):
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog, "host_platform", lambda: backend_catalog.APPLE)
+    monkeypatch.setattr(backend_catalog._host, "macos_major", lambda release=None: 15)
+    with pytest.raises(RuntimeError) as raised:
+        dl.start("trellis")
+    assert "macOS 26" in str(raised.value) and "macOS 15" in str(raised.value)
+    assert "which this machine is not" not in str(raised.value)
+    assert "Nothing has been downloaded" in str(raised.value)
+    assert "trellis" not in dl.DOWNLOADS
+
+
+def test_trellis_on_nvidia_runs_the_cuda_bootstrap_with_yes():
+    command = dl.command_for("trellis", host=dl.NVIDIA)
+    assert command[1].endswith("bootstrap_trellis_cuda.py")
+    assert command[-1] == "--yes"
+
+
+def test_trellis_on_a_mac_still_runs_the_metal_bootstrap(monkeypatch):
+    """Nothing built yet: the button compiles the port. It does not pretend to download."""
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog.Backend, "built_on", lambda self, host=None: False)
+    command = dl.command_for("trellis", host="apple-silicon")
+    assert command[1].endswith("bootstrap_trellis_space_macos.py")
+    assert "--weights-only" not in command
+
+
+def test_a_built_mac_trellis_downloads_weights_instead_of_rebuilding(monkeypatch):
+    """The code is already there. Setup fetches the weights, and it passes --yes because
+    the page already asked. Re-running the plain bootstrap dies on its own patches."""
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog.Backend, "built_on", lambda self, host=None: True)
+    command = dl.command_for("trellis", host="apple-silicon")
+    assert command[1].endswith("bootstrap_trellis_space_macos.py")
+    assert "--weights-only" in command
+    assert "--yes" in command
+
+
+def test_trellis_on_amd_runs_the_rocm_bootstrap():
+    """TRELLIS.2 on AMD is Microsoft's checkout built with HIP.
+
+    Without a host entry here the Setup page falls back to COMMANDS["trellis"], which is
+    the Metal port. That script refuses a machine that is not a Mac, so the button died
+    minutes in -- and before that check existed, it failed on `xcrun` after cloning four
+    repositories. Hit on a real AMD card.
+    """
+    command = dl.command_for("trellis", host=dl.AMD)
+    assert command[1].endswith("bootstrap_trellis_rocm.py")
+    assert command[-1] == "--yes"
+    assert dl.building_label("trellis", host=dl.AMD) == "building the ROCm version"
+
+
+@pytest.mark.parametrize("host", [dl.NVIDIA, dl.AMD])
+def test_no_machine_is_handed_the_metal_bootstrap(host):
+    """A general guard, not a trellis one: the Metal port builds through xcrun, so any
+    non-Mac given that script fails somewhere unhelpful."""
+    for backend_id in dl.COMMANDS:
+        command = dl.command_for(backend_id, host=host)
+        if command is None:
+            continue
+        assert "bootstrap_trellis_space_macos.py" not in command[1], (
+            f"{backend_id} on {host} runs the macOS bootstrap")
+
+
+def test_the_label_matches_the_command_being_run():
+    """A progress line that says CUDA while the ROCm build runs is worse than none."""
+    for host in ("apple-silicon", dl.NVIDIA, dl.AMD):
+        command = dl.command_for("trellis", host=host)
+        label = dl.building_label("trellis", host=host)
+        if "rocm" in command[1]:
+            assert "ROCm" in label
+        elif "cuda" in command[1]:
+            assert "CUDA" in label
+        else:
+            assert "Metal" in label
+
+
+def test_a_route_without_a_host_command_uses_the_shared_one():
+    assert dl.command_for("pixal3d", host=dl.NVIDIA) == dl.COMMANDS["pixal3d"]
+    assert dl.command_for("pixal3d", rebuild=True) == dl.REBUILDS["pixal3d"]
+    assert dl.command_for("trellis", rebuild=True) is None
+
+
+def test_the_command_follows_the_machine(monkeypatch):
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog, "host_platform", lambda: backend_catalog.NVIDIA)
+    assert dl.command_for("trellis")[1].endswith("bootstrap_trellis_cuda.py")
+    assert dl.building_label("trellis") == "building the CUDA version"
+    monkeypatch.setattr(backend_catalog, "host_platform", lambda: backend_catalog.APPLE)
+    assert dl.building_label("trellis") == "building the Metal port"
+
+
+def test_a_setup_run_on_nvidia_holds_the_cuda_command(monkeypatch):
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog, "host_platform", lambda: backend_catalog.NVIDIA)
+    run = dl.DownloadRun(backend_catalog.BY_ID["trellis"])
+    assert run.command[1].endswith("bootstrap_trellis_cuda.py")
+
+
+def test_every_route_claiming_automated_setup_actually_has_a_command():
+    """The flag and the command table are two halves of one fact; a drift shows the user
+    a button that throws "has no automated setup yet" only after they click it."""
+    import backend_catalog
+
+    for backend in backend_catalog.CATALOG:
+        has_command = backend.id in dl.COMMANDS
+        assert backend.automated_setup is has_command, backend.id
+
+
+def test_the_background_remover_is_removed_as_one_file_leaving_its_folder(tmp_path, monkeypatch):
+    """BiRefNet-lite shares rembg's folder with u2net: Remove takes the file, not the folder."""
+    import dataclasses
+
+    monkeypatch.setenv("U2NET_HOME", str(tmp_path))
+    lite = tmp_path / "birefnet-general-lite.onnx"
+    lite.write_bytes(b"12345")
+    (tmp_path / "u2net.onnx").write_bytes(b"keep me")
+    real = dl.BY_ID["matte"]
+    entry = dataclasses.replace(real, weights=(dataclasses.replace(real.weights[0], path=lite),))
+    monkeypatch.setitem(dl.BY_ID, "matte", entry)
+
+    result = dl.remove("matte")
+    assert result["freed_bytes"] == 5
+    assert not lite.exists()
+    assert (tmp_path / "u2net.onnx").read_bytes() == b"keep me"
+
+
+def test_rembgs_model_folder_is_a_known_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("U2NET_HOME", str(tmp_path))
+    assert dl._inside_known_roots(tmp_path / "birefnet-general-lite.onnx") is True
+
+
+def test_the_remover_download_asks_nothing_twice():
+    """--yes because the Setup & Status dialog already asked."""
+    assert dl.COMMANDS["matte"][-1] == "--yes"
+    assert dl.COMMANDS["matte"][1].endswith("bootstrap_matte.py")
+
+
+def _pixal3d_tree(tmp_path, patched: bool, cli_newer: bool, skins: bool = True):
+    source = tmp_path / "flow_runner.cpp"
+    cli = tmp_path / "trellis-cli"
+    source.write_text("i2l_steps" if patched else "plain")
+    cli.write_bytes(b"binary PIXAL3D_LOAD_SHAPE" if skins else b"binary")
+    older, newer = 1_000_000, 2_000_000
+    os.utime(source, (older, older) if cli_newer else (newer, newer))
+    os.utime(cli, (newer, newer) if cli_newer else (older, older))
+    return source, cli
+
+
+def test_an_unpatched_pixal3d_build_is_offered_a_rebuild(tmp_path):
+    source, cli = _pixal3d_tree(tmp_path, patched=False, cli_newer=True)
+    assert "not patched" in dl.rebuild_reason("pixal3d", source, cli)
+
+
+def test_a_patch_not_yet_compiled_in_is_offered_a_rebuild(tmp_path):
+    source, cli = _pixal3d_tree(tmp_path, patched=True, cli_newer=False)
+    assert "older" in dl.rebuild_reason("pixal3d", source, cli)
+
+
+def test_a_patched_current_build_is_left_alone(tmp_path):
+    source, cli = _pixal3d_tree(tmp_path, patched=True, cli_newer=True)
+    assert dl.rebuild_reason("pixal3d", source, cli) is None
+
+
+def test_a_build_from_before_skins_is_offered_a_rebuild(tmp_path):
+    """Otherwise its models silently keep no shape, and no model of theirs takes a skin."""
+    source, cli = _pixal3d_tree(tmp_path, patched=True, cli_newer=True, skins=False)
+    assert "skins" in dl.rebuild_reason("pixal3d", source, cli)
+
+
+def test_nothing_installed_or_a_prebuilt_is_never_offered_a_rebuild(tmp_path):
+    """No binary is Set up's job; no source means a prebuilt, which cannot be patched."""
+    source, cli = _pixal3d_tree(tmp_path, patched=False, cli_newer=True)
+    assert dl.rebuild_reason("pixal3d", source, tmp_path / "missing") is None
+    (tmp_path / "post-replay").write_text("binary")   # our own prebuilt: nothing to patch
+    assert dl.rebuild_reason("pixal3d", tmp_path / "missing", cli) is None
+
+
+def test_upstreams_old_nvidia_download_is_offered_ours(tmp_path):
+    """No source and no post-replay: upstream's prebuilt, from before our own NVIDIA build.
+    Rebuild swaps it for ours, which downloads, so the page must say how much."""
+    cli = tmp_path / "trellis-cli"
+    cli.write_text("binary")
+    missing = tmp_path / "missing.cpp"
+    assert "new Finish" in dl.rebuild_reason("pixal3d", missing, cli)
+    assert dl.rebuild_download("pixal3d", missing, cli) == dl.NEW_BUILD_SIZE
+    (tmp_path / "post-replay").write_text("binary")
+    assert dl.rebuild_reason("pixal3d", missing, cli) is None
+    assert dl.rebuild_download("pixal3d", missing, cli) is None
+
+
+def test_a_source_rebuild_downloads_nothing(tmp_path):
+    source, cli = _pixal3d_tree(tmp_path, patched=False, cli_newer=True)
+    assert dl.rebuild_download("pixal3d", source, cli) is None
+
+
+def test_the_catalog_says_when_a_rebuild_downloads():
+    import generate_api
+
+    catalog = {"backends": [{"id": "pixal3d", "supported_here": True}]}
+    out = generate_api.with_rebuild_reasons(catalog, reason=lambda b: "old", download=lambda b: "600 MB")
+    assert out["backends"][0]["rebuild_downloads"] == "600 MB"
+
+
+def test_backends_without_a_rebuild_command_are_never_offered_one(tmp_path):
+    source, cli = _pixal3d_tree(tmp_path, patched=False, cli_newer=True)
+    assert dl.rebuild_reason("hunyuan_xiong", source, cli) is None
+
+
+def test_the_rebuild_command_recompiles_without_downloading_or_asking():
+    command = dl.REBUILDS["pixal3d"]
+    assert {"--build-only", "--rebuild", "--yes"} <= set(command)
+    assert "--weights-only" not in command
+
+
+def test_a_rebuild_runs_the_rebuild_command_not_the_setup_one():
+    import backend_catalog
+
+    run = dl.DownloadRun(backend_catalog.BY_ID["pixal3d"], rebuild=True)
+    assert run.command == dl.REBUILDS["pixal3d"]
+    assert dl.DownloadRun(backend_catalog.BY_ID["pixal3d"]).command == dl.COMMANDS["pixal3d"]
+
+
+def test_a_rebuild_is_refused_for_a_backend_that_has_none(monkeypatch):
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog, "host_platform", lambda: "apple")
+    with pytest.raises(RuntimeError, match="no automated rebuild"):
+        dl.start("hunyuan_xiong", rebuild=True)
+
+
+def test_the_catalog_carries_a_rebuild_reason_only_where_the_backend_runs():
+    import generate_api
+
+    catalog = {"backends": [{"id": "pixal3d", "supported_here": True},
+                            {"id": "sf3d", "supported_here": False}]}
+    out = generate_api.with_rebuild_reasons(catalog, reason=lambda backend_id: "stale")
+    assert out["backends"][0]["rebuild_reason"] == "stale"
+    assert out["backends"][1]["rebuild_reason"] is None
+
+
+def test_the_tab_the_setup_page_draws_carries_the_rebuild_reason_too():
+    """setup.js renders `views[host]`, not `backends`; a reason only on `backends` meant the
+    Rebuild button never appeared once the page grew one tab per machine."""
+    import generate_api
+    from backend_catalog import AMD, catalog_status
+
+    out = generate_api.with_rebuild_reasons(catalog_status(AMD),
+                                            reason=lambda backend_id: "stale")
+    pixal = next(b for b in out["views"][AMD] if b["id"] == "pixal3d")
+    assert pixal["rebuild_reason"] == "stale"
+
+
+def test_a_page_loaded_mid_setup_can_find_the_run_again(monkeypatch):
+    # A setup runs 30-60 minutes; a refreshed or reopened Setup page must reattach to it
+    # instead of showing idle "Set up" buttons that refuse with "already running".
+    monkeypatch.setattr(dl, "DOWNLOADS", {})
+    assert dl.running_payload() is None
+    run = dl.DownloadRun(dl.BY_ID["pixal3d"])
+    run.status = "running"
+    dl.DOWNLOADS["pixal3d"] = run
+    assert dl.running_payload() == {
+        "backend": "pixal3d", "rebuild": False,
+        "events_url": "/api/setup/pixal3d/events",
+    }
+    run.status = "done"
+    assert dl.running_payload() is None
+
+
+def test_a_download_timeout_buried_above_a_traceback_is_still_explained():
+    # Seen on a real pod: uv's "Failed to download ... operation timed out" sat above a
+    # 20-line Python traceback, so the user got the traceback's last line instead.
+    log = ["  x Failed to download `nvidia-cudnn-cu12==9.10.2.21`",
+           "  |-> Request failed after 3 retries", "  `-> operation timed out",
+           "Traceback (most recent call last):"] + [f"  frame {i}" for i in range(20)] + [
+           "subprocess.CalledProcessError: Command '[uv, pip, install]' returned 1."]
+    message = dl._explain(1, log)
+    assert "network" in message and "Set up again" in message
+
+
+def test_finished_nvidia_trellis_setup_does_not_promise_a_later_download(monkeypatch):
+    monkeypatch.setattr(dl, "_this_host", lambda: dl.NVIDIA)
+    assert dl.done_detail(dl.BY_ID["trellis"], present=16 * 1024 ** 3).startswith("done ·")
+    monkeypatch.setattr(dl, "_this_host", lambda: "apple")
+    detail = dl.done_detail(dl.BY_ID["trellis"], present=0)
+    assert "first generation" not in detail
+    assert "before a run" in detail
+
+
+def test_hunyuan_cuda_sets_up_with_its_own_bootstrap_and_says_cuda():
+    command = dl.command_for("hunyuan-cuda", host=dl.NVIDIA)
+    assert command[1].endswith("bootstrap_hunyuan_cuda.py") and command[-1] == "--yes"
+    assert dl.building_label("hunyuan-cuda", host=dl.NVIDIA) == "building the CUDA version"
+
+
+def test_files_already_on_disk_do_not_make_a_build_look_stalled():
+    # Seen on a real pod: the shared background remover (214 MB) was already there from
+    # another route, so Hunyuan's rasterizer compile read "stalled" after 90 s. Only bytes
+    # this setup has fetched count, and until there are some the step is shown.
+    backend = dl.BY_ID["hunyuan-cuda"]
+    line = dl.describe_progress(backend, present=214 * 1024 ** 2, rate=None, eta=None,
+                                stalled=dl.is_stalled(0, 10 * dl.STALL_SECONDS),
+                                step="Building custom-rasterizer", fetched=0)
+    assert line["detail"] == "Building custom-rasterizer" and line["stalled"] is False
+
+
+def _sharing(tmp_path, monkeypatch):
+    """Two routes and the remover's own card, all declaring one remover file."""
+    import dataclasses
+
+    shared = tmp_path / "birefnet-lite.onnx"
+    shared.write_bytes(b"x" * 10)
+    own = tmp_path / "own-weights"
+    own.mkdir()
+    (own / "w.bin").write_bytes(b"y" * 20)
+    real = dl.BY_ID["pixal3d"]
+    lite = dataclasses.replace(real.weights[0], path=shared)
+    mine = dataclasses.replace(real.weights[0], path=own)
+    monkeypatch.setitem(dl.BY_ID, "route-a", dataclasses.replace(real, id="route-a", weights=(mine, lite)))
+    monkeypatch.setitem(dl.BY_ID, "route-b", dataclasses.replace(real, id="route-b", weights=(lite,)))
+    monkeypatch.setitem(dl.BY_ID, "remover", dataclasses.replace(
+        dl.BY_ID["matte"], id="remover", weights=(lite,)))
+    monkeypatch.setattr(dl, "_inside_known_roots", lambda path: True)
+    return shared, own
+
+
+def test_removing_a_route_keeps_files_another_route_uses(tmp_path, monkeypatch):
+    # Seen on a real pod: Pixal3D offered "Delete 213.6 MB of weights", and that was the
+    # background remover TRELLIS and Hunyuan cut out with.
+    shared, own = _sharing(tmp_path, monkeypatch)
+    result = dl.remove("route-a")
+    assert not own.exists() and shared.is_file()
+    assert result["freed_bytes"] == 20
+
+
+def test_the_removers_own_card_can_still_remove_it(tmp_path, monkeypatch):
+    shared, _ = _sharing(tmp_path, monkeypatch)
+    dl.remove("remover")
+    assert not shared.exists()
+
+
+# --- a weight that is one file inside a shared Hugging Face folder ----------------------------
+
+
+def _hf_folder(tmp_path):
+    """A Hugging Face cache folder holding a big model and a small extra, both as snapshot
+    links into blobs/, the way the hub lays them out."""
+    repo = tmp_path / "models--Qwen--Qwen3-VL-8B-Instruct-GGUF"
+    (repo / "blobs").mkdir(parents=True)
+    snap = repo / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    for name, size in (("Qwen3VL-8B-Instruct-Q4_K_M.gguf", 50), ("mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf", 7)):
+        blob = repo / "blobs" / f"sha-{size}"
+        blob.write_bytes(b"z" * size)
+        (snap / name).symlink_to(os.path.relpath(blob, snap))
+    return repo
+
+
+def _vision_weight(repo):
+    from backend_catalog import WeightSet
+    return WeightSet("vision", "Qwen/Qwen3-VL-8B-Instruct-GGUF", 7, repo,
+                     pattern="snapshots/*/mmproj-*.gguf")
+
+
+def test_a_patterned_weight_measures_only_its_own_file(tmp_path):
+    weight = _vision_weight(_hf_folder(tmp_path))
+    present, total, alt = weight.state()
+    assert (present, total, alt) == (True, 7, None)
+    assert weight.describe()["bytes_present"] == 7
+
+
+def test_a_patterned_weight_is_missing_when_its_file_is(tmp_path):
+    repo = _hf_folder(tmp_path)
+    for link in repo.glob("snapshots/*/mmproj-*"):
+        link.unlink()
+    assert _vision_weight(repo).state()[:2] == (False, 0)
+
+
+def test_removing_a_patterned_weight_deletes_its_file_and_keeps_the_folder(tmp_path, monkeypatch):
+    import dataclasses
+    repo = _hf_folder(tmp_path)
+    monkeypatch.setitem(dl.BY_ID, "front-back-test", dataclasses.replace(
+        dl.BY_ID["matte"], id="front-back-test", weights=(_vision_weight(repo),)))
+    monkeypatch.setattr(dl, "_inside_known_roots", lambda path: True)
+    result = dl.remove("front-back-test")
+    assert result["freed_bytes"] == 7
+    assert not list(repo.glob("snapshots/*/mmproj-*")) and not (repo / "blobs" / "sha-7").exists()
+    assert (repo / "blobs" / "sha-50").is_file() and repo.is_dir()   # Qwen's own model stays
+
+
+def test_a_patterned_weight_does_not_make_its_whole_folder_shared(tmp_path):
+    import dataclasses
+
+    from backend_catalog import WeightSet, is_shared
+    repo = _hf_folder(tmp_path)
+    whole = WeightSet("llm", "Qwen/Qwen3-VL-8B-Instruct-GGUF", 50, repo)
+    qwen = dataclasses.replace(dl.BY_ID["qwen-image"], id="q-test", weights=(whole,))
+    extra = dataclasses.replace(dl.BY_ID["matte"], id="x-test", kind="3d", weights=(_vision_weight(repo),))
+    import backend_catalog
+    backend_catalog.BY_ID.update({"q-test": qwen, "x-test": extra})
+    try:
+        assert not is_shared(qwen, whole)
+    finally:
+        backend_catalog.BY_ID.pop("q-test"), backend_catalog.BY_ID.pop("x-test")
+
+
+def test_trellis_on_a_linux_card_shows_bytes_not_a_clock(monkeypatch):
+    """TRELLIS.2's setup on NVIDIA and AMD fetches 16 GB after the build. The size watcher
+    was chosen from the Mac's answer (the code build fetches nothing), so that compile
+    showed only "minutes elapsed"."""
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog.Backend, "built_on", lambda self, host=None: False)
+    run = dl.DownloadRun(dl.BY_ID["trellis"])
+    assert dl.measures_bytes(run, dl.AMD)
+    assert dl.measures_bytes(run, dl.NVIDIA)
+    assert not dl.measures_bytes(run, "apple-silicon")
+    assert not dl.measures_bytes(dl.DownloadRun(dl.BY_ID["pixal3d"], rebuild=True), dl.AMD)
+
+
+def test_a_mac_weight_download_is_measured_in_bytes(monkeypatch):
+    import backend_catalog
+
+    monkeypatch.setattr(backend_catalog.Backend, "built_on", lambda self, host=None: True)
+    monkeypatch.setattr(dl, "_this_host", lambda: "apple-silicon")
+    run = dl.DownloadRun(dl.BY_ID["trellis"])
+    assert "--weights-only" in run.command
+    assert dl.measures_bytes(run, "apple-silicon")
+
+
+def test_a_compile_error_is_not_mistaken_for_a_sign_in_problem():
+    """GCC and hipcc both end a syntax error with "... before '}' token". The AMD builds
+    compile for half an hour, so that line is a likely last word, not a login hint."""
+    message = dl._explain(1, ["custom_rasterizer.cpp:12: error: expected ';' before '}' token"])
+    assert "login" not in message
+    assert "before '}' token" in message
+
+
+def test_a_bad_token_is_still_a_sign_in_problem():
+    assert "login" in dl._explain(1, ["huggingface_hub.errors: Invalid user token."])
+
+
+def test_a_picture_engine_s_setup_names_the_engine_it_fetches(monkeypatch):
+    """Security review 2026-10-31: setup fetched sd-cli after a yes that listed only weights."""
+    sys.path.insert(0, str(Path(dl.REPO) / "scripts"))
+    import bootstrap_qwen_image as sdcpp
+    monkeypatch.setattr(sdcpp, "target", lambda: "windows-nvidia")
+    monkeypatch.setattr(sdcpp, "binary_present", lambda: False)
+    for backend in ("flux-image", "qwen-image"):
+        [engine] = dl.also_fetches(backend)
+        assert "~850 MB" in engine["size"] and engine["licence"] == "MIT"
+        assert sdcpp.PINNED_RELEASE in engine["from"]
+    monkeypatch.setattr(sdcpp, "binary_present", lambda: True)
+    monkeypatch.setattr(sdcpp, "binary_stale", lambda: False)
+    assert dl.also_fetches("flux-image") == []                      # installed and current: nothing
+
+
+@pytest.mark.parametrize("needs, listed", [(True, 1), (False, 0)])
+def test_front_back_setup_names_qwen_s_projector_when_it_fetches_it(monkeypatch, needs, listed):
+    import bootstrap_front_back as front_back
+    monkeypatch.setattr(front_back, "needs_vision", lambda: needs)
+    got = dl.also_fetches("front-back")
+    assert len(got) == listed
+    if got:
+        assert got[0]["licence"] == "Qwen Research License" and got[0]["size"] == "0.75 GB"
+
+
+def _external_backend(tmp_path, monkeypatch, *, saved=False):
+    import dataclasses
+
+    from image_to_3dlab import models_home
+
+    repo, root = tmp_path / "repo", tmp_path / "models"
+    own = root / "pixal3d"
+    own.mkdir(parents=True)
+    (own / "weight.bin").write_bytes(b"model")
+    monkeypatch.setattr(dl, "REPO", repo)
+    if saved:
+        monkeypatch.delenv(models_home.ENV, raising=False)
+        models_home.save(str(root), repo=repo)
+    else:
+        monkeypatch.setenv(models_home.ENV, str(root))
+    real = dl.BY_ID["pixal3d"]
+    backend = dataclasses.replace(real, id="external-test", weights=(
+        dataclasses.replace(real.weights[0], path=own, pattern=None),))
+    monkeypatch.setitem(dl.BY_ID, backend.id, backend)
+    return root, own, backend
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_remove_weights_in_active_external_models_root(tmp_path, monkeypatch, saved):
+    root, own, backend = _external_backend(tmp_path, monkeypatch, saved=saved)
+    result = dl.remove(backend.id)
+    assert result["freed_bytes"] == 5
+    assert result["removed"] == [str(own)]
+    assert not own.exists() and root.is_dir()
+
+
+@pytest.mark.parametrize("escape", ["sibling", "inactive", "symlink", "pattern"])
+def test_external_model_root_does_not_allow_escapes(tmp_path, monkeypatch, escape):
+    import dataclasses
+
+    root, own, backend = _external_backend(tmp_path, monkeypatch)
+    outside = tmp_path / ("models-other" if escape == "sibling" else "inactive")
+    outside.mkdir()
+    sentinel = outside / "weight.bin"
+    sentinel.write_bytes(b"keep")
+    pattern = None
+    if escape == "symlink":
+        path = root / "linked"
+        path.symlink_to(outside, target_is_directory=True)
+    elif escape == "pattern":
+        path, pattern = root / "patterned", "*.bin"
+        path.mkdir()
+        (path / "weight.bin").symlink_to(sentinel)
+    else:
+        path = outside
+    replacement = dataclasses.replace(backend, weights=(dataclasses.replace(backend.weights[0], path=path, pattern=pattern),))
+    monkeypatch.setitem(dl.BY_ID, backend.id, replacement)
+    with pytest.raises(RuntimeError, match="refusing to delete"):
+        dl.remove(backend.id)
+    assert sentinel.read_bytes() == b"keep"
+    assert own.is_dir()
+
+
+def test_external_models_environment_choice_wins_over_saved_folder(tmp_path, monkeypatch):
+    from image_to_3dlab import models_home
+
+    _root, own, backend = _external_backend(tmp_path, monkeypatch, saved=True)
+    monkeypatch.setenv(models_home.ENV, str(tmp_path / "new-models"))
+    with pytest.raises(RuntimeError, match="refusing to delete"):
+        dl.remove(backend.id)
+    assert own.is_dir()

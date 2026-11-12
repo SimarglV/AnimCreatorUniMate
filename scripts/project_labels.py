@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Project a 2D image onto a generated mesh as per-vertex colours.
+
+A generated mesh has no idea what its parts are -- it is one undifferentiated blob,
+because the generator works in occupancy-per-point of space and never has a concept of
+"hair" or "leaf" to lose. That missing part information is what blocks foliage wind,
+cloth, hair, and multi-material effects, all at once.
+
+This recovers it from 2D. Paint a flat-colour mask over the *source* image (leaves
+green, body red), and this transfers those labels onto the mesh: every vertex is
+projected back into the image and samples the colour painted there.
+
+The projection mirrors what TRELLIS conditions on. Its preprocessing removes the
+background, takes the subject's alpha bounding box, and crops to a SQUARE centred on
+it, so the mesh's own bounding square maps onto the image's subject square. The view
+is treated as orthographic, which is a close enough approximation to validate against
+the silhouette.
+
+Validate before painting anything: pass the original image as --image, and the mesh
+should come out looking like itself. If it looks scrambled, the projection is wrong
+and no mask will save it.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import trimesh
+from PIL import Image
+
+# Which mesh axes face the camera. The GLB is Y-up; "front" is the axis the
+# conditioning view looks down. Signs are resolved empirically -- see --flip flags.
+AXES = {
+    "z": (0, 1, 2),  # horizontal=X, vertical=Y, depth=Z
+    "x": (2, 1, 0),  # horizontal=Z, vertical=Y, depth=X
+}
+
+
+def subject_bbox(image: Image.Image, threshold: int = 204) -> tuple[int, int, int, int]:
+    """Bounding box of the subject, matching how TRELLIS finds it.
+
+    Uses alpha when present (TRELLIS skips background removal in that case, so this
+    reproduces its crop exactly). Falls back to "not near-white" for opaque images,
+    which approximates what background removal would have produced.
+    """
+    array = np.array(image)
+    if image.mode == "RGBA" and not np.all(array[:, :, 3] == 255):
+        mask = array[:, :, 3] > threshold
+    else:
+        rgb = array[:, :, :3].astype(np.int32)
+        mask = rgb.sum(axis=2) < (threshold * 3)
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if not len(rows) or not len(cols):
+        raise ValueError("could not find a subject in the image")
+    return int(cols.min()), int(rows.min()), int(cols.max()), int(rows.max())
+
+
+def crop_box(image: Image.Image) -> tuple[int, int, int, int]:
+    """The square crop TRELLIS conditions on: centred on the subject bbox."""
+    x0, y0, x1, y1 = subject_bbox(image)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    size = max(x1 - x0, y1 - y0)
+    box = (
+        int(cx - size // 2),
+        int(cy - size // 2),
+        int(cx + size // 2),
+        int(cy + size // 2),
+    )
+    return box
+
+
+def project(
+    mesh: trimesh.Trimesh,
+    image: Image.Image,
+    axis: str,
+    flip_h: bool,
+    flip_v: bool,
+    flip_depth: bool,
+    depth_buffer: int,
+    depth_tolerance: float,
+    yaw: float = 0.0,
+    source: Image.Image | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (colours, visible) for every vertex."""
+    h_axis, v_axis, d_axis = AXES[axis]
+    vertices = mesh.vertices
+    if yaw:
+        # A source image is rarely a dead-on view. The generated mesh sits in canonical
+        # orientation, so a three-quarter reference needs the projection turned to match
+        # or vertices land off the subject and go unlabelled.
+        angle = np.radians(yaw)
+        cos, sin = np.cos(angle), np.sin(angle)
+        rotated = vertices.copy()
+        rotated[:, h_axis] = vertices[:, h_axis] * cos - vertices[:, d_axis] * sin
+        rotated[:, d_axis] = vertices[:, h_axis] * sin + vertices[:, d_axis] * cos
+        vertices = rotated
+    horizontal = vertices[:, h_axis]
+    vertical = vertices[:, v_axis]
+    depth = vertices[:, d_axis] * (-1.0 if flip_depth else 1.0)
+
+    # The mesh's bounding square maps onto the image's subject square, which is how
+    # TRELLIS framed the subject in the first place.
+    lo = np.array([horizontal.min(), vertical.min()])
+    hi = np.array([horizontal.max(), vertical.max()])
+    center = (lo + hi) * 0.5
+    extent = float(max(hi - lo))
+
+    u = (horizontal - center[0]) / extent + 0.5
+    v = 0.5 - (vertical - center[1]) / extent  # image rows run downward
+    if flip_h:
+        u = 1.0 - u
+    if flip_v:
+        v = 1.0 - v
+
+    # The crop geometry must always come from the SOURCE image, never from a painted
+    # mask. A mask's own bounding box is defined by where paint happens to land, so
+    # overflow or a missed edge would shift the crop and silently offset every label.
+    box = crop_box(source if source is not None else image)
+    crop = image.crop(box)
+    reference = (source if source is not None else image).crop(box)
+    pixels = np.array(crop.convert("RGB"))
+    height, width = pixels.shape[:2]
+    px = np.clip((u * width).astype(np.int32), 0, width - 1)
+    py = np.clip((v * height).astype(np.int32), 0, height - 1)
+    colours = pixels[py, px]
+
+    # A vertex landing off the subject sampled the backdrop, not a label. Without this
+    # the background's colour becomes a bogus label -- white "paint" smeared over every
+    # silhouette edge. Treat those as unlabelled instead.
+    # Foreground likewise comes from the source: it defines where the subject is, which
+    # is what the silhouette match and the "off the subject" test both depend on.
+    cropped = np.array(reference)
+    if reference.mode == "RGBA" and not np.all(cropped[:, :, 3] == 255):
+        foreground = cropped[:, :, 3] > 204
+    else:
+        foreground = cropped[:, :, :3].astype(np.int32).sum(axis=2) < (204 * 3)
+    on_subject = foreground[py, px]
+
+    # When sampling a painted mask, an unpainted pixel means "no label here". Its RGB
+    # reads as black, and snapping black to a palette is a coin toss between labels, so
+    # gaps in the painting would silently become confident wrong answers.
+    if source is not None:
+        painted = np.array(crop.convert("RGBA"))
+        if not np.all(painted[:, :, 3] == 255):
+            on_subject &= painted[:, :, 3][py, px] > 204
+
+    # Occlusion test: a vertex on the back of the head would otherwise sample the chest.
+    if depth_buffer:
+        visible = ~occluded_binned(u, v, depth, depth_buffer, depth_tolerance)
+    else:
+        view = np.zeros(3)
+        view[d_axis] = -1.0 if flip_depth else 1.0
+        if yaw:
+            # project() rotated the vertices; rotate the camera the same way instead of
+            # un-rotating the mesh, so the ray cast runs against the original geometry.
+            angle = np.radians(yaw)
+            cos, sin = np.cos(angle), np.sin(angle)
+            turned = view.copy()
+            turned[h_axis] = view[h_axis] * cos + view[d_axis] * sin
+            turned[d_axis] = -view[h_axis] * sin + view[d_axis] * cos
+            view = turned
+        visible = ~occluded(mesh, view)
+    visible &= on_subject
+
+    return colours, visible, u, v, foreground
+
+
+def occluded_binned(
+    u: np.ndarray,
+    v: np.ndarray,
+    depth: np.ndarray,
+    depth_buffer: int,
+    depth_tolerance: float,
+) -> np.ndarray:
+    """The original screen-bin depth test. Kept for comparison; do not trust it.
+
+    Bins vertices by pixel and rejects any that sit behind the frontmost in their bin.
+    The flaw is arithmetic: a 512x512 grid is 262,144 bins, and the hero fox has 99,256
+    vertices, so the average occupied bin holds fewer than three. Almost every vertex is
+    alone in its bin and is therefore "frontmost" by default. Measured on that mesh, it
+    passed 68% of rear-facing vertices as visible, pasting front-view colours onto the
+    far side. Lowering the resolution trades leakage for coverage and never gets clean.
+    """
+    bins = np.clip((u * depth_buffer).astype(np.int64), 0, depth_buffer - 1) + (
+        np.clip((v * depth_buffer).astype(np.int64), 0, depth_buffer - 1) * depth_buffer
+    )
+    nearest = np.full(depth_buffer * depth_buffer, -np.inf)
+    np.maximum.at(nearest, bins, depth)
+    span = float(depth.max() - depth.min()) or 1.0
+    return depth < (nearest[bins] - depth_tolerance * span)
+
+
+def occluded(mesh: trimesh.Trimesh, view: np.ndarray) -> np.ndarray:
+    """Which vertices have geometry between them and the camera.
+
+    Casts one ray per vertex toward the camera and asks whether it hits the mesh. This
+    is exact where the bin test was approximate, and it costs under a second for 100K
+    vertices, so there is no performance argument for the approximation.
+
+    Backface culling by vertex normal would be cheaper still, and does not work on these
+    meshes: winding is inconsistent (see docs/open-questions.md), and 36% of the hero
+    fox's rear vertices claim to face the camera. Normals cannot be trusted here.
+
+    A ray that escapes through a tear counts as unoccluded, which is correct -- the
+    decoder really did have a line of sight to that surface through the hole.
+    """
+    vertices = np.asarray(mesh.vertices)
+    direction = np.asarray(view, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) or 1.0)
+
+    # Step off the surface before casting, or every vertex is blocked by its own faces.
+    scale = float(np.max(vertices.max(axis=0) - vertices.min(axis=0))) or 1.0
+    origins = vertices + direction * (scale * 1e-4)
+
+    return np.asarray(
+        mesh.ray.intersects_any(
+            ray_origins=origins,
+            ray_directions=np.broadcast_to(direction, vertices.shape),
+        )
+    )
+
+
+
+
+# Painted masks are anti-aliased, so edge pixels are blends of two labels. Snapping
+# each sample to the nearest palette entry keeps those from becoming phantom classes.
+DEFAULT_PALETTE = {
+    "body": (255, 0, 0),
+    "foliage": (0, 255, 0),
+    "flower": (0, 0, 255),
+}
+
+
+def snap_to_palette(colours: np.ndarray, palette: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Return (index into palette, snapped colour) for each sampled colour."""
+    entries = np.array(list(palette.values()), dtype=np.float32)
+    distances = np.linalg.norm(
+        colours.astype(np.float32)[:, None, :] - entries[None, :, :], axis=2
+    )
+    index = distances.argmin(axis=1)
+    return index, entries[index].astype(np.uint8)
+
+
+def silhouette_iou(u: np.ndarray, v: np.ndarray, foreground: np.ndarray, grid: int = 128) -> float:
+    """Overlap between where the mesh projects and where the subject actually is."""
+    px = np.clip((u * grid).astype(np.int32), 0, grid - 1)
+    py = np.clip((v * grid).astype(np.int32), 0, grid - 1)
+    mesh_mask = np.zeros((grid, grid), dtype=bool)
+    mesh_mask[py, px] = True
+
+    height, width = foreground.shape
+    ys = (np.arange(grid) * height / grid).astype(np.int32)
+    xs = (np.arange(grid) * width / grid).astype(np.int32)
+    image_mask = foreground[np.ix_(ys, xs)]
+
+    union = (mesh_mask | image_mask).sum()
+    return float((mesh_mask & image_mask).sum() / union) if union else 0.0
+
+
+def best_yaw(mesh, image, axis, flip_h, flip_v, flip_depth, depth_buffer, depth_tolerance, step, source=None):
+    """Sweep yaw and keep the angle whose silhouette best matches the image."""
+    best, best_score = 0.0, -1.0
+    for yaw in np.arange(0.0, 360.0, step):
+        _, _, u, v, foreground = project(
+            mesh, image, axis, flip_h, flip_v, flip_depth,
+            depth_buffer, depth_tolerance, float(yaw), source,
+        )
+        score = silhouette_iou(u, v, foreground)
+        if score > best_score:
+            best, best_score = float(yaw), score
+    return best, best_score
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mesh", type=Path, help="generated .glb")
+    parser.add_argument("image", type=Path, help="image to sample: the source, or a painted mask")
+    parser.add_argument("output", type=Path, help="destination .glb")
+    parser.add_argument("--axis", choices=tuple(AXES), default="z")
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=None,
+        help=(
+            "the original source image, when sampling a painted mask. The crop and "
+            "silhouette are taken from this, so mask paint that overflows or falls "
+            "short of the subject cannot shift the alignment."
+        ),
+    )
+    parser.add_argument(
+        "--yaw",
+        type=float,
+        default=0.0,
+        help="degrees to turn the projection, for a source that is not a dead-on view",
+    )
+    parser.add_argument(
+        "--auto-yaw",
+        action="store_true",
+        help="solve for the yaw that best matches the mesh silhouette to the image",
+    )
+    parser.add_argument("--yaw-step", type=float, default=5.0)
+    parser.add_argument(
+        "--fill",
+        action="store_true",
+        help="give unlabelled vertices the label of their nearest labelled neighbour",
+    )
+    parser.add_argument(
+        "--snap",
+        action="store_true",
+        help="snap sampled colours to the nearest label, for painted masks",
+    )
+    parser.add_argument("--flip-h", action="store_true")
+    parser.add_argument("--flip-v", action="store_true")
+    parser.add_argument("--flip-depth", action="store_true")
+    parser.add_argument(
+        "--hidden-colour",
+        default="20,20,20",
+        help="R,G,B given to vertices the view cannot see (unlabelled)",
+    )
+    parser.add_argument(
+        "--depth-buffer",
+        type=int,
+        default=0,
+        help=(
+            "0 (default) casts a ray per vertex to test occlusion exactly. A positive "
+            "value restores the old screen-bin approximation, which leaks front-view "
+            "colours onto the far side -- for comparison only"
+        ),
+    )
+    parser.add_argument(
+        "--depth-tolerance",
+        type=float,
+        default=0.02,
+        help="fraction of total depth a vertex may sit behind the frontmost and still count",
+    )
+    args = parser.parse_args()
+
+    mesh = trimesh.load(args.mesh.expanduser().resolve(), force="mesh")
+    image = Image.open(args.image.expanduser().resolve())
+    source = Image.open(args.source.expanduser().resolve()) if args.source else None
+    if source is not None and source.size != image.size:
+        raise SystemExit(
+            f"error: mask {image.size} and source {source.size} must be the same size"
+        )
+
+    yaw = args.yaw
+    if args.auto_yaw:
+        yaw, score = best_yaw(
+            mesh, image, args.axis, args.flip_h, args.flip_v, args.flip_depth,
+            args.depth_buffer, args.depth_tolerance, args.yaw_step, source,
+        )
+        print(f"AUTOYAW:: best yaw {yaw:.0f} deg (silhouette IoU {score:.3f})")
+
+    colours, visible, _, _, _ = project(
+        mesh,
+        image,
+        args.axis,
+        args.flip_h,
+        args.flip_v,
+        args.flip_depth,
+        args.depth_buffer,
+        args.depth_tolerance,
+        yaw,
+        source,
+    )
+
+    colours = colours.copy()
+    if args.snap:
+        index, snapped = snap_to_palette(colours, DEFAULT_PALETTE)
+        colours = snapped
+        names = list(DEFAULT_PALETTE)
+        total = int(visible.sum())
+        print("LABELS::")
+        for i, name in enumerate(names):
+            count = int(((index == i) & visible).sum())
+            share = 100.0 * count / total if total else 0.0
+            print(f"  {name:9s} {count:7d} vertices  ({share:5.1f}% of labelled)")
+        print(f"  {'unlabelled':9s} {int((~visible).sum()):7d} vertices")
+
+    if args.fill and (~visible).any() and visible.any():
+        # A single view cannot label the far side, and leaving it unlabelled is not
+        # neutral: defaulting it to "rigid" would freeze the far half of a swaying tail
+        # while the near half moves, tearing it down the middle. Filling from the
+        # nearest labelled vertex in 3D resolves it correctly -- a far-side tail vertex
+        # sits millimetres from a labelled tail vertex, so it inherits foliage.
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(mesh.vertices[visible])
+        _, nearest_labelled = tree.query(mesh.vertices[~visible])
+        colours[~visible] = colours[visible][nearest_labelled]
+        filled = int((~visible).sum())
+        visible = np.ones(len(mesh.vertices), dtype=bool)
+        print(f"FILL:: filled {filled} unlabelled vertices from nearest neighbours")
+
+    hidden = np.array([int(c) for c in args.hidden_colour.split(",")], dtype=np.uint8)
+    colours[~visible] = hidden
+
+    rgba = np.concatenate(
+        [colours.astype(np.uint8), np.full((len(colours), 1), 255, np.uint8)], axis=1
+    )
+    # Drop the original texture: the point is to see the projected colours alone.
+    painted = trimesh.Trimesh(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        vertex_colors=rgba,
+        process=False,
+    )
+    output = args.output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    painted.export(output)
+
+    print(
+        f"PROJECT:: vertices {len(mesh.vertices)} visible {int(visible.sum())} "
+        f"({100.0 * visible.mean():.1f}%) -> {output}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,1215 @@
+"""What each backend needs on disk, so nothing is ever downloaded by surprise.
+
+`AGENTS.md` makes this a rule: no script, bootstrap, viewer button or agent tool may fetch
+weights until the user has confirmed which pipeline and which route. A rule needs numbers
+to be honest about, and until now the viewer had none: `/api/backends` described stages
+and settings but never said that picking TRELLIS.2 means ~16 GB from Hugging Face.
+
+This module is that missing half. It is deliberately pure data plus pure functions over a
+filesystem, with no imports from `generate_api`, so the onboarding screen, the CLI
+bootstraps and the tests can all read the same catalogue without a circular import.
+
+**Sizes are approximate and measured, not authoritative.** They come from a real install
+on 2026-09-21 (`du -sh`) and exist to set expectations before a download, not to verify
+one. Treat a mismatch as a stale constant, never as a failure.
+
+**Licence text here is a pointer, not advice.** Each entry names the licence and links to
+the original; reading it is the user's business. The one exception is a restriction with
+real teeth, such as Hunyuan's territorial limits, which is surfaced as a caveat because
+silently downloading those weights in a restricted region is a harm we would be causing.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from image_to_3dlab import host as _host
+from image_to_3dlab import matte as _matte
+from image_to_3dlab import models_home as _models_home
+from image_to_3dlab import upscale as _upscale
+from image_to_3dlab.host import AMD, APPLE, NVIDIA
+
+# rembg's own BiRefNet-lite file, which every install before 0.5.5 has. It cuts out just as
+# well as the lean file (it only takes more memory), so an engine card counts it as
+# installed rather than calling a working engine "partly downloaded". The remover's own
+# card still looks for the lean file only, so Setup & Status keeps offering the upgrade.
+_OLDER_REMOVER = (_matte.model_file(_matte.LITE_MODEL),)
+
+_models_home.apply()   # a chosen models folder moves HF_HOME, so before reading it
+HF_HUB_DIR = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+
+#: TRELLIS.2's weights can come from a local directory instead of the Hugging Face cache,
+#: for machines that already have them -- a shared model store, an offline box. Read by
+#: scripts/trellis_route.py too; the test that both agree on this name is what keeps the
+#: card and the generator from drifting onto different variables. Read here at import, like
+#: HF_HUB_DIR above: the viewer's environment is fixed when it starts.
+TRELLIS_MODEL_PATH_ENV = "I2L_TRELLIS_MODEL_PATH"
+
+#: Where a locally-assembled TRELLIS.2 weights tree goes, per route. A machine with both
+#: cards can use either; the generator looks under its own route first, then the other (see
+#: scripts/trellis_route.py). This is a convention rather than a requirement: the cache and
+#: the environment variable both work.
+TRELLIS_LOCAL_MODEL_DIR = "TRELLIS.2-4B"
+TRELLIS_ROUTE_DIRS = ("trellis-cuda", "trellis-rocm")
+
+
+def trellis_local_models() -> Path | None:
+    """The local TRELLIS.2 weights directory the environment points at, if any."""
+    value = os.environ.get(TRELLIS_MODEL_PATH_ENV)
+    return Path(value) if value else None
+
+
+def _local_trellis() -> tuple[Path, ...]:
+    """Every place these weights may legitimately be, besides the Hugging Face cache.
+
+    Without this a machine whose weights live outside the cache is told it is missing 15 GB
+    it does not need -- on the very machine that just finished a successful generation.
+    """
+    found: list[Path] = []
+    named = trellis_local_models()
+    if named:
+        found.append(named)
+    found += [REPO / "vendor" / route / "models" / TRELLIS_LOCAL_MODEL_DIR
+              for route in TRELLIS_ROUTE_DIRS]
+    return tuple(found)
+
+GB = 1024 ** 3
+
+# Which machines a backend can run on is per-backend data rather than one "is this a
+# Mac?" test, so a route gains NVIDIA support by adding a string to its `runs_on`. The
+# detection itself lives in `image_to_3dlab.host`, shared with the bootstraps.
+PLATFORM_LABELS = {APPLE: "an Apple Silicon Mac", NVIDIA: "an NVIDIA GPU",
+                   AMD: "an AMD GPU with ROCm"}
+# Setup page tabs, in order. Every tab names the backends its machine can run.
+TAB_LABELS = {APPLE: "Mac (Apple Silicon)", NVIDIA: "NVIDIA (Linux)",
+              AMD: "AMD (ROCm, Linux)"}
+VIEW_PLATFORMS = (APPLE, NVIDIA, AMD)
+
+
+venv_python = _host.venv_python
+
+
+def _total_present(weights: list[dict[str, Any]]) -> int:
+    """Bytes on disk for a backend, counting each location once.
+
+    One local TRELLIS.2 weights tree holds the main weights, the image-large decoder and the
+    DINOv3 encoder together, so three weights report the same directory. Summed naively the
+    card reads "53.1 GB of 17.9 GB" on a machine that is in fact completely ready. The first
+    weight to claim a location accounts for it; the rest add nothing.
+    """
+    counted: set[str] = set()
+    total = 0
+    for weight in weights:
+        alt = weight.get("alt_path")
+        if alt is not None:
+            if alt in counted:
+                continue
+            counted.add(alt)
+        total += weight["bytes_present"]
+    return total
+
+
+def host_platform() -> str:
+    """What this machine is: APPLE, NVIDIA, AMD or "other". See `image_to_3dlab.host`.
+
+    Kept as a name here because the viewer and its tests reach for it on this module.
+    """
+    return _host.host_platform()
+
+
+def host_label(host: str) -> str:
+    """This machine, named the way its owner would name it."""
+    if host in PLATFORM_LABELS:
+        return PLATFORM_LABELS[host].removeprefix("an ").removeprefix("a ")
+    return f"{platform.system() or 'this machine'} ({platform.machine()})"
+
+
+def runs_on_phrase(backend: Backend) -> str:
+    return " or ".join(PLATFORM_LABELS.get(p, p) for p in backend.runs_on)
+
+
+@dataclass(frozen=True)
+class WeightSet:
+    """One downloadable unit, and where it lands."""
+
+    label: str
+    source: str
+    bytes_expected: int
+    path: Path
+    note: str | None = None
+    # One file inside a folder another download owns (Qwen's vision projector sits in the
+    # same Hugging Face folder as its 5 GB text model): a glob under `path`. Presence,
+    # progress and Remove then see only the matching files, never the whole folder.
+    pattern: str | None = None
+    # Other places the same download may legitimately live. TRELLIS.2 can be pointed at a
+    # local directory of weights instead of downloaded (scripts/trellis_route.py), and a
+    # card that only looked in the Hugging Face cache would call a working route "partly
+    # downloaded" on the machine that built it. Whichever location holds the most bytes
+    # wins, so a cache that is partly populated still counts for what it has.
+    alt_paths: tuple[Path, ...] = ()
+    # With `pattern`: the file's SHA-256. Hugging Face writes a download to
+    # blobs/<sha256>[.<random>].incomplete and links it into snapshots/ only once it is
+    # finished (huggingface_hub 2.x adds the random part), so without this a 4 GB file reads
+    # 0 bytes until the end and the download looks stalled.
+    blob: str | None = None
+
+    def files(self) -> list[Path]:
+        return sorted(self.path.glob(self.pattern)) if self.pattern and self.path.is_dir() else []
+
+    def state(self) -> tuple[bool, int]:
+        """Whether this download is on disk, and how many bytes of it, and where.
+
+        The third value is the alternative location that satisfied it, or None. One local
+        weights tree can hold several of a backend's downloads at once -- TRELLIS.2's main
+        weights, its image-large decoder and its DINOv3 encoder all live in one directory --
+        so without it each reports the whole tree and the card's total reads 53 GB of 17.9.
+        """
+        if self.pattern is not None:
+            found, size = self._pattern_state()
+            return found, size, None
+        present, total = _dir_state(self.path)
+        best = (present, total, None)
+        for alternative in self.alt_paths:
+            found, size = _dir_state(alternative)
+            # By size, not by "does it exist": a Hugging Face cache directory is created
+            # with a refs/ file before anything is downloaded, so preferring the first
+            # location that merely exists would settle on an empty one.
+            if size > total:
+                best = (found, size, str(alternative))
+        return best
+
+    def _pattern_state(self) -> tuple[bool, int]:
+        """A glob under a folder: presence, progress and Remove see only those files."""
+        total = 0
+        files = self.files()
+        for item in files:
+            try:
+                total += item.stat().st_size  # follows the snapshot link to its blob
+            except OSError:
+                continue
+        if not files and self.blob and self.path.is_dir():
+            sizes = []  # still arriving: count it, but it is not there yet
+            for part in (self.path / "blobs").glob(f"{self.blob}*.incomplete"):
+                try:
+                    sizes.append(part.stat().st_size)
+                except OSError:
+                    continue
+            if sizes:
+                return False, max(sizes)
+        return total > 0, total
+
+    def describe(self) -> dict[str, Any]:
+        present, actual, alt_path = self.state()
+        return {
+            "label": self.label,
+            "source": self.source,
+            "source_url": self.source if self.source.startswith("https://")
+            else f"https://huggingface.co/{self.source}",
+            "bytes_expected": self.bytes_expected,
+            "human_expected": human_bytes(self.bytes_expected),
+            "present": present,
+            "bytes_present": actual,
+            "human_present": human_bytes(actual),
+            "path": str(self.path),
+            "alt_path": alt_path,
+            "note": self.note,
+        }
+
+
+HOST_OVERRIDABLE = frozenset({"label", "tradeoff", "caveat", "setup_fetches_weights",
+                              "setup_minutes"})
+
+
+@dataclass(frozen=True)
+class Backend:
+    """One generation route, as the onboarding table presents it."""
+
+    id: str
+    label: str
+    best_for: str
+    tradeoff: str
+    license_name: str
+    license_url: str
+    weights: tuple[WeightSet, ...]
+    install: str
+    rank: int | None = None
+    setup_minutes: int | None = None
+    caveat: str | None = None
+    # The gated Hugging Face repo the caveat warns about, if that is what it warns about.
+    # The Setup page drops the caveat once the sign-in check says the account has access.
+    gated_repo: str | None = None
+    # Whether the code bootstrap itself fetches the weights. The Mac TRELLIS bootstrap
+    # does not: it clones, patches and builds the port. Once that build exists, Setup's
+    # download button fetches the weights on its own. The flag keeps the build
+    # confirmation from promising a download, and it keeps a compile from being judged
+    # by byte progress.
+    setup_fetches_weights: bool = True
+    # Files that prove the code side is installed: a compiled binary, a venv interpreter.
+    # Weights and build are independent, and conflating them offers "Set up" to someone
+    # who already has the build, which re-runs a bootstrap that then fails on its own
+    # already-applied patches (hit for real 2026-09-21).
+    build_probes: tuple[Path, ...] = ()
+    extra_steps: tuple[str, ...] = field(default_factory=tuple)
+    # "low_memory" / "plenty_memory": the card gets the start-here pill on machines with 16 GB
+    # or less / more than that (host.low_memory). A suggestion only; every card stays usable.
+    suggested_when: str | None = None
+    # The machines this route works on. Default rather than per-entry because every route
+    # is Apple-only today; the day one of them runs on CUDA, it says so here.
+    runs_on: tuple[str, ...] = (APPLE,)
+    # Whether the viewer can install this route by itself. Two of them it cannot: SF3D
+    # wants a shell bootstrap and dgrauet's Hunyuan shape stage is a manual vendor clone
+    # because it is Tencent-licensed. Listing them with a button that throws is worse than
+    # listing them with the command to run, so the page says which it is.
+    automated_setup: bool = True
+    # What this route produces. Everything here made a mesh until Qwen-Image arrived, and a
+    # text-to-image step sits one stage upstream of the rest of the pipeline: it is for
+    # people who do not have a source image yet. The page groups on this rather than
+    # guessing from the label.
+    kind: str = "3d"
+    # The official project behind a Mac port, as (label, url). TRELLIS.2 and Hunyuan3D are
+    # NVIDIA-first upstream; only our wrappers are Apple-only. Without this, a Linux user
+    # read "needs Apple Silicon" as if the model itself could not run on their card.
+    upstream: tuple[str, str] | None = None
+    # A route that installs differently per machine (TRELLIS.2: the Metal port on a Mac,
+    # Microsoft's own code on NVIDIA) overrides `install` and `build_probes` per host here.
+    # Hosts not listed use the plain fields.
+    install_by_host: dict[str, str] = field(default_factory=dict)
+    build_probes_by_host: dict[str, tuple[Path, ...]] = field(default_factory=dict)
+    # What the card says, per machine, where one route is really different code: TRELLIS
+    # is the Metal port on a Mac and Microsoft's own code on NVIDIA. Keys: HOST_OVERRIDABLE.
+    overrides_by_host: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Operating systems a listed machine type still cannot use, as (host, os family):
+    # TRELLIS.2 runs on NVIDIA under Linux, but its CUDA build is not set up for Windows.
+    excludes: tuple[tuple[str, str], ...] = ()
+    # A separate route in this catalogue that does the same job on NVIDIA (the MLX Hunyuan
+    # ports -> Tencent's own Hunyuan3D-2.1). Named in the note an NVIDIA machine sees.
+    nvidia_route: str | None = None
+    # Why an AMD machine cannot run this route, when the honest reason is specific.
+    # TRELLIS.2 and Hunyuan3D-2.1 need NVIDIA-only compiled extensions; Stable Fast 3D is
+    # Apple-only because its pins broke the lab's shared environment, which is a different
+    # sentence entirely. Without this field every blocked route borrows the extension
+    # excuse, and SF3D ends up claiming an NVIDIA-only extension it does not have.
+    amd_blocked_reason: str | None = None
+    # The oldest macOS a Mac can run this route on, with the reason. TRELLIS.2's Metal port
+    # is compiled as Metal 4.0, which older macOS refuses to load: the build succeeds, then
+    # the first run crashes (#154). None: any macOS.
+    min_macos: tuple[int, str] | None = None
+
+    @property
+    def bytes_expected(self) -> int:
+        return sum(w.bytes_expected for w in self.weights)
+
+    def install_for(self, host: str | None = None) -> str:
+        return self.install_by_host.get(host or host_platform(), self.install)
+
+    def probes_for(self, host: str | None = None) -> tuple[Path, ...]:
+        return self.build_probes_by_host.get(host or host_platform(), self.build_probes)
+
+    def built_on(self, host: str | None = None) -> bool:
+        """True when nothing is declared, so a weights-only backend is never 'unbuilt'."""
+        return all(p.exists() for p in self.probes_for(host))
+
+    @property
+    def build_present(self) -> bool:
+        return self.built_on()
+
+    def excluded_os(self, host: str | None = None, family: str | None = None) -> str | None:
+        """The OS family that rules this machine out, or None."""
+        family = family or _host.os_family()
+        return family if ((host or host_platform()), family) in self.excludes else None
+
+    def macos_too_old(self, host: str | None = None, macos: int | None = None) -> int | None:
+        """This Mac's macOS major version when it is older than the route needs, or None."""
+        if self.min_macos is None or (host or host_platform()) != APPLE:
+            return None
+        macos = _host.macos_major() if macos is None else macos
+        return macos if macos is not None and macos < self.min_macos[0] else None
+
+    def runs_here(self, host: str | None = None, family: str | None = None,
+                  macos: int | None = None) -> bool:
+        host = host or host_platform()
+        return (host in self.runs_on and self.excluded_os(host, family) is None
+                and self.macos_too_old(host, macos) is None)
+
+    def _platform_note(self, host: str | None = None, family: str | None = None,
+                       macos: int | None = None) -> str:
+        old = self.macos_too_old(host, macos)
+        if old is not None:
+            needed, why = self.min_macos
+            works = [b.label for b in CATALOG if b.kind == "3d" and b is not self
+                     and APPLE in b.runs_on and b.min_macos is None]
+            tail = f" {works[0]} runs on this Mac." if works else ""
+            return (f"{self.label} on a Mac needs macOS {needed} or newer; this Mac has macOS {old}. "
+                    f"{why} Update macOS to use it.{tail}")
+        excluded = self.excluded_os(host, family)
+        if excluded:
+            return (f"{self.label} is not supported on {excluded.capitalize()} yet. "
+                    f"On an NVIDIA card it runs under Linux.")
+        # AMD comes before the generic notes below, because both of those talk about
+        # NVIDIA and an AMD reader has no NVIDIA machine to act on.
+        if (host or host_platform()) == AMD and AMD not in self.runs_on:
+            reason = self.amd_blocked_reason or (
+                f"{self.label} needs NVIDIA-only compiled extensions, and upstream ships no "
+                f"ROCm build of them, so a download here would end in a failed build.")
+            # Point at a route that genuinely runs here, by asking the catalogue rather than
+            # naming one: a suggestion that is itself unavailable is the same failure as no
+            # suggestion at all, and it is the thing that reads as a broken page.
+            works = [b.label for b in CATALOG if AMD in b.runs_on and b.kind == "3d"]
+            tail = f" {works[0]} runs on this card and needs nothing NVIDIA-only." if works else ""
+            return f"Not on AMD. {reason}{tail}"
+
+        # The "use the official version" advice is only true while this lab cannot run it
+        # on NVIDIA itself; once a route lists NVIDIA, the plain note is the honest one.
+        twin = BY_ID.get(self.nvidia_route) if self.nvidia_route else None
+        if twin is not None and (host or host_platform()) == NVIDIA:
+            return (f"This lab runs the Apple Silicon port here. On an NVIDIA machine, use "
+                    f"{twin.label} instead: {self.upstream[0] if self.upstream else 'it'} "
+                    f"with the vendor's own code, set up from this page.")
+        if self.upstream and NVIDIA not in self.runs_on:
+            return (f"This lab runs the Apple Silicon port. {self.upstream[0]} itself is "
+                    f"built for NVIDIA: on an NVIDIA machine, use the official version "
+                    f"for now. Built into this lab later.")
+        return (f"Needs {runs_on_phrase(self)}. Setting it up on this machine would "
+                f"download gigabytes and then fail, so the button is off.")
+
+    def setup_fetches_on(self, host: str | None = None) -> bool:
+        """Whether this machine's setup downloads the weights (vs. the first run doing so)."""
+        said = self.overrides_by_host.get(host or host_platform(), {})
+        return said.get("setup_fetches_weights", self.setup_fetches_weights)
+
+    def missing_build_probes(self, host: str | None = None) -> list[Path]:
+        """Which declared build files are not there.
+
+        "Needs setup" with nothing else is what a build that quietly lost its venv looks
+        like, and it sends people looking at the install script rather than at the checkout.
+        Naming the absent file turns that into a one-glance answer.
+        """
+        return [p for p in self.probes_for(host) if not p.exists()]
+
+    def build_hint(self, host: str | None = None) -> str | None:
+        """Why this is not built, naming what is absent, or None when it is."""
+        missing = self.missing_build_probes(host)
+        if not missing:
+            return None
+        if len(missing) == len(self.probes_for(host)):
+            return f"{self.label} is not installed on this machine."
+        listed = ", ".join(str(p.relative_to(REPO)) if p.is_relative_to(REPO) else str(p)
+                           for p in missing)
+        return (f"{self.label} was installed here and is no longer: {listed} is missing. "
+                f"Setup will rebuild it.")
+
+    def suggested_here(self, low: bool | None = None) -> bool:
+        """Whether this card is the one we suggest for this machine's memory."""
+        if self.suggested_when is None:
+            return False
+        low = _host.low_memory() if low is None else low
+        return low if self.suggested_when == "low_memory" else not low
+
+    def describe(self, host: str | None = None) -> dict[str, Any]:
+        weights = [w.describe() for w in self.weights]
+        # A file another card also uses (Flux's VAE) does not make this card "partly
+        # downloaded": with none of its own files here, it is judged on its own files alone.
+        own = [d for d, w in zip(weights, self.weights) if not is_shared(self, w)]
+        judged = weights if not own or any(d["bytes_present"] > 0 for d in own) else own
+        present = _total_present(weights)
+        built = self.built_on(host)
+        supported = self.runs_here(host)
+        said = self.overrides_by_host.get(host or host_platform(), {})
+        fetches = self.setup_fetches_on(host)
+        return {
+            "build_present": built,
+            "build_missing": [str(p) for p in self.missing_build_probes(host)],
+            "build_hint": self.build_hint(host),
+            "supported_here": supported,
+            "requires": runs_on_phrase(self),
+            # Said once, in words, so the screen can explain instead of a button failing.
+            "platform_note": None if supported else self._platform_note(host),
+            "upstream": ({"label": self.upstream[0], "url": self.upstream[1]}
+                         if self.upstream else None),
+            "id": self.id,
+            "label": said.get("label", self.label),
+            "kind": self.kind,
+            "rank": self.rank,
+            "recommended": self.rank == 1 or self.suggested_here(),
+            "best_for": self.best_for,
+            "tradeoff": said.get("tradeoff", self.tradeoff),
+            "license": {"name": self.license_name, "url": self.license_url},
+            "caveat": said.get("caveat", self.caveat),
+            "gated_repo": self.gated_repo,
+            "install": self.install_for(host),
+            "setup_minutes": said.get("setup_minutes", self.setup_minutes),
+            "setup_fetches_weights": fetches,
+            "extra_steps": list(self.extra_steps),
+            "weights": weights,
+            "bytes_expected": self.bytes_expected,
+            "human_expected": human_bytes(self.bytes_expected),
+            "bytes_present": present,
+            "human_present": human_bytes(present),
+            # What Remove would free: files other routes share are kept (see is_shared).
+            "bytes_removable": sum(d["bytes_present"] for d, w in zip(weights, self.weights)
+                                   if not is_shared(self, w)),
+            "automated_setup": self.automated_setup,
+            "state": "unsupported" if not supported else
+                     _state(judged, built, fetches),
+            "action": "none" if not supported else
+                      _action(judged, built, fetches,
+                              self.automated_setup),
+            "percent_present": _percent(present, self.bytes_expected),
+        }
+
+
+# Ranked the way the README ranks them, because two orderings of the same advice is one
+# too many. Rank 1 is what a newcomer should pick.
+CATALOG: tuple[Backend, ...] = (
+    Backend(
+        id="pixal3d",
+        label="Pixal3D (C++/GGML)",
+        rank=1,
+        best_for="Best results we have. One pass, no repaint needed.",
+        tradeoff=(
+            "On a Mac it compiles locally and needs full Xcode for the Metal compiler. "
+            "On NVIDIA it downloads a ready-made CUDA build; no compiling. On AMD it "
+            "compiles with HIP; no prebuilt is published."
+        ),
+        overrides_by_host={
+            APPLE: {"tradeoff": "Compiles on your Mac, and needs full Xcode for the Metal "
+                                "compiler."},
+            NVIDIA: {"tradeoff": "Downloads a ready-made CUDA build, no compiling "
+                                 "(driver 575 or newer)."},
+            AMD: {"tradeoff": "Compiles on your machine with HIP, which needs ROCm's "
+                              "hipcc. Expect 10-20 minutes of compiling, once."},
+        },
+        license_name="MIT (code + flow weights); DINOv3 License (bundled encoder)",
+        license_url="https://huggingface.co/raven38/pixal3d-sv-q8_0-v1",
+        install="scripts/bootstrap_pixal3d.py",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=20,
+        build_probes=(_host.executable(REPO / "vendor" / "pixal3d-cpp" / "build", "trellis-cli"),),
+        weights=(
+            # One entry, not two: the bootstrap moves BiRefNet *into* pixal3d-sv/, so a
+            # second set pointed at the parent directory would count everything twice.
+            WeightSet("Pixal3D single-view Q8_0, with BiRefNet matting",
+                      "raven38/pixal3d-sv-q8_0-v1", int(8.4 * GB),
+                      _models_home.vendor_models("pixal3d-cpp") / "pixal3d-sv",
+                      note="Includes the BiRefNet matting model (ilintar/trellis2-gguf), "
+                           "used to cut out a subject when the image has no alpha."),
+            # Installed with Pixal3D since 0.3.5: without it the cut-out falls back to
+            # u2net, which ate a white robot's upper arms on a fresh Linux install.
+            WeightSet("BiRefNet-lite background remover", _matte.LEAN_URL, _matte.LEAN_BYTES,
+                      _matte.model_file(_matte.LEAN_MODEL), alt_paths=_OLDER_REMOVER,
+                      note="Cuts the subject out before generation, keeping thin and "
+                           "light-coloured parts. Shared with the other routes."),
+        ),
+    ),
+    Backend(
+        id="hunyuan_xiong",
+        label="Hunyuan3D-MLX (Xiong, full pipeline)",
+        rank=2,
+        best_for="Fast, clean results, and the quickest to run from a fresh clone.",
+        tradeoff="Shape and paint are separate venvs, each set up on its own.",
+        license_name="MIT (code); Tencent Hunyuan Community License (weights)",
+        license_url="https://huggingface.co/tencent/Hunyuan3D-2.1",
+        install="python scripts/bootstrap_hunyuan_xiong.py",
+        upstream=("Hunyuan3D-2.1", "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1"),
+        nvidia_route="hunyuan-cuda",
+        # Neither half of Hunyuan reaches an AMD card: this port is Apple Silicon, and
+        # Tencent's own is NVIDIA-only. Saying so beats the generic note, which would
+        # point an AMD reader at a machine they do not have.
+        amd_blocked_reason=(
+            "This port is Apple Silicon, and Tencent's own runs on AMD only in the "
+            "separate Hunyuan3D-2.1 (AMD) route, which is compiled with HIP."
+        ),
+        setup_minutes=25,
+        build_probes=(venv_python(REPO / "hunyuan_mlx" / "shape"),
+                      venv_python(REPO / "hunyuan_mlx" / "paint")),
+        caveat=(
+            "The Hunyuan weights are not licensed for use in the EU, the UK or South Korea. "
+            "Check the licence before downloading."
+        ),
+        weights=(
+            WeightSet("Hunyuan3D-2 shape (default route)", "tencent/Hunyuan3D-2",
+                      int(5.0 * GB), REPO / "hunyuan_mlx" / "shape" / "weights" / "Hunyuan3D-2"),
+            WeightSet("Hunyuan3D-2.1 paint (PBR), MLX port",
+                      "zimengxiong/hunyuan3d-mlx-paint-large", int(8.7 * GB),
+                      REPO / "hunyuan_mlx" / "paint" / "weights"),
+            WeightSet("BiRefNet-lite background remover", _matte.LEAN_URL, _matte.LEAN_BYTES,
+                      _matte.model_file(_matte.LEAN_MODEL), alt_paths=_OLDER_REMOVER,
+                      note="Cuts the subject out before generation. Shared with the other routes."),
+        ),
+    ),
+    Backend(
+        id="hunyuan-cuda",
+        label="Hunyuan3D-2.1 (NVIDIA)",
+        rank=2,
+        best_for="Hunyuan on an NVIDIA card: Tencent's own shape and PBR paint, one run.",
+        # On AMD this route is not "not built for your card": the same upstream commit
+        # builds with HIP, as hunyuan-rocm. Saying so stops the page reading as though
+        # Tencent's code itself were NVIDIA-only.
+        amd_blocked_reason=(
+            "This is the CUDA build of Tencent's own Hunyuan3D-2.1. The same upstream commit "
+            "compiles with HIP as Hunyuan3D-2.1 (AMD), which is the route for this card."
+        ),
+        tradeoff=(
+            "Linux only, and paint needs about 21 GB of GPU memory: a 24 GB card or bigger. "
+            "Compiles its paint rasterizer for your card on setup."
+        ),
+        license_name="Tencent Hunyuan Community License (code + weights)",
+        license_url="https://huggingface.co/tencent/Hunyuan3D-2.1",
+        install="scripts/bootstrap_hunyuan_cuda.py",
+        runs_on=(NVIDIA,),
+        excludes=((NVIDIA, "windows"),),
+        setup_minutes=30,
+        build_probes=(REPO / "vendor" / "hunyuan-cuda" / ".i2l-build-complete",),
+        caveat=(
+            "The Hunyuan weights are not licensed for use in the EU, the UK or South Korea. "
+            "Check the licence before downloading."
+        ),
+        weights=(
+            WeightSet("Hunyuan3D-2.1 shape + VAE", "tencent/Hunyuan3D-2.1", int(8.03 * GB),
+                      _models_home.vendor_models("hunyuan-cuda") / "tencent" / "Hunyuan3D-2.1"),
+            WeightSet("Hunyuan3D-2.1 PBR paint", "tencent/Hunyuan3D-2.1", int(6.89 * GB),
+                      HF_HUB_DIR / "models--tencent--Hunyuan3D-2.1"),
+            WeightSet("DINOv2-giant image encoder", "facebook/dinov2-giant", int(4.55 * GB),
+                      HF_HUB_DIR / "models--facebook--dinov2-giant",
+                      note="The paint model reads the picture with it. Upstream fetches it "
+                           "unannounced on the first run; here it is fetched at setup."),
+            WeightSet("RealESRGAN x4plus upscaler",
+                      "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/"
+                      "RealESRGAN_x4plus.pth",
+                      int(0.067 * GB),
+                      REPO / "vendor" / "hunyuan-cuda" / "ckpt" / "RealESRGAN_x4plus.pth"),
+            WeightSet("BiRefNet-lite background remover", _matte.LEAN_URL, _matte.LEAN_BYTES,
+                      _matte.model_file(_matte.LEAN_MODEL), alt_paths=_OLDER_REMOVER,
+                      note="Cuts out pictures without alpha. Shared with the other routes."),
+        ),
+    ),
+    Backend(
+        id="hunyuan-rocm",
+        label="Hunyuan3D-2.1 (AMD)",
+        rank=2,
+        best_for="Hunyuan on an AMD card: Tencent's own shape and PBR paint, one run.",
+        tradeoff=(
+            "Linux only, and capped at 256px textures. Upstream's 512px comes back "
+            "entirely black on this card -- measured on an RX 7900 XTX -- so the paint "
+            "stage is asked for less rather than for something broken. Paint also wants "
+            "about 21 GB; on 20 GB or less it drops views and chunks attention so it runs "
+            "slower rather than not at all. The shape stage fits in 10 GB and needs none "
+            "of that."
+        ),
+        license_name="Tencent Hunyuan Community License (code + weights)",
+        license_url="https://huggingface.co/tencent/Hunyuan3D-2.1",
+        install="scripts/bootstrap_hunyuan_rocm.py",
+        runs_on=(AMD,),
+        setup_minutes=30,
+        build_probes=(REPO / "vendor" / "hunyuan-rocm" / ".i2l-build-complete",),
+        caveat=(
+            "The Hunyuan weights are not licensed for use in the EU, the UK or South Korea. "
+            "Check the licence before downloading."
+        ),
+        weights=(
+            WeightSet("Hunyuan3D-2.1 shape + VAE", "tencent/Hunyuan3D-2.1", int(8.03 * GB),
+                      _models_home.vendor_models("hunyuan-rocm") / "tencent" / "Hunyuan3D-2.1"),
+            WeightSet("Hunyuan3D-2.1 PBR paint", "tencent/Hunyuan3D-2.1", int(6.89 * GB),
+                      HF_HUB_DIR / "models--tencent--Hunyuan3D-2.1"),
+            WeightSet("DINOv2-giant image encoder", "facebook/dinov2-giant", int(4.55 * GB),
+                      HF_HUB_DIR / "models--facebook--dinov2-giant",
+                      note="The paint model reads the picture with it. Upstream fetches it "
+                           "unannounced on the first run; here it is fetched at setup."),
+            WeightSet("RealESRGAN x4plus upscaler",
+                      "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/"
+                      "RealESRGAN_x4plus.pth",
+                      int(0.067 * GB),
+                      REPO / "vendor" / "hunyuan-rocm" / "ckpt" / "RealESRGAN_x4plus.pth"),
+            WeightSet("BiRefNet-lite background remover", _matte.LEAN_URL, _matte.LEAN_BYTES,
+                      _matte.model_file(_matte.LEAN_MODEL), alt_paths=_OLDER_REMOVER,
+                      note="Cuts out pictures without alpha. Shared with the other routes."),
+        ),
+    ),
+    Backend(
+        id="hunyuan-mlx",
+        label="Hunyuan3D-MLX (dgrauet shape + Xiong paint)",
+        rank=4,
+        best_for="The older Hunyuan pairing: dgrauet's shape stage, Xiong's paint stage.",
+        tradeoff=(
+            "Two projects bolted together, and the shape half is a manual vendor clone. "
+            "Prefer the Xiong full pipeline unless you specifically want this shape model."
+        ),
+        license_name="MIT (Xiong paint code); Tencent Hunyuan Community License (weights)",
+        license_url="https://huggingface.co/tencent/Hunyuan3D-2.1",
+        install="Manual: clone dgrauet's port into vendor/hunyuan-mlx, then uv sync",
+        upstream=("Hunyuan3D-2.1", "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1"),
+        nvidia_route="hunyuan-cuda",
+        amd_blocked_reason=(
+            "This port is Apple Silicon, and Tencent's own runs on AMD only in the "
+            "separate Hunyuan3D-2.1 (AMD) route, which is compiled with HIP."
+        ),
+        automated_setup=False,
+        setup_minutes=40,
+        build_probes=(REPO / "vendor" / "hunyuan-mlx" / ".venv" / "bin" / "python",
+                      venv_python(REPO / "hunyuan_mlx" / "paint")),
+        caveat=(
+            "The Hunyuan weights are not licensed for use in the EU, the UK or South Korea. "
+            "Check the licence before downloading."
+        ),
+        extra_steps=(
+            ("The shape half stays vendor-cloned on purpose: it is Tencent-licensed code, "
+             "not just weights. See docs/hunyuan-mlx-recipes.md."),
+        ),
+        weights=(
+            WeightSet("Hunyuan3D-2.1 shape, MLX port", "dgrauet/hunyuan3d-2.1-mlx",
+                      int(13.0 * GB),
+                      HF_HUB_DIR / "models--dgrauet--hunyuan3d-2.1-mlx"),
+            WeightSet("Hunyuan3D-2.1 paint (PBR), MLX port",
+                      "zimengxiong/hunyuan3d-mlx-paint-large", int(8.7 * GB),
+                      REPO / "hunyuan_mlx" / "paint" / "weights",
+                      note="The same paint weights the Xiong route uses. Downloading it "
+                           "for one route installs it for both."),
+        ),
+    ),
+    Backend(
+        id="sf3d",
+        label="Stable Fast 3D",
+        rank=5,
+        best_for="Fastest of the lot, and the smallest download. Good for a quick look.",
+        tradeoff="Lowest fidelity here, and it bakes lighting into the texture.",
+        license_name="Stability AI Community License (non-commercial under $1M revenue)",
+        license_url="https://huggingface.co/stabilityai/stable-fast-3d",
+        install="scripts/bootstrap_sf3d.py",
+        # Not a card limitation at all: SF3D's pins (numpy 1.26, transformers 4.42, an old
+        # huggingface-hub) broke the lab's *shared* environment on Linux, so it was marked
+        # Apple-only rather than given its own packages to fight over them. A route with a
+        # venv of its own removes that reason. Upstream needed one line:
+        # texture_baker/setup.py gates its GPU kernels on CUDA_HOME, which is None on a ROCm
+        # build, so it silently built a CPU-only baker.
+        install_by_host={AMD: "scripts/bootstrap_sf3d_rocm.py"},
+        # Same checkout as the Mac route, so the Apple source file proves nothing on Linux:
+        # what proves the AMD route is its venv and its build marker.
+        build_probes_by_host={
+            AMD: (REPO / "vendor" / "stable-fast-3d" / ".i2l-build-complete",
+                  venv_python(REPO / "vendor" / "stable-fast-3d")),
+        },
+        runs_on=(APPLE, AMD),
+        setup_minutes=20,
+        build_probes=(REPO / "vendor" / "stable-fast-3d" / "sf3d" / "system.py",),
+        caveat=(
+            "The SF3D weights are gated: accept Stability's licence on Hugging Face and "
+            "sign in under Hugging Face sign-in at the top of this page before setting it up."
+        ),
+        gated_repo="stabilityai/stable-fast-3d",
+        weights=(
+            WeightSet("Stable Fast 3D", "stabilityai/stable-fast-3d", int(3.75 * GB),
+                      HF_HUB_DIR / "models--stabilityai--stable-fast-3d"),
+            WeightSet("DINOv2 image encoder", "facebook/dinov2-large", int(1.13 * GB),
+                      HF_HUB_DIR / "models--facebook--dinov2-large",
+                      note="SF3D reads the picture with it. Without this entry it was "
+                           "fetched unannounced on the first run."),
+            WeightSet("BiRefNet-lite background remover", _matte.LEAN_URL, _matte.LEAN_BYTES,
+                      _matte.model_file(_matte.LEAN_MODEL), alt_paths=_OLDER_REMOVER,
+                      note="Cuts the subject out before generation. Shared with the other routes."),
+        ),
+    ),
+    Backend(
+        id="trellis",
+        label="TRELLIS.2 (clean port)",
+        rank=3,
+        best_for="Highest fidelity, closest to the official demo.",
+        tradeoff=(
+            "Slowest, and its material model bleaches flat or vector-style illustrations. "
+            "Prefer photographs or softly lit 3D-style references."
+        ),
+        license_name="MIT (code + weights); DINOv3 License (image encoder)",
+        license_url="https://huggingface.co/microsoft/TRELLIS.2-4B",
+        install="viewer",
+        upstream=("TRELLIS.2", "https://github.com/microsoft/TRELLIS.2"),
+        # Mac: the Metal port. Linux + NVIDIA: Microsoft's own code, built for CUDA.
+        # Linux + AMD: the same checkout, built with HIP. Windows is not supported for
+        # TRELLIS.2 yet (the bootstrap refuses it).
+        runs_on=(APPLE, NVIDIA, AMD),
+        excludes=((NVIDIA, "windows"),),
+        min_macos=(_host.METAL4_MACOS, "Its GPU code is built for Metal 4, which older macOS cannot load."),
+        install_by_host={
+            NVIDIA: "scripts/bootstrap_trellis_cuda.py",
+            AMD: "scripts/bootstrap_trellis_rocm.py",
+        },
+        build_probes_by_host={
+            NVIDIA: (REPO / "vendor" / "trellis-cuda" / ".i2l-build-complete",),
+            AMD: (REPO / "vendor" / "trellis-rocm" / ".i2l-build-complete",),
+        },
+        caveat=(
+            "Its DINOv3 image encoder is gated: request access to "
+            "facebook/dinov3-vitl16-pretrain-lvd1689m on Hugging Face (Meta approves by "
+            "hand) and sign in under Hugging Face sign-in at the top of this page, or the first run stops "
+            "after the 14 GB download."
+        ),
+        gated_repo="facebook/dinov3-vitl16-pretrain-lvd1689m",
+        setup_minutes=60,
+        setup_fetches_weights=False,
+        overrides_by_host={NVIDIA: {
+            "label": "TRELLIS.2 (NVIDIA)",
+            "tradeoff": ("Microsoft's own code, built for your card. Its material model "
+                         "bleaches flat or vector-style illustrations. Prefer photographs "
+                         "or softly lit 3D-style references."),
+            "caveat": ("Its DINOv3 image encoder is gated: request access to "
+                       "facebook/dinov3-vitl16-pretrain-lvd1689m on Hugging Face (Meta "
+                       "approves by hand) and sign in under Hugging Face sign-in at the top of this page. Setup checks "
+                       "access before downloading anything."),
+            # The CUDA bootstrap fetches the weights once the build is done.
+            "setup_fetches_weights": True,
+        }, AMD: {
+            "label": "TRELLIS.2 (AMD)",
+            "tradeoff": ("Microsoft's own code, built with HIP for your card. Its material "
+                         "model bleaches flat or vector-style illustrations. Prefer "
+                         "photographs or softly lit 3D-style references."),
+            "caveat": ("Its DINOv3 image encoder is gated: request access to "
+                       "facebook/dinov3-vitl16-pretrain-lvd1689m on Hugging Face (Meta "
+                       "approves by hand) and sign in under Hugging Face sign-in at the top of this page. Setup checks "
+                       "access before downloading anything. Attention runs on AuleAttention, "
+                       "because flash-attn cannot be built for ROCm."),
+            # The ROCm bootstrap fetches the weights once the build is done.
+            "setup_fetches_weights": True,
+        }},
+        build_probes=(venv_python(REPO / "vendor" / "trellis-space-mac"),),
+        weights=(
+            # The first three can live outside the Hugging Face cache: TRELLIS.2 loads from
+            # a local directory when I2L_TRELLIS_MODEL_PATH points at one, and that
+            # directory holds the decoder and the encoder along with the main weights. So
+            # all three count it, or a working route reads as "partly downloaded" on the
+            # machine that built it.
+            WeightSet("TRELLIS.2-4B", "microsoft/TRELLIS.2-4B", int(15.15 * GB),
+                      HF_HUB_DIR / "models--microsoft--TRELLIS.2-4B",
+                      alt_paths=_local_trellis()),
+            WeightSet("TRELLIS image-large decoder", "microsoft/TRELLIS-image-large",
+                      148 * 1024 ** 2,
+                      HF_HUB_DIR / "models--microsoft--TRELLIS-image-large",
+                      note="One decoder file TRELLIS.2's config pulls in on the first run.",
+                      alt_paths=_local_trellis()),
+            WeightSet("DINOv3 image encoder", "facebook/dinov3-vitl16-pretrain-lvd1689m",
+                      int(1.1 * GB),
+                      HF_HUB_DIR / "models--facebook--dinov3-vitl16-pretrain-lvd1689m",
+                      alt_paths=_local_trellis()),
+            WeightSet("TinyCLIP input advisor", "wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M",
+                      92 * 1024 ** 2,
+                      HF_HUB_DIR / "models--wkcn--TinyCLIP-ViT-8M-16-Text-3M-YFCC15M",
+                      note="Advisory only. Generation works without it."),
+            WeightSet("BiRefNet-lite background remover", _matte.LEAN_URL, _matte.LEAN_BYTES,
+                      _matte.model_file(_matte.LEAN_MODEL), alt_paths=_OLDER_REMOVER,
+                      note="Cuts out pictures without alpha on NVIDIA and AMD. Fetched by "
+                           "those setups; the Mac port wants pre-masked images."),
+        ),
+    ),
+    Backend(
+        id="flux-image",
+        label="FLUX.2 klein 4B (text to image)",
+        kind="image",
+        best_for=("Makes the source image when you do not have one, and draws the back for "
+                  "front + back builds. Prompt in, picture out."),
+        tradeoff=("Fast, and Apache-2.0: the pictures you make are yours for any use. "
+                  "Follows very long prompts a little less closely than Qwen-Image."),
+        license_name="Apache-2.0",
+        license_url="https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+        install="scripts/bootstrap_flux_image.py",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=10,
+        build_probes=(_host.executable(REPO / "vendor" / "sdcpp", "sd-cli"),),
+        suggested_when="plenty_memory",
+        weights=(
+            WeightSet("FLUX.2 klein 4B diffusion model (Q8_0)", "leejet/FLUX.2-klein-4B-GGUF",
+                      4_300_629_440, HF_HUB_DIR / "models--leejet--FLUX.2-klein-4B-GGUF",
+                      pattern="snapshots/*/flux-2-klein-4b-Q8_0.gguf",
+                      blob="0bba6951258ec8f92d51114a8fa13e66828297bfff58a738f52729b3ef66fa28"),
+            WeightSet("Qwen3-4B text encoder (Q8_0)", "unsloth/Qwen3-4B-GGUF", 4_280_405_792,
+                      HF_HUB_DIR / "models--unsloth--Qwen3-4B-GGUF",
+                      note="Reads your prompt. Plain Qwen3, Apache-2.0: not Qwen-Image's licence.",
+                      pattern="snapshots/*/Qwen3-4B-Q8_0.gguf",
+                      blob="eed555233267a33c7e8ee31682762cc7751b3f6d224039086e0e846f05fffa5d"),
+            WeightSet("FLUX.2 VAE", "Comfy-Org/Flux-2-Klein-4B", 336_211_292,
+                      HF_HUB_DIR / "models--Comfy-Org--Flux-2-Klein-4B",
+                      note="Turns the generated latent back into pixels."),
+        ),
+    ),
+    Backend(
+        id="flux-image-light",
+        label="FLUX.2 klein 4B Light (text to image, less memory)",
+        kind="image",
+        best_for=("The same pictures for machines with 16 GB of memory or less: about 5 GB "
+                  "while drawing instead of about 9."),
+        tradeoff=("Smaller files of the same model. Pictures look the same in our tests; the "
+                  "standard files keep a little more fine detail. Apache-2.0: the pictures are "
+                  "yours for any use."),
+        license_name="Apache-2.0",
+        license_url="https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+        install="scripts/bootstrap_flux_image.py --light",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=8,
+        build_probes=(_host.executable(REPO / "vendor" / "sdcpp", "sd-cli"),),
+        suggested_when="low_memory",
+        weights=(
+            WeightSet("FLUX.2 klein 4B diffusion model (Q4_0)", "leejet/FLUX.2-klein-4B-GGUF",
+                      2_460_378_560, HF_HUB_DIR / "models--leejet--FLUX.2-klein-4B-GGUF",
+                      pattern="snapshots/*/flux-2-klein-4b-Q4_0.gguf",
+                      blob="d1023499ef3f2f82ff7c50e6778495195c1b6cc34835741778868428111f9ff4"),
+            WeightSet("Qwen3-4B text encoder (Q4_K_M)", "unsloth/Qwen3-4B-GGUF", 2_497_281_312,
+                      HF_HUB_DIR / "models--unsloth--Qwen3-4B-GGUF",
+                      note="Reads your prompt. Plain Qwen3, Apache-2.0.",
+                      pattern="snapshots/*/Qwen3-4B-Q4_K_M.gguf",
+                      blob="f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a"),
+            WeightSet("FLUX.2 VAE", "Comfy-Org/Flux-2-Klein-4B", 336_211_292,
+                      HF_HUB_DIR / "models--Comfy-Org--Flux-2-Klein-4B",
+                      note="Shared with the standard Flux card."),
+        ),
+    ),
+    Backend(
+        id="qwen-image",
+        label="Qwen-Image 2.1 (text to image)",
+        kind="image",
+        best_for="Makes the source image when you do not have one. Prompt in, picture out.",
+        tradeoff=("Follows long prompts closely and draws skins. Slower and a bigger download "
+                  "than FLUX.2 klein, and under the Qwen Research License (the pictures are "
+                  "still yours)."),
+        license_name="Qwen Research License",
+        license_url="https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE",
+        install="Prebuilt stable-diffusion.cpp binary in vendor/sdcpp/",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=15,
+        build_probes=(_host.executable(REPO / "vendor" / "sdcpp", "sd-cli"),),
+        weights=(
+            WeightSet("Qwen-Image 2.1 diffusion model (Q8_0)",
+                      "leejet/Qwen-Image-2.1-GGUF", int(7.69 * GB),
+                      HF_HUB_DIR / "models--leejet--Qwen-Image-2.1-GGUF"),
+            WeightSet("Qwen3-VL-8B text encoder (Q4_K_M)",
+                      "Qwen/Qwen3-VL-8B-Instruct-GGUF", int(5.03 * GB),
+                      HF_HUB_DIR / "models--Qwen--Qwen3-VL-8B-Instruct-GGUF",
+                      note="Qwen-Image reads your prompt with a vision-language model, "
+                           "which is why the text encoder is this large."),
+            WeightSet("Qwen-Image 2.1 VAE", "Comfy-Org/Qwen-Image-2.1", int(0.68 * GB),
+                      HF_HUB_DIR / "models--Comfy-Org--Qwen-Image-2.1",
+                      note="Turns the generated latent back into pixels."),
+            WeightSet("Qwen3-VL vision projector (Q8_0)", "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+                      752_289_728, HF_HUB_DIR / "models--Qwen--Qwen3-VL-8B-Instruct-GGUF",
+                      note="Lets Qwen-Image read a picture: skins, and back views when Qwen "
+                           "draws them.",
+                      pattern="snapshots/*/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf"),
+        ),
+    ),
+    Backend(
+        id="matte",
+        label="Background remover (BiRefNet-lite)",
+        kind="tool",
+        best_for=("Cuts the subject out before every generator, keeping the thin and "
+                  "light-coloured parts the built-in u2net loses."),
+        tradeoff=("Comes with every 3D engine that needs it. Install it here if a run "
+                  "says it is missing. Have the older, heavier copy? This lighter file "
+                  "replaces it: half the memory per cut-out, and the old file is removed."),
+        license_name="MIT",
+        license_url="https://github.com/ZhengPeng7/BiRefNet",
+        install="scripts/bootstrap_matte.py",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=2,
+        weights=(
+            WeightSet("BiRefNet-lite", _matte.LEAN_URL, _matte.LEAN_BYTES,
+                      _matte.model_file(_matte.LEAN_MODEL),
+                      note="One file, shared by every 3D engine."),
+        ),
+    ),
+    Backend(
+        id="upscaler",
+        label="Hero face upscaler (Real-ESRGAN)",
+        kind="tool",
+        best_for=("Sharpens the close crop of a character's head for Hero face, so the head "
+                  "built from it keeps real eyelids and solid hair."),
+        tradeoff="Needed only for Hero face (Finish > Detail).",
+        license_name="BSD-3-Clause",
+        license_url="https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
+        install="scripts/bootstrap_upscaler.py",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=1,
+        weights=(
+            WeightSet("Real-ESRGAN x4plus", _upscale.WEIGHTS_URL, _upscale.WEIGHTS_BYTES,
+                      _upscale.WEIGHTS_FILE, note="One file, run by the project's own PyTorch."),
+        ),
+    ),
+    Backend(
+        id="autorig",
+        label="Auto-rig (SkinTokens)",
+        kind="tool",
+        best_for=("Gives a humanoid model a skeleton and skin weights, so the Rig tab can "
+                  "play preset animations on it."),
+        tradeoff="Humanoids in an A-pose or T-pose only for now. Four-legged creatures are coming.",
+        overrides_by_host={
+            AMD: {"tradeoff": "Humanoids in an A-pose or T-pose only for now, and attention comes "
+                              "from PyTorch rather than flash-attn, which has no ROCm "
+                              "wheel: a little slower and a little heavier on memory."},
+        },
+        license_name="MIT",
+        license_url="https://github.com/VAST-AI-Research/SkinTokens/blob/main/LICENSE",
+        install="scripts/bootstrap_autorig.py",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=10,
+        build_probes=(venv_python(REPO / "vendor" / "SkinTokens"),
+                      REPO / "vendor" / "SkinTokens" / "demo.py"),
+        upstream=("VAST-AI SkinTokens", "https://github.com/VAST-AI-Research/SkinTokens"),
+        weights=(
+            WeightSet("SkinTokens rigging + skinning checkpoints", "VAST-AI/SkinTokens",
+                      1_131_603_979 + 487_311_745,
+                      HF_HUB_DIR / "models--VAST-AI--SkinTokens",
+                      note="Pinned to the revision we tested. Setup also fetches "
+                           "Qwen3-0.6B's config and tokenizer (~16 MB, no weights)."),
+        ),
+    ),
+    Backend(
+        id="front-back",
+        label="Front + back",
+        kind="tool",
+        best_for=("Builds characters and props from a front and a back picture: the picture "
+                  "engine draws the back, Pixal3D builds the shape from both, and Pixel Match "
+                  "paints from both, so the sides and back match your picture instead of being "
+                  "guessed."),
+        tradeoff=("Needs Pixal3D and a picture engine set up first. Each model takes a little "
+                  "longer for the back picture."),
+        license_name="MIT + DINOv3 License (Pixal3D)",
+        license_url="https://huggingface.co/raven38/pixal3d-q8_0-v1",
+        install="scripts/bootstrap_front_back.py",
+        runs_on=(APPLE, NVIDIA, AMD),
+        setup_minutes=10,
+        weights=(
+            WeightSet("Pixal3D multi-view flows (Q8_0)", "raven38/pixal3d-q8_0-v1", 5_856_899_828,
+                      _models_home.vendor_models("pixal3d-cpp") / "pixal3d-q8_0-v1",
+                      note="Only the four multi-view flows are fetched; the encoder and "
+                           "decoders are linked from the single-view set.",
+                      # The flows alone: the linked files are the single-view set's bytes.
+                      pattern="*_mv.gguf"),
+        ),
+    ),
+)
+
+BY_ID = {backend.id: backend for backend in CATALOG}
+
+def is_shared(backend: Backend, weight: WeightSet) -> bool:
+    """Whether another route also uses this file, so removing `backend` must keep it.
+
+    The background remover is listed by every route that cuts pictures out; Pixal3D's
+    Remove once offered to delete it from under TRELLIS and Hunyuan. Its own card (a
+    tool) can still remove it: that is the explicit choice."""
+    if backend.kind == "tool":
+        return False
+    return any(other.id != backend.id and any(w.path == weight.path and w.pattern == weight.pattern
+                                              for w in other.weights)
+               for other in BY_ID.values())
+
+
+# The Generate tab spells one route differently from the catalogue, and renaming either
+# would break a saved setting or a download key for no gain. One alias costs a line; two
+# half-synchronised id namespaces cost an afternoon, which is what they already cost once.
+ALIASES = {"hunyuan-mlx-xiong": "hunyuan_xiong"}
+
+
+def resolve(backend_id: str) -> Backend | None:
+    """One way to look a route up, whichever spelling the caller happens to hold."""
+    return BY_ID.get(ALIASES.get(backend_id, backend_id))
+
+
+def readiness(backend_id: str, host: str | None = None) -> dict[str, Any] | None:
+    """Is this route installed, in the shape the Generate tab's readiness strip reads.
+
+    This is the catalogue's answer, derived from the same data the Setup & Status page
+    shows, so a route is never installed according to one screen and unknown to the other.
+    Backends with a live probe of their own layer detail on top of this (which of three
+    Hunyuan checkpoints is present, how many of nine GGUF files); everything else, and
+    every image route, is served from here alone.
+
+    ``ready`` means a run can start from files already on disk. A missing weight is not
+    ready: generation does not fetch it.
+    """
+    backend = resolve(backend_id)
+    if backend is None:
+        return None
+    described = backend.describe(host)
+    sources = [w["source"] for w in described["weights"]]
+    weights = {}
+    for weight in described["weights"]:
+        source = weight["source"]
+        key = source if sources.count(source) == 1 else f"{source}#{weight['label']}"
+        weights[key] = {"label": weight["label"], "present": weight["present"],
+                        "human": weight["human_present"], "source": source}
+    missing = [w["label"] for w in described["weights"] if not w["present"]]
+    blocking = [w["label"] for w in described["weights"] if _blocks_run(w)]
+    supported = described["supported_here"]
+    built = described["build_present"]
+    hint = None
+    if not supported:
+        hint = described["platform_note"]
+    elif not built:
+        hint = f"{backend.label} is not installed — run: {backend.install_for(host)}"
+    return {
+        "schema_version": 1,
+        "backend": backend.id,
+        "build": {"present": built, "hint": hint},
+        "weights": weights,
+        "missing_weights": missing,
+        "ready": bool(supported and built and not blocking),
+        "warning": (
+            f"{backend.label} needs its weights ({described['human_expected']}) before a run. "
+            "Download them from Setup & Status. Generation does not fetch them."
+            if blocking and built and supported else None
+        ),
+        "supported_here": supported,
+        "platform_note": described["platform_note"],
+    }
+
+
+def catalog_status(host: str | None = None) -> dict[str, Any]:
+    """The whole catalogue merged with what is actually on disk, for this machine.
+
+    The host is reported alongside the backends because "nothing is installed" and "nothing
+    can be installed here" look identical in a list of states, and only one of them is
+    worth a download button.
+    """
+    host = host or host_platform()
+    backends = [backend.describe(host) for backend in sorted(CATALOG, key=_rank_key)]
+    ready = [b for b in backends if b["state"] == "ready"]
+    runnable = [b for b in backends if b["supported_here"]]
+    return {
+        "schema_version": 1,
+        # The onboarding screen exists for exactly this condition, so the server decides
+        # it rather than leaving each client to re-derive the rule.
+        "needs_onboarding": not ready,
+        "ready_count": len(ready),
+        "host": {
+            "id": host,
+            "label": host_label(host),
+            "any_backend_runs_here": bool(runnable),
+            "supported": sorted({PLATFORM_LABELS.get(p, p)
+                                 for b in CATALOG for p in b.runs_on}),
+        },
+        "backends": backends,
+        # The Setup page's tabs. Each machine family sees only the backends that run on it,
+        # worded for it; the tab for this machine is the only one with buttons.
+        "platforms": [{"id": p, "label": TAB_LABELS[p], "coming": p not in VIEW_PLATFORMS}
+                      for p in TAB_LABELS],
+        "views": {p: [b.describe(p) for b in sorted(CATALOG, key=_rank_key) if p in b.runs_on]
+                  for p in VIEW_PLATFORMS},
+    }
+
+
+def human_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _dir_state(path: Path) -> tuple[bool, int]:
+    """Whether a weight directory exists, and how many bytes are in it.
+
+    Size is what drives the progress readout during a download, so an unreadable file is
+    skipped rather than raised: a partially written cache is the normal case here, not an
+    error worth failing the whole status call for.
+    """
+    if path.is_file():
+        # A single-file model (BiRefNet-lite) shares its folder with other models, so the
+        # file is the unit, not the folder.
+        return True, path.stat().st_size
+    if not path.is_dir():
+        return False, 0
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for item in path.rglob("*"):
+        try:
+            # Count each real file once, by inode. The Hugging Face cache links
+            # `snapshots/` at `blobs/`, so counting both doubles every byte (16 GB reads
+            # as 30 GB). Newer huggingface_hub puts the blobs outside this folder
+            # entirely, so links must be followed, or 13.4 GB reads as 120 B.
+            if not item.is_file():  # follows links; a dangling one is not a file
+                continue
+            info = item.stat()
+            key = (info.st_dev, info.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += info.st_size
+        except OSError:
+            continue
+    return total > 0, total
+
+
+def _weights_state(weights: list[dict[str, Any]]) -> str:
+    """ready, partial or missing, judged against expected size rather than mere existence.
+
+    A directory that exists but holds a tenth of the bytes is an interrupted download, and
+    calling that "ready" is how someone ends up debugging a backend that was never fully
+    fetched. The 85% floor leaves room for the size constants above being approximate.
+    """
+    if not weights:
+        return "ready"
+    if all(w["bytes_present"] >= w["bytes_expected"] * 0.85 for w in weights):
+        return "ready"
+    if any(w["bytes_present"] > 0 for w in weights):
+        return "partial"
+    return "missing"
+
+
+def _blocks_run(weight: dict[str, Any]) -> bool:
+    """True when this weight would have to be fetched before a run.
+
+    A note that says the file is advisory (TinyCLIP) does not block. The 85% floor is
+    the same one ``_weights_state`` uses, so a short file and a missing file agree.
+    """
+    if "Advisory only" in (weight.get("note") or ""):
+        return False
+    expected = weight.get("bytes_expected") or 0
+    if expected <= 0:
+        return not weight.get("present")
+    return weight.get("bytes_present", 0) < expected * 0.85
+
+
+def _state(weights: list[dict[str, Any]], built: bool, setup_fetches: bool) -> str:
+    """The backend's state, which is the build and the weights together.
+
+    A built tree with no weights is not ready. Generation does not fetch them.
+    ``setup_fetches`` is still passed by callers; it no longer skips this check.
+    Offering "build" for a finished tree re-ran the bootstrap onto its own patches
+    (hit for real 2026-09-21). That choice lives in ``_action``.
+    """
+    del setup_fetches
+    if not built:
+        return "missing"
+    return _weights_state(weights)
+
+
+def _action(weights: list[dict[str, Any]], built: bool, setup_fetches: bool,
+            automated: bool = True) -> str:
+    """What the button should offer: build, fetch, resume, nothing, or a command to run.
+
+    Once the code is built, missing weights are a download. They are not another build.
+    A route the viewer cannot install shows the command instead of a button.
+    """
+    del setup_fetches
+    if not built:
+        return "build" if automated else "manual"
+    state = _weights_state(weights)
+    if state == "ready":
+        return "none"
+    if not automated:
+        return "manual"
+    return "resume" if state == "partial" else "download"
+
+
+def _percent(present: int, expected: int) -> int:
+    if expected <= 0:
+        return 100
+    return max(0, min(100, round(present / expected * 100)))
+
+
+def _rank_key(backend: Backend) -> tuple[int, str]:
+    return (backend.rank if backend.rank is not None else 99, backend.label)
