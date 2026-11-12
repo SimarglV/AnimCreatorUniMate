@@ -198,6 +198,17 @@ from motion_api import (
     status_payload as motion_status_payload,
 )
 
+import vat_api
+from vat_api import (
+    VAT_JOBS,
+    cancel_job as cancel_vat_job,
+    engine_tools as vat_engine_tools,
+    installed as vat_installed,
+    missing_note as vat_missing_note,
+    run_job as run_vat_job,
+    status_payload as vat_status_payload,
+)
+
 REPO = Path(__file__).resolve().parents[1]
 WRAPPER = REPO / "scripts" / "trellis_space_generate.py"
 PYTHON = REPO / "vendor" / "trellis-space-mac" / ".venv" / "bin" / "python"
@@ -1586,6 +1597,7 @@ HEAVY_JOBS: dict[str, Callable[[], bool]] = {
     "rebind": lambda: _running(RIG_JOBS),
     "animate": lambda: _animate_running(),
     "motion": lambda: _running(MOTION_JOBS),
+    "vat": lambda: _running(VAT_JOBS),
     "skin": lambda: skins_api.BUILDS.running(),
 }
 BUSY_WORDS = {
@@ -1594,6 +1606,7 @@ BUSY_WORDS = {
     "props": "a prop sheet is baking", "rebind": "a rig rebind is running",
     "animate": "an auto-rig or animation is running",
     "motion": "a UniMate motion job is running",
+    "vat": "a VAT export is running",
     "skin": "a skin is being made",
 }
 
@@ -2929,6 +2942,21 @@ class Handler(SimpleHTTPRequestHandler):
         if parts == ["api", "motion"]:
             self._create_motion_job()
             return
+        if parts == ["api", "vat"]:
+            self._create_vat_job()
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "vat"] and parts[3] == "cancel":
+            job = VAT_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                cancel_vat_job(job)
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._send_json(202, {"job_id": job.id, "status": job.status})
+            return
         if len(parts) == 4 and parts[:2] == ["api", "motion"] and parts[3] == "cancel":
             job = MOTION_JOBS.get(parts[2])
             if job is None:
@@ -3667,6 +3695,20 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
             return
+        if parts == ["api", "vat", "tools"]:
+            self._send_json(200, {"tools": vat_engine_tools(), "installed": vat_installed()})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "vat"]:
+            job = VAT_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if parts[3] == "events":
+                self._stream_events(job)
+                return
+            if parts[3] == "status":
+                self._send_json(200, vat_status_payload(job))
+                return
         if len(parts) == 4 and parts[:2] == ["api", "animate"]:
             job = ANIMATE_JOBS.get(parts[2])
             if job is None:
@@ -4023,6 +4065,84 @@ class Handler(SimpleHTTPRequestHandler):
         if motion_api.rig_run_of(path) is None:
             return None
         return path
+
+    def _vat_blocked(self) -> str | None:
+        waiting = busy_reason("vat")
+        if waiting:
+            return waiting
+        note = vat_missing_note()
+        if note:
+            return f"VAT export is not ready. {note}"
+        return None
+
+    def _start_vat(self, job) -> None:
+        threading.Thread(target=run_vat_job, args=(job,), daemon=True,
+                         name=f"vat-{job.id[:8]}").start()
+        self._send_json(202, {"job_id": job.id, "kind": job.kind,
+                              "events_url": f"/api/vat/{job.id}/events",
+                              "status_url": f"/api/vat/{job.id}/status"})
+
+    def _create_vat_job(self) -> None:
+        """Bake a VAT from an animated GLB: multipart with the GLB in 'asset', or JSON
+        {model: path} naming a GLB under output/ (a clip, a rigged or finished model)."""
+        try:
+            blocked = self._vat_blocked()
+            if blocked:
+                self._send_json(409, {"error": blocked})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 512 * 1024 * 1024:
+                self._send_json(400, {"error": "request is missing or larger than 512 MiB"})
+                return
+            content_type = self.headers.get("Content-Type", "")
+            source: Path | None = None
+            body: dict[str, Any] = {}
+            if "multipart" in content_type:
+                form = parse_multipart(content_type, self.rfile.read(length))
+                asset = form.get("asset")
+                if asset and str(asset.get("filename", "")).lower().endswith((".glb", ".gltf")):
+                    keep = OUTPUT_ROOT / "vat" / "uploads" / uuid.uuid4().hex[:10]
+                    keep.mkdir(parents=True, exist_ok=True)
+                    source = keep / str(asset["filename"])
+                    source.write_bytes(asset["data"])
+                else:
+                    self._send_json(422, {"error": "send an animated .glb in 'asset'"})
+                    return
+                settings_value = str((form.get("settings") or {}).get("value", "")).strip()
+                try:
+                    body = json.loads(settings_value) if settings_value else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "invalid settings JSON"})
+                    return
+            else:
+                try:
+                    body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "expected a JSON object"})
+                    return
+            if not isinstance(body, dict):
+                self._send_json(422, {"error": "expected a JSON object"})
+                return
+            if source is None:
+                chosen = str(body.get("model", "")).strip()
+                path = (OUTPUT_ROOT / chosen).resolve() if chosen else None
+                if path is None or OUTPUT_ROOT.resolve() not in path.parents or not path.is_file():
+                    self._send_json(422, {"error": f"not a model in output/: {chosen!r}"})
+                    return
+                source = path
+            try:
+                job = VAT_JOBS.create(source, str(body.get("name", "")),
+                                      body.get("fps", 30), body.get("format", "png16"),
+                                      body.get("normals", "packed"))
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._start_vat(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
 
     def _create_animate_rig(self) -> None:
         """Rig a model: a GLB uploaded in field 'asset', or one the lab made, named in

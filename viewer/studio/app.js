@@ -3,7 +3,7 @@
 
 import { STEPS, stepCount, stepDone, stepState, statusText, displayModel, stepFile, canViewStep, canFixShown, fixBlockedNote, servedUrl, visibleFamilies, madeVersion, engineOf, engineChoices, openingView, isModelFile, duration, canViewPictures, sizeText, deletionWords, linkedAssetId, statsRows, canReveal } from './library.js';
 import { createStudioViewer } from './viewer.js';
-import { readyEngines, readableLog, copyDetails, logScroll, moveBox, resizeBox } from './jobs.js';
+import { readyEngines, readableLog, copyDetails, logScroll, moveBox, resizeBox, followJob, statusUrlFor, jobEnd } from './jobs.js';
 import { stepBody, wireStep, wireBrush, wireVersions } from './steps.js';
 import { retryWant } from './plan.js';
 import { closeBrushStage } from './brush.js';
@@ -333,7 +333,6 @@ async function showModelInfo(file) {
   actions.dataset.file = info.file;
   actions.dataset.path = info.path;
 }
-
 $('revealBtn').addEventListener('click', () => {
   fetch('/api/reveal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ file: $('fileActions').dataset.file }) });
@@ -348,6 +347,61 @@ $('copyPathBtn').addEventListener('click', async (event) => {
     button.textContent = 'Copy failed';
   }
   setTimeout(() => { button.textContent = 'Copy path'; }, 1500);
+});
+
+// VAT export: bake the currently-shown animated GLB into a vertex animation texture.
+const vatFile = (relative) => ({ name: fileName(relative), url: url(relative), relative });
+const vatLinks = (tools) => {
+  const groups = new Map();
+  for (const tool of tools || []) {
+    if (!groups.has(tool.folder)) groups.set(tool.folder, []);
+    groups.get(tool.folder).push(tool);
+  }
+  return [...groups.entries()].map(([folder, files]) =>
+    `<div class="vat-tools"><span class="meta">${escape(folder === 'root' ? 'engine templates' : folder)}</span>` +
+    files.map((t) => `<a class="ghost small" href="${escape(url(t.path))}" download="${escape(t.name)}">${escape(t.name)}</a>`).join('') +
+    '</div>').join('');
+};
+$('vatBtn').addEventListener('click', async () => {
+  const button = $('vatBtn');
+  const file = $('fileActions').dataset.file;
+  if (!file) return;
+  const out = $('vatOut');
+  button.disabled = true;
+  out.hidden = false;
+  out.innerHTML = '<div class="job"><div class="bigbar"><span></span></div><p class="job-msg">Starting the VAT bake…</p></div>';
+  const bar = out.querySelector('.bigbar span'), msg = out.querySelector('.job-msg');
+  let start;
+  try {
+    start = await (await fetch('/api/vat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: file }) })).json();
+  } catch (error) {
+    out.innerHTML = `<p class="job-msg">${escape(error.message || 'Could not start the bake.')}</p>`;
+    button.disabled = false;
+    return;
+  }
+  if (!start.job_id) {
+    out.innerHTML = `<p class="job-msg">${escape(start.error || 'Could not start the bake.')}</p>`;
+    button.disabled = false;
+    return;
+  }
+  const statusUrl = statusUrlFor('vat', start);
+  const job = followJob(statusUrl, { interval: 1200, onUpdate: ({ event, percent }) => {
+    msg.textContent = event.message || event.phase || 'Baking…';
+    if (percent != null) bar.style.width = `${percent}%`; else bar.classList.add('busy');
+  } });
+  const final = await job.done;
+  button.disabled = false;
+  if (final.status !== 'done') {
+    const { why } = jobEnd(final);
+    out.innerHTML = `<p class="job-msg">${escape(why)}</p>`;
+    return;
+  }
+  const event = final.last_event || {};
+  const files = (event.files || []).map(vatFile);
+  out.innerHTML = `<p class="job-msg">VAT ready</p>` +
+    files.map((f) => `<a class="ghost small" href="${escape(f.url)}" download="${escape(f.name)}">${escape(f.name)}</a>`).join('') +
+    vatLinks(event.tools);
 });
 
 // A picture redrawn, brushed or swapped keeps its file name: ask past the browser's copy

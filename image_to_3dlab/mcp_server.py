@@ -65,10 +65,12 @@ STUDIO_ONLY = {
     "api/props": "via create / continue_asset", "api/image": "via create / continue_asset",
     "api/image/back": "via create / continue_asset", "api/animate/rig": "via create / continue_asset",
     "api/animate/play": "via create / continue_asset", "api/motion": "via create / continue_asset",
+    "api/vat": "a niche export the user starts with Export VAT in the studio",
     "api/rig/rebind": "re-rigs from the Steps panel",
     "api/generate/*/cancel": "via cancel_run", "api/finish/*/cancel": "via cancel_run",
     "api/props/*/cancel": "via cancel_run", "api/image/*/cancel": "via cancel_run",
     "api/animate/*/cancel": "via cancel_run", "api/motion/*/cancel": "via cancel_run",
+    "api/vat/*/cancel": "via cancel_run",
     "api/rig/rebind/*/cancel": "via cancel_run",
 }
 # Server actions the tools below call.

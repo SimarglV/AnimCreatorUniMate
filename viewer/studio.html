@@ -69,7 +69,9 @@
         <div class="file-actions" id="fileActions">
           <button class="ghost small" id="revealBtn" data-tip="Open the folder this file is in, with the file selected." hidden>Show in folder</button>
           <button class="ghost small" id="copyPathBtn" data-tip="Copy the file's full path on this computer.">Copy path</button>
+          <button class="ghost small" id="vatBtn" data-tip="Bake this animated GLB into a Vertex Animation Texture: a texture the engine shader samples per vertex, for cheap animated crowds. The result is a PNG + remap JSON + proxy GLB, plus Unity / Unreal / Godot templates.">Export VAT</button>
         </div>
+        <div class="vat-out" id="vatOut" hidden></div>
       </section>
       <a class="primary export" id="download" data-tip="Download this model as a GLB for Godot, Unity, Unreal, Blender or three.js." hidden download>Download GLB</a></div>
   </aside>

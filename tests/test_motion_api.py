@@ -153,8 +153,8 @@ def test_the_result_is_copied_into_the_rig_folder_when_the_animator_wrote_one(ri
     assert copy_to.read_bytes() == valid_glb()
 
 
-def test_status_payload_carries_the_log_tail_and_last_event():
-    job = ma.MotionJob("1" * 32, Path("."), Path("out.glb"), [], 10.0, {}, None)
+def test_status_payload_carries_the_log_tail_and_last_event(tmp_path):
+    job = ma.MotionJob("1" * 32, tmp_path, tmp_path / "out.glb", [], 10.0, {}, None)
     job.append_log("sampling")
     job.emit({"phase": "running", "message": "Sampling motion from the prompt"})
     payload = ma.status_payload(job)

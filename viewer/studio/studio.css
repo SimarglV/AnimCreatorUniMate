@@ -428,3 +428,10 @@ img.glow { animation: doorglow 2.4s ease-in-out infinite; }
 /* UniMate text-to-motion, offered inside the Animate step */
 .motion-box { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .motion-box textarea { width: 100%; resize: vertical; }
+
+/* VAT export results under the file card */
+.vat-out { display: grid; gap: 6px; margin-top: 8px; }
+.vat-out .job-msg { margin: 0 0 2px; }
+.vat-out a { justify-self: start; }
+.vat-tools { display: grid; gap: 3px; margin-top: 4px; }
+.vat-tools .meta { margin-top: 4px; }

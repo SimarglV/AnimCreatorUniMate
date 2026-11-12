@@ -41,6 +41,9 @@ sentence / picture → 3D model → finish → rig → UniMate motion → animat
 - **Your pick of models, all local.** Pixal3D, TRELLIS.2 and Hunyuan3D behind one studio and
   one CLI. Nothing is uploaded anywhere.
 - **Game-size files.** The animated GLB opens in Godot, Unity, Unreal, Blender or three.js.
+- **VAT export.** One click bakes the animated GLB into a Vertex Animation Texture (texture +
+  remap JSON + proxy mesh) with Unity / Unreal / Godot templates, for cheap vertex-animated
+  crowds.
 - **Agents can drive it.** Claude Code, Codex and other MCP clients make, check and tweak
   assets for you (`docs/agents.md`).
 - **Know what you can ship.** Every file carries a `.provenance.json` record of the licences
