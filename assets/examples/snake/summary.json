@@ -2,7 +2,7 @@
   "name": "Snake",
   "profile": "general",
   "inputs": [
-    "G:\\UniMate\\assets\\sources\\Snake.fbx"
+    "assets/sources/Snake.fbx"
   ],
   "annotate": "file",
   "annotation": "outputs\\rig\\snake\\annotation.json",

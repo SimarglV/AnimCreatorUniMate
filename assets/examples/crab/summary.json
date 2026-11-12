@@ -2,7 +2,7 @@
   "name": "Crab",
   "profile": "general",
   "inputs": [
-    "G:\\UniMate\\assets\\sources\\Crab.FBX"
+    "assets/sources/Crab.FBX"
   ],
   "annotate": "file",
   "annotation": "outputs\\rig\\crab\\annotation.json",
