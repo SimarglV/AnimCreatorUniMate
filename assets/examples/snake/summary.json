@@ -1,0 +1,44 @@
+{
+  "name": "Snake",
+  "profile": "general",
+  "inputs": [
+    "G:\\UniMate\\assets\\sources\\Snake.fbx"
+  ],
+  "annotate": "file",
+  "annotation": "outputs\\rig\\snake\\annotation.json",
+  "animated": false,
+  "n_joints_export": 18,
+  "rig_glb": null,
+  "stats_dataset": "general",
+  "dropped_translation": {
+    "max_share_of_extent": 0.0,
+    "clip": null,
+    "joint": null
+  },
+  "face_pair": {
+    "r_hip": {
+      "raw": "A_Bone01",
+      "clean": "Hips"
+    },
+    "l_hip": {
+      "raw": "A_Bone13",
+      "clean": "Tail End"
+    },
+    "source": "body_axis",
+    "body_axis": true
+  },
+  "annotation_notes": [
+    "annotation from outputs\\rig\\snake\\annotation.json"
+  ],
+  "n_joints": 18,
+  "model_joint_limit": {
+    "max_joints": 71,
+    "source": "released UniML3D models",
+    "fits": true
+  },
+  "n_clips": 0,
+  "cond": "outputs/rig/snake\\cond.npy",
+  "canonical_glb": "outputs/rig/snake\\Snake.glb",
+  "notes": [],
+  "preview": "outputs/rig/snake\\preview.png"
+}

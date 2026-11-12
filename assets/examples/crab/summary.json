@@ -1,0 +1,43 @@
+{
+  "name": "Crab",
+  "profile": "general",
+  "inputs": [
+    "G:\\UniMate\\assets\\sources\\Crab.FBX"
+  ],
+  "annotate": "file",
+  "annotation": "outputs\\rig\\crab\\annotation.json",
+  "animated": false,
+  "n_joints_export": 31,
+  "rig_glb": null,
+  "stats_dataset": "general",
+  "dropped_translation": {
+    "max_share_of_extent": 0.0,
+    "clip": null,
+    "joint": null
+  },
+  "face_pair": {
+    "r_hip": {
+      "raw": "Bone22",
+      "clean": "Right Front Leg"
+    },
+    "l_hip": {
+      "raw": "Bone02",
+      "clean": "Left Front Leg"
+    },
+    "source": "reviewed"
+  },
+  "annotation_notes": [
+    "annotation from outputs\\rig\\crab\\annotation.json"
+  ],
+  "n_joints": 31,
+  "model_joint_limit": {
+    "max_joints": 71,
+    "source": "released UniML3D models",
+    "fits": true
+  },
+  "n_clips": 0,
+  "cond": "outputs/rig/crab\\cond.npy",
+  "canonical_glb": "outputs/rig/crab\\Crab.glb",
+  "notes": [],
+  "preview": "outputs/rig/crab\\preview.png"
+}

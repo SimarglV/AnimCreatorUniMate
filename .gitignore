@@ -1,0 +1,26 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtual environments (the installer recreates .venv)
+.venv/
+venv/
+env/
+
+# ── UniMate runtime outputs (regenerated / downloadable) ────────────────────
+# Checkpoints, samples, imported rigs, VAT exports, WebUI history, and the
+# UniML3D dataset are all reproduced locally and must not be committed.
+outputs/
+dataset/
+data/
+
+# ── OS / editor ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
