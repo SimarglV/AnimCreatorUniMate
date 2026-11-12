@@ -60,8 +60,9 @@ if exist "%CKPT%" (
 echo.
 echo ================================================
 echo   Done.
-echo   Start the WebUI:   run_webui.bat
-echo   (or:  python webui.py   then open http://127.0.0.1:7860)
+echo   UniMate's environment is ready.
+echo   Next: install the studio (install_studio.ps1), then start it with:
+echo     .\lab          (or  run.bat)
 echo ================================================
 pause
 exit /b 0

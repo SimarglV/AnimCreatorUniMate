@@ -12,8 +12,8 @@ venv/
 env/
 
 # ── UniMate runtime outputs (regenerated / downloadable) ────────────────────
-# Checkpoints, samples, imported rigs, VAT exports, WebUI history, and the
-# UniML3D dataset are all reproduced locally and must not be committed.
+# Checkpoints, samples, imported rigs and the UniML3D dataset are all
+# reproduced locally and must not be committed.
 outputs/
 dataset/
 data/
@@ -70,7 +70,5 @@ manifests/*.json
 AGENTS.local.md
 CLAUDE.local.md
 
-# UniMate webui history
-outputs/webui/
 .venv-studio/
 models/

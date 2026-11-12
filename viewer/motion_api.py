@@ -44,7 +44,7 @@ from image_to_3dlab import host, processes
 from image_to_3dlab.provenance import set_glb_generator, write_provenance
 
 OUTPUT_ROOT = REPO / "output" / "motion"
-# The UniMate checkpoint the sampler loads (same path the Gradio webui.py uses).
+# The UniMate checkpoint the sampler loads.
 EXP_DIR = REPO / "outputs" / "unimate_uniml3d_f60_v3"
 CHECKPOINT = EXP_DIR / "checkpoints" / "checkpoint_step_150000.pt"
 PROMPTS_FILE = REPO / "image_to_3dlab" / "unimate_prompts.json"

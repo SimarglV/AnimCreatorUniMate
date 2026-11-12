@@ -26,7 +26,7 @@ route) behind one CLI, with license provenance as a first-class concern.
    It is git-ignored on purpose: never commit it or quote it in commits, PRs or docs.
 
 5. **Two environments.** UniMate's own code (`.venv`, Python 3.10: sampling,
-   `rig_preprocess`, mesh animation, `webui.py`) and the studio (`.venv-studio`, Python
+   `rig_preprocess`, mesh animation) and the studio (`.venv-studio`, Python
    3.11: the server, engines, rigging, MCP) pin conflicting numpy versions and must stay
    separate. The Motion step (`viewer/motion_api.py`) shells out from the studio to
    `.venv`; keep that bridge, never merge the pins.
@@ -41,8 +41,7 @@ route) behind one CLI, with license provenance as a first-class concern.
 | `unimate/` | UniMate's own model: training, inference, the sampler and the text encoder |
 | `data_process/` | UniMate's dataset pipeline and `rig_preprocess` (the Motion step's adapt stage) |
 | `assets/`, `configs/` | UniMate's example rigs and training configs |
-| `webui.py` | UniMate's research WebUI (Gradio, unchanged) — runs in `.venv` |
-| `outputs/` | UniMate's own outputs: checkpoints (`outputs/unimate_uniml3d_f60_v3`), samples, rigs, VAT |
+| `outputs/` | UniMate's own outputs: checkpoints (`outputs/unimate_uniml3d_f60_v3`), samples, rigs |
 | `output/` | Studio-generated assets + `.provenance.json` sidecars (git-ignored) |
 | `install.bat` / `install.sh` | UniMate's environment + checkpoint (asks first) |
 | `install_studio.ps1` / `install_studio.sh` | The studio's `.venv-studio` (packages only) |

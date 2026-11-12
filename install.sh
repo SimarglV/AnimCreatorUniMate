@@ -56,6 +56,7 @@ fi
 echo
 echo "================================================"
 echo "  Done."
-echo "  Start the WebUI:   bash run_webui.sh"
-echo "  (or:  .venv/bin/python webui.py   then open http://127.0.0.1:7860)"
+echo "  UniMate's environment is ready."
+echo "  Next: install the studio (install_studio.sh), then start it with:"
+echo "    ./lab          (or  run.bat on Windows)"
 echo "================================================"

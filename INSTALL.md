@@ -1,7 +1,7 @@
 # Установка UniMate Studio
 
-Эта инструкция — как развернуть проект на новом компьютере с нуля. Она объединяет два
-компонента: **UniMate** (text-to-motion, Python 3.10) и **студию AssetFurnace**
+Как развернуть проект на новом компьютере с нуля. Проект объединяет **UniMate**
+(text-to-motion, Python 3.10) и **студию AssetFurnace**
 (картинка/фраза → 3D → риг → анимация, Python 3.11).
 
 ```text
@@ -25,7 +25,7 @@
 - **нужно:** весь остальной код + установщики (`install.bat`, `install.sh`,
   `install_studio.ps1`, `install_studio.sh`, `lab`, `lab.cmd`, `run.bat`)
 
-Если репозиторий закоммичен — достаточно `git clone`.
+Либо, если репозиторий закоммичен — `git clone`.
 
 ## 3. Установка
 
@@ -33,7 +33,7 @@
 
 | Окружение | Python | Что в нём работает | Установщик |
 |---|---|---|---|
-| `.venv` | 3.10 | UniMate: сэмплинг движения, `rig_preprocess`, анимация меша, WebUI | `install.bat` / `install.sh` — скачивает чекпойнт (~6 ГБ) |
+| `.venv` | 3.10 | UniMate: сэмплинг движения, `rig_preprocess`, анимация меша | `install.bat` / `install.sh` — скачивает чекпойнт (~6 ГБ) |
 | `.venv-studio` | 3.11 | Студия, движки, риг, MCP | `install_studio.ps1` / `install_studio.sh` — только пакеты |
 
 ### Windows
@@ -41,7 +41,7 @@
 ```powershell
 install.bat            # UniMate: .venv + чекпойнт (спросит перед ~6 ГБ)
 powershell -ExecutionPolicy ByPass -File install_studio.ps1   # студия: .venv-studio
-.\lab                  # открыть студию в браузере
+.\lab                  # открыть студию в браузере (run.bat — то же самое)
 ```
 
 ### Linux
@@ -57,10 +57,11 @@ bash install_studio.sh
 В студии (`http://127.0.0.1:8777`):
 
 1. **Setup & Status** → нажать **Set up** у **Pixal3D** (~8.4 ГБ, спросит размер и лицензию).
+   TRELLIS.2 и Hunyuan3D-2.1 — только Linux + NVIDIA.
 2. Поставить **Blender 4.2+** самостоятельно (нужен для Finish — низкополигональной
    чистки и Pixel Match). Карточка Blender на той же странице покажет, найден ли он.
-3. Карточка **UniMate** уже должна быть зелёной (✓ ready) — это значит, что чекпойнт
-   из шага 3 на месте.
+3. Карточка **UniMate** уже должна быть зелёной (✓ ready) — значит чекпойнт из шага 3
+   на месте.
 
 Дальше: **+ Create** → «Start from: An idea» → «I want: A character moved by text» →
 опишите персонажа и напишите промпт движения (например `An object walks forward.`) →
@@ -84,9 +85,7 @@ models/
 
 ## 6. Запуск
 
-- `run.bat` — меню выбора: **1** = студия, **2** = WebUI (старый Gradio для движения по
-  готовому ригу).
-- `.\lab` / `./lab` — сразу студия.
+- `run.bat` (Windows) / `./lab` (Linux) — студия.
 - `.\lab mcp` — MCP-сервер для агентов (Claude Code и т.п.).
 
 ## 7. Примечания
@@ -101,5 +100,4 @@ models/
   помечается в `.provenance.json` как не для коммерческого использования); студия —
   Apache-2.0 (`LICENSE-ASSETFURNACE-APACHE` + `NOTICE`).
 
-Проблемы при установке — `run_webui.bat` / `.\lab` выводят ошибку с подсказкой, что
-именно отсутствует.
+Проблемы при установке — `.\lab` выводит ошибку с подсказкой, что именно отсутствует.
