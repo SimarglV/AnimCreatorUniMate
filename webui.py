@@ -641,7 +641,7 @@ def restore(run_id):
     """Restore a past generation's settings and outputs."""
     rec = HISTORY.get(run_id)
     if not rec:
-        return [gr.update()] * 14
+        return [gr.update()] * 15
     model3d = _viewer_html(rec.get("model3d"))
     return (
         rec.get("asset_key"),

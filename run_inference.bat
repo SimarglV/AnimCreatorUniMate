@@ -7,7 +7,7 @@ echo ================================================
 echo   UniMate - text-to-motion + mesh animation
 echo ================================================
 
-if not exist ".venv\Scripts\activate.bat" (
+if not exist ".venv\Scripts\python.exe" (
     echo [ERROR] Virtual environment not found - .venv missing.
     echo         Run the install steps first.
     pause
@@ -25,26 +25,24 @@ if not exist "%EXP_DIR%\checkpoints\checkpoint_step_150000.pt" (
     exit /b 1
 )
 
-call ".venv\Scripts\activate.bat"
-
 echo.
 echo [1/3] Unitree Go2 (quadruped) ...
-python -m unimate.inference.sample --exp_dir "%EXP_DIR%" --asset assets/examples/unitree_go2 --prompt "An object trots forward." "An object rears up on its hind legs." --output_dir "%OUT_DIR%"
+".venv\Scripts\python.exe" -m unimate.inference.sample --exp_dir "%EXP_DIR%" --asset assets/examples/unitree_go2 --prompt "An object trots forward." "An object rears up on its hind legs." --output_dir "%OUT_DIR%"
 if errorlevel 1 goto :err
 
 echo.
 echo [2/3] Eagle (bird) ...
-python -m unimate.inference.sample --exp_dir "%EXP_DIR%" --asset assets/examples/eagle --prompt "An object flaps its wings." "An object strikes forward." --output_dir "%OUT_DIR%"
+".venv\Scripts\python.exe" -m unimate.inference.sample --exp_dir "%EXP_DIR%" --asset assets/examples/eagle --prompt "An object flaps its wings." "An object strikes forward." --output_dir "%OUT_DIR%"
 if errorlevel 1 goto :err
 
 echo.
 echo [3/3] Shark (fish) ...
-python -m unimate.inference.sample --exp_dir "%EXP_DIR%" --asset assets/examples/shark --prompt "An object swims and turns around." "An object bites forward." --output_dir "%OUT_DIR%"
+".venv\Scripts\python.exe" -m unimate.inference.sample --exp_dir "%EXP_DIR%" --asset assets/examples/shark --prompt "An object swims and turns around." "An object bites forward." --output_dir "%OUT_DIR%"
 if errorlevel 1 goto :err
 
 echo.
 echo [4/4] Animating meshes (GLB + FBX) ...
-python scripts/animate_samples.py "%OUT_DIR%"
+".venv\Scripts\python.exe" scripts/animate_samples.py "%OUT_DIR%"
 if errorlevel 1 goto :err
 
 echo.

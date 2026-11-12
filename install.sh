@@ -30,17 +30,15 @@ echo "Using $("$PY" --version)"
 echo
 echo "[1/4] Creating virtual environment (.venv) ..."
 "$PY" -m venv .venv
-# shellcheck disable=SC1091
-source .venv/bin/activate
 
 # ── 3. Install dependencies ─────────────────────────────────────────────────
 echo
 echo "[2/4] Installing setuptools<81 ..."
-python -m pip install --upgrade pip "setuptools<81"
+.venv/bin/python -m pip install --upgrade pip "setuptools<81"
 
 echo
 echo "[3/4] Installing dependencies (this can take several minutes) ..."
-python -m pip install -r requirements.txt --no-build-isolation
+.venv/bin/python -m pip install -r requirements.txt --no-build-isolation
 
 # ── 4. Download the checkpoint ──────────────────────────────────────────────
 CKPT="outputs/unimate_uniml3d_f60_v3/checkpoints/checkpoint_step_150000.pt"
@@ -49,7 +47,7 @@ echo "[4/4] Downloading the model checkpoint ..."
 if [ -f "$CKPT" ]; then
     echo "        Already present: $CKPT"
 else
-    hf download Linzhan/UniMate --repo-type model --local-dir outputs \
+    .venv/bin/hf download Linzhan/UniMate --repo-type model --local-dir outputs \
         --include "unimate_uniml3d_f60_v3/*.json" \
         --include "unimate_uniml3d_f60_v3/*.npy" \
         --include "unimate_uniml3d_f60_v3/checkpoints/checkpoint_step_150000.pt"
@@ -59,5 +57,5 @@ echo
 echo "================================================"
 echo "  Done."
 echo "  Start the WebUI:   bash run_webui.sh"
-echo "  (or:  python webui.py   then open http://127.0.0.1:7860)"
+echo "  (or:  .venv/bin/python webui.py   then open http://127.0.0.1:7860)"
 echo "================================================"

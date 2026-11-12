@@ -31,17 +31,16 @@ echo.
 echo [1/4] Creating virtual environment (.venv) ...
 %PY% -m venv .venv
 if errorlevel 1 goto :err
-call ".venv\Scripts\activate.bat"
 
 REM ── 3. Install dependencies ──────────────────────────────────────────────
 echo.
 echo [2/4] Installing setuptools^<81 ...
-python -m pip install --upgrade pip "setuptools<81"
+".venv\Scripts\python.exe" -m pip install --upgrade pip "setuptools<81"
 if errorlevel 1 goto :err
 
 echo.
 echo [3/4] Installing dependencies (this can take several minutes) ...
-python -m pip install -r requirements.txt --no-build-isolation
+".venv\Scripts\python.exe" -m pip install -r requirements.txt --no-build-isolation
 if errorlevel 1 goto :err
 
 REM ── 4. Download the checkpoint ───────────────────────────────────────────

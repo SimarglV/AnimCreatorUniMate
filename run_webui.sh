@@ -12,12 +12,9 @@ if [ ! -f "outputs/unimate_uniml3d_f60_v3/checkpoints/checkpoint_step_150000.pt"
     exit 1
 fi
 
-# shellcheck disable=SC1091
-source .venv/bin/activate
-
 echo
 echo "Starting UniMate WebUI at http://127.0.0.1:7860"
 echo "Press Ctrl+C to stop."
 echo
 
-python webui.py
+.venv/bin/python webui.py
