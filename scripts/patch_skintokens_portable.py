@@ -112,6 +112,21 @@ EDITS: tuple[Edit, ...] = (
          'PORT = int(os.environ.get("SKINTOKENS_PORT", "59875"))\n'),
     Edit("src/server/spec.py", "BPY_PORT = 59876\n",
          'BPY_PORT = int(os.environ.get("SKINTOKENS_BPY_PORT", "59876"))\n'),
+    # diffusers removed `LayerNorm` from `models.normalization` (its requirements pin only
+    # `>=0.35.0`, so a fresh venv pulls a version without it). `torch.nn.LayerNorm` is the
+    # same layer (same signature for a single-dim call), and torch is always there.
+    Edit("src/model/skin_vae/autoencoders/autoencoder_kl_tripo2.py",
+         "from diffusers.models.normalization import LayerNorm",
+         "from torch.nn import LayerNorm"),
+    Edit("src/model/skin_vae/transformers/tripo2_transformer.py",
+         "from diffusers.models.normalization import (\n"
+         "    AdaLayerNormContinuous,\n"
+         "    FP32LayerNorm,\n"
+         "    LayerNorm,\n",
+         "from torch.nn import LayerNorm\n"
+         "from diffusers.models.normalization import (\n"
+         "    AdaLayerNormContinuous,\n"
+         "    FP32LayerNorm,\n"),
 )
 
 
