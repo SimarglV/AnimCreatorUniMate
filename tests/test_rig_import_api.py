@@ -63,6 +63,60 @@ def test_analyze_refuses_bad_profile_and_mode(env, monkeypatch):
         ri.RIG_IMPORT_JOBS.create_analyze(source, "r", annotate="wobbly")
 
 
+def test_llm_analyze_passes_the_openai_compatible_server(env, monkeypatch):
+    python = env / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ri, "venv_python", lambda: python)
+    source = env / "r.glb"
+    source.write_bytes(b"g")
+    job = ri.RIG_IMPORT_JOBS.create_analyze(source, "r", annotate="llm",
+                                            model="gemma-4-12b-it", backend="openai",
+                                            base_url="http://127.0.0.1:1234/v1")
+    cmd = job.command
+    assert cmd[cmd.index("--annotate") + 1] == "llm"
+    assert cmd[cmd.index("--model") + 1] == "gemma-4-12b-it"
+    assert cmd[cmd.index("--backend") + 1] == "openai"
+    assert cmd[cmd.index("--base_url") + 1] == "http://127.0.0.1:1234/v1"
+    assert "--api_key" not in cmd      # LM Studio / Ollama / vLLM need no key
+
+
+def test_llm_analyze_passes_a_local_hf_model(env, monkeypatch):
+    python = env / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ri, "venv_python", lambda: python)
+    source = env / "r.glb"
+    source.write_bytes(b"g")
+    job = ri.RIG_IMPORT_JOBS.create_analyze(source, "r", annotate="llm",
+                                            model="Qwen/Qwen3-8B", backend="local")
+    cmd = job.command
+    assert cmd[cmd.index("--backend") + 1] == "local"
+    assert cmd[cmd.index("--model") + 1] == "Qwen/Qwen3-8B"
+    assert "--base_url" not in cmd
+
+
+def test_llm_analyze_needs_a_model_and_a_valid_backend(env, monkeypatch):
+    python = env / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ri, "venv_python", lambda: python)
+    source = env / "r.glb"
+    source.write_bytes(b"g")
+    with pytest.raises(ValueError, match="needs a model"):
+        ri.RIG_IMPORT_JOBS.create_analyze(source, "r", annotate="llm")
+    with pytest.raises(ValueError, match="backend"):
+        ri.RIG_IMPORT_JOBS.create_analyze(source, "r", annotate="llm", model="m", backend="wobbly")
+
+
+def test_rule_analyze_sends_no_llm_flags(env, monkeypatch):
+    python = env / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ri, "venv_python", lambda: python)
+    source = env / "r.glb"
+    source.write_bytes(b"g")
+    job = ri.RIG_IMPORT_JOBS.create_analyze(source, "r", annotate="rule")
+    assert "--model" not in job.command and "--backend" not in job.command
+    assert "--base_url" not in job.command and "--api_key" not in job.command
+
+
 def test_build_writes_the_reviewed_annotation_and_runs_with_it(env, monkeypatch):
     python = env / "fake-python"
     python.write_bytes(b"x")

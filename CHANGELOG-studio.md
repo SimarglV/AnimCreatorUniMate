@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `install_studio.sh` for the studio's packages, and `lab` / `lab.cmd` start it.
 - Setup & Status shows a **UniMate** card (what is missing, nothing downloaded from there).
 
+- **Import rig** (UniMate's own workflow): upload a rigged GLB/glTF/FBX, review and fix the
+  joint labels and the facing pair, then build the asset (cond.npy + canonical GLB) and animate
+  it. Imported rigs appear in the Library as rigged characters. Joint labels can now come from
+  an **LLM** as well as the offline rules — a local HuggingFace model, or any OpenAI-compatible
+  server (LM Studio, Ollama, vLLM) via its base URL, which needs no API key.
+
 ### Changed
 - The studio is branded **UniMate** (the AssetFurnace design stays). The write marker header
   is `X-UniMate-Request`; usage counts and the notice feed are off by default (no collection

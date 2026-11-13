@@ -27,6 +27,23 @@ export function openRigImport({ stage, ctx, onResult }) {
             <option value="auto">auto</option><option value="general">general</option>
             <option value="objaverse">objaverse</option><option value="truebones">truebones</option></select></label>
         </div>
+        <label class="field">Joint labels<select data-annotate>
+          <option value="rule">rules (offline, no model)</option><option value="llm">an LLM (local or API)</option></select></label>
+        <div data-llm hidden>
+          <div class="row">
+            <label class="field">Backend<select data-backend>
+              <option value="openai">OpenAI-compatible server (LM Studio / Ollama / vLLM)</option>
+              <option value="local">local HuggingFace model</option></select></label>
+            <label class="field">Model<input type="text" data-model placeholder="the name your server shows"></label>
+          </div>
+          <div class="row">
+            <label class="field">Base URL <span class="hint">LM Studio: http://127.0.0.1:1234/v1</span><input type="text" data-base-url value="http://127.0.0.1:1234/v1"></label>
+            <label class="field">API key <span class="hint">blank for a local server</span><input type="text" data-api-key placeholder="(none)"></label>
+          </div>
+          <p class="hint" data-local-note hidden>A local model is fetched from Hugging Face on first use (size depends on
+            the model) and loads into UniMate's own environment. Keep the rig in rule mode if
+            you would rather not download one.</p>
+        </div>
         <label class="check"><input type="checkbox" data-clips><span>Keep the asset's clips <span class="hint">for in-betweening / editing</span></span></label>
         <button type="submit" class="primary">Analyse</button>
       </div>
@@ -43,6 +60,13 @@ export function openRigImport({ stage, ctx, onResult }) {
   const name = $('[data-name]');
   const profile = $('[data-profile]');
   const clips = $('[data-clips]');
+  const annotate = $('[data-annotate]');
+  const llmBox = $('[data-llm]');
+  const backend = $('[data-backend]');
+  const model = $('[data-model]');
+  const baseUrl = $('[data-base-url]');
+  const apiKey = $('[data-api-key]');
+  const localNote = $('[data-local-note]');
   const out = $('[data-out]');
   const fail = (message) => { const e = $('[data-error]'); e.textContent = message; e.hidden = false; };
   const progress = (text) => {
@@ -55,6 +79,19 @@ export function openRigImport({ stage, ctx, onResult }) {
   drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); upload.click(); } };
   upload.onchange = () => { drop.textContent = upload.files[0]?.name || 'Drop a rigged GLB / glTF / FBX here, or click to choose'; };
 
+  const llmSettings = () => {
+    if (annotate.value !== 'llm') return {};
+    return { model: model.value.trim(), backend: backend.value, base_url: baseUrl.value.trim(),
+      api_key: apiKey.value.trim() };
+  };
+  const syncLlm = () => {
+    llmBox.hidden = annotate.value !== 'llm';
+    localNote.hidden = backend.value !== 'local';
+  };
+  annotate.onchange = syncLlm;
+  backend.onchange = syncLlm;
+  syncLlm();
+
   let analysed = null;   // { directory, annotation, source }
 
   const runAnalyse = async () => {
@@ -66,11 +103,11 @@ export function openRigImport({ stage, ctx, onResult }) {
       const form = new FormData();
       form.append('asset', file);
       form.append('settings', JSON.stringify({ name: name.value.trim(), profile: profile.value,
-        annotate: 'rule', rest_rotation: '', save_clips: clips.checked }));
+        annotate: annotate.value, ...llmSettings(), rest_rotation: '', save_clips: clips.checked }));
       body = form;
     } else {
       body = JSON.stringify({ path: pathValue, name: name.value.trim(), profile: profile.value,
-        annotate: 'rule', rest_rotation: '', save_clips: clips.checked });
+        annotate: annotate.value, ...llmSettings(), rest_rotation: '', save_clips: clips.checked });
     }
     const { bar, msg } = progress('Analysing…');
     let start;

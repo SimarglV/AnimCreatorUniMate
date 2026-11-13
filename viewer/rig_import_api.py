@@ -40,6 +40,7 @@ ANALYZE_SECONDS = 60.0
 BUILD_SECONDS = 60.0
 PROFILES = ("auto", "general", "objaverse", "truebones")
 ANNOTATE_MODES = ("rule", "llm")
+LLM_BACKENDS = ("local", "openai")
 
 
 def venv_python() -> Path:
@@ -122,7 +123,8 @@ class RigImportManager:
     def create_analyze(self, source: Path, name: str, profile: str = "auto",
                        annotate: str = "rule", face_r: str = "", face_l: str = "",
                        body_axis: bool = False, rest_rotation: str = "",
-                       save_clips: bool = False) -> RigImportJob:
+                       save_clips: bool = False, model: str = "", backend: str = "",
+                       base_url: str = "", api_key: str = "") -> RigImportJob:
         with self.lock:
             if self.busy():
                 raise RuntimeError("an Import job is already running")
@@ -130,12 +132,25 @@ class RigImportManager:
                 raise ValueError(f"profile is one of {', '.join(PROFILES)}")
             if annotate not in ANNOTATE_MODES:
                 raise ValueError(f"annotate is one of {', '.join(ANNOTATE_MODES)}")
+            if backend.strip() and backend not in LLM_BACKENDS:
+                raise ValueError(f"backend is one of {', '.join(LLM_BACKENDS)}")
+            if annotate == "llm" and not model.strip():
+                raise ValueError("LLM labelling needs a model (an HF id, or the name your "
+                                 "local server shows)")
             if bool(face_r) != bool(face_l):
                 raise ValueError("the facing pair is two joints, or neither")
             outdir = self._outdir(name)
             command = [str(venv_python()), "-m", "data_process.rig_preprocess", "run",
                        "--input", str(source), "--output_dir", str(outdir),
                        "--profile", profile, "--annotate", annotate]
+            if annotate == "llm":
+                command += ["--model", model.strip()]
+                if backend.strip():
+                    command += ["--backend", backend.strip()]
+                if base_url.strip():
+                    command += ["--base_url", base_url.strip()]
+                if api_key.strip():
+                    command += ["--api_key", api_key.strip()]
             if face_r and face_l:
                 command += ["--face_r", face_r.strip(), "--face_l", face_l.strip()]
             if body_axis:

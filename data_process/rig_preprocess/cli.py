@@ -99,10 +99,14 @@ def _add_verify(sub):
 
 
 def _llm_configured(args):
-    """Whether the LLM backend of *args* can run: a local model, or an API key
-    for the model (``--api_key`` or its environment variable)."""
-    from data_process.joint_annotation.llm import BACKEND_LOCAL, detect_backend
+    """Whether the LLM backend of *args* can run: a local model, a local
+    OpenAI-compatible server (``--backend openai`` with a loopback ``--base_url``,
+    e.g. LM Studio), or an API key for the model (``--api_key`` or its env var)."""
+    from data_process.joint_annotation.llm import (
+        BACKEND_LOCAL, BACKEND_OPENAI, detect_backend, is_local_base_url)
     if (args.backend or detect_backend(args.model)) == BACKEND_LOCAL or args.api_key:
+        return True
+    if args.backend == BACKEND_OPENAI and is_local_base_url(args.base_url):
         return True
     var = 'DEEPSEEK_API_KEY' if args.model.startswith('deepseek') else 'OPENAI_API_KEY'
     return bool(os.environ.get(var))

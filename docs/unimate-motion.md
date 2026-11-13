@@ -17,6 +17,17 @@ labels and the facing pair, then build the asset (cond.npy + canonical GLB) and 
 Imported rigs show up in the Library as rigged characters, so they can be animated again
 later from the Steps panel's Animate step.
 
+Joint labels come from one of two sources, chosen in the Import rig form:
+
+- **rules** (default) — offline, no model, no key;
+- **an LLM** — a local HuggingFace model, or any **OpenAI-compatible server** (LM Studio,
+  Ollama, vLLM) by its base URL. A server on this machine needs no API key, so leave the key
+  blank. A local model is fetched from Hugging Face on first use and loads into UniMate's
+  own environment.
+
+LLM labelling is still a first pass: check and fix the labels and the facing pair before
+you build, exactly as with the rules.
+
 The same UniMate motion runs on humanoid characters through the normal pipeline
 (**Create → A character moved by text**, or the Animate step after the rig).
 

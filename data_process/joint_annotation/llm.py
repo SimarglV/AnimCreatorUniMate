@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import tempfile
+from urllib.parse import urlparse
 
 from loguru import logger
 
@@ -44,6 +45,20 @@ def detect_backend(model_name):
     if model_name.startswith(("gpt-", "o1", "o3", "o4", "deepseek")):
         return BACKEND_OPENAI
     return BACKEND_LOCAL
+
+
+def is_local_base_url(base_url):
+    # type: (str) -> bool
+    """Whether *base_url* points at an OpenAI-compatible server on this machine
+    (LM Studio, Ollama, vLLM). Those need no API key, unlike the hosted APIs."""
+    if not base_url:
+        return False
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    if host is None and "://" not in base_url:
+        parsed = urlparse("http://" + base_url)
+        host = parsed.hostname
+    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,12 +138,17 @@ def generate_openai(system_prompt, user_prompt, model_name, api_key, base_url,
         key_var = "DEEPSEEK_API_KEY" if is_deepseek else "OPENAI_API_KEY"
         api_key = os.environ.get(key_var)
         if api_key is None:
-            # Fail loudly: with api_key=None the OpenAI client silently falls
-            # back to OPENAI_API_KEY, which sends the wrong vendor's key to a
-            # DeepSeek endpoint (and produces a confusing 401).
-            raise RuntimeError(
-                "{} is not set (and no --api_key given) for model {!r}.".format(
-                    key_var, model_name))
+            if is_local_base_url(base_url):
+                # A local OpenAI-compatible server (LM Studio, Ollama, vLLM)
+                # ignores the key but the client still sends one.
+                api_key = "local"
+            else:
+                # Fail loudly: with api_key=None the OpenAI client silently falls
+                # back to OPENAI_API_KEY, which sends the wrong vendor's key to a
+                # DeepSeek endpoint (and produces a confusing 401).
+                raise RuntimeError(
+                    "{} is not set (and no --api_key given) for model {!r}.".format(
+                        key_var, model_name))
     if base_url is None and is_deepseek:
         base_url = DEEPSEEK_BASE_URL
     client = OpenAI(api_key=api_key, base_url=base_url)

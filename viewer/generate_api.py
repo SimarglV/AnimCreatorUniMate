@@ -4294,7 +4294,9 @@ class Handler(SimpleHTTPRequestHandler):
                     source, str(body.get("name", "")), str(body.get("profile", "auto")),
                     str(body.get("annotate", "rule")), str(body.get("face_r", "")),
                     str(body.get("face_l", "")), bool(body.get("body_axis")),
-                    str(body.get("rest_rotation", "")), bool(body.get("save_clips")))
+                    str(body.get("rest_rotation", "")), bool(body.get("save_clips")),
+                    str(body.get("model", "")), str(body.get("backend", "")),
+                    str(body.get("base_url", "")), str(body.get("api_key", "")))
             except ValueError as exc:
                 self._send_json(422, {"error": str(exc)})
                 return
