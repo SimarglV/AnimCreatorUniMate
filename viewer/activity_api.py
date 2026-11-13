@@ -108,6 +108,7 @@ class Chain:
     back_settings: dict[str, Any] = field(default_factory=dict)      # a back redraw: seed, what to change
     model_seed: int | None = None                                    # a fresh 3D try each time; None = engine default
     keep_everything: bool = False                                    # the 3D step keeps its textures, meshes, caches
+    rigged_upload: bool = False                                       # the uploaded model already has a skeleton
     finish_settings: dict[str, Any] = field(default_factory=dict)    # detail and Pixel Match (the finish job checks them)
     move_settings: dict[str, Any] = field(default_factory=dict)      # speed, arm_spread, in_place (the animate job checks them)
     made: dict[str, str | None] = field(default_factory=dict)       # picture/model/finished/rigged paths
@@ -229,6 +230,14 @@ class ChainRunner:
                 self._kept_back(chain)
             except Exception as exc:  # any decode failure (a decompression bomb too) must end the run, not hang it
                 chain.status, chain.error = "error", f"The back picture could not be read: {exc}"
+                return
+        if chain.rigged_upload and chain.upload and not chain.made.get("rigged"):
+            # an uploaded model that already has a skeleton: keep it as the rigged file, so the
+            # motion step reads it by path instead of re-rigging it with SkinTokens
+            try:
+                chain.made["rigged"] = self._kept_rig_upload(chain)
+            except OSError as exc:
+                chain.status, chain.error = "error", f"The rigged model could not be kept: {exc}"
                 return
         for step in chain.steps:
             if chain.cancel_requested:
@@ -359,6 +368,17 @@ class ChainRunner:
     def _inside(self, relative: str) -> bool:
         root = self.output.resolve()
         return root in (root / str(relative)).resolve().parents
+
+    def _kept_rig_upload(self, chain: Chain) -> str:
+        """An uploaded GLB that already has a skeleton, saved under output/rig/uploads/ so the
+        motion step can read it by path (its own bones, no SkinTokens re-rig)."""
+        name, data = chain.upload
+        stem = re.sub(r"[^a-z0-9]+", "-", Path(name).stem.lower()).strip("-") or "rig"
+        relative = f"rig/uploads/{stem}__{chain.id[:8]}{Path(name).suffix.lower() or '.glb'}"
+        path = self.output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return relative
 
     def _kept_back(self, chain: Chain) -> str:
         """The user's back picture, saved beside the kept front as <front>__back.png: the name a
@@ -573,6 +593,7 @@ def chain_from_form(form: dict[str, dict[str, Any]]) -> Chain:
         if isinstance(picture, dict) else {},
         model_seed=int(text("model_seed")) if (text("model_seed") or "").isdigit() else None,
         keep_everything=text("keep_everything") in ("1", "true"),
+        rigged_upload=text("rigged_upload") in ("1", "true"),
         finish_settings={k: finish[k] for k in FINISH_KEYS if k in finish} if isinstance(finish, dict) else {},
         move_settings={k: move[k] for k in MOVE_KEYS if k in move} if isinstance(move, dict) else {},
         made={k: str(v) for k, v in made.items() if k in ("picture", "back", "model", "finished", "rigged") and v},

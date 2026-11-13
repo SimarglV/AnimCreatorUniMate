@@ -649,7 +649,8 @@ async function loadTools() {
 function openCreateSheet(prefill = null) {
   closeSheet($('stage'));
   createHandle = openCreate({ stage: $('stage'), recipes, engines, presets, motionPrompts, frontBack, pictureEngines, prefill,
-    onSourceChange: () => { libraryInputId = null; renderLibrary(); }, onStart: (plan) => startChain(plan) });
+    onSourceChange: () => { libraryInputId = null; renderLibrary(); }, onStart: (plan) => startChain(plan),
+    onReview: (file) => openRigImport({ stage: $('stage'), ctx, onResult: showMotionResult, prefill: { file } }) });
 }
 
 async function useLibraryPicture(asset) {
@@ -967,14 +968,9 @@ function openFile(file) {
 $('openBtn').addEventListener('click', () => $('openFile').click());
 $('openFile').addEventListener('change', (event) => { openFile(event.target.files[0]); event.target.value = ''; });
 
-// Animate a rig: UniMate motion on a built-in example, an uploaded rigged GLB, or a path.
+// Rig examples: UniMate motion on a built-in example or a rig already on this machine.
 $('motionBtn').addEventListener('click', () => {
   openMotionImport({ stage: $('stage'), ctx, onResult: showMotionResult });
-});
-
-// Import a rig: UniMate's own workflow — analyse, review joint labels + facing, build.
-$('importBtn').addEventListener('click', () => {
-  openRigImport({ stage: $('stage'), ctx, onResult: showMotionResult });
 });
 
 function showMotionResult(glbUrl, name, path) {

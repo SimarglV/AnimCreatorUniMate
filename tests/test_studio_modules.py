@@ -357,6 +357,50 @@ def test_a_motion_want_runs_through_the_rig_and_ends_in_the_motion_step():
 
 
 @needs_node
+def test_a_rigged_upload_skips_the_studio_rig_step():
+    out = _run("plan.js", """console.log(JSON.stringify({
+      plain: m.planFor('model', 'motion'),
+      rigged: m.planFor('model', 'motion', { riggedUpload: true }),
+      character: m.planFor('model', 'character', { riggedUpload: true }),
+    }));""")
+    assert out["plain"] == ["rigged", "motion"]
+    assert out["rigged"] == ["motion"]                 # its own bones: no SkinTokens re-rig
+    assert out["character"] == ["rigged", "animated"]  # preset moves still take the studio rig
+
+
+@needs_node
+def test_the_plan_form_carries_the_rigged_upload_flag():
+    out = _run("create.js", """console.log(JSON.stringify([
+      m.planForm({ steps: ['motion'], riggedUpload: true }).get('rigged_upload'),
+      m.planForm({ steps: ['rigged', 'motion'] }).get('rigged_upload'),
+    ]));""")
+    assert out == ["1", None]
+
+
+@needs_node
+def test_a_glb_is_recognised_as_rigged_by_its_skin_or_joint_attributes():
+    out = _run("create.js", """
+      const glb = (json) => {
+        const text = JSON.stringify(json);
+        const pad = (4 - new TextEncoder().encode(text).length % 4) % 4;
+        const bytes = new TextEncoder().encode(text + ' '.repeat(pad));
+        const buffer = new ArrayBuffer(12 + 8 + bytes.length);
+        const view = new DataView(buffer);
+        view.setUint32(0, 0x46546c67, true); view.setUint32(4, 2, true); view.setUint32(8, buffer.byteLength, true);
+        view.setUint32(12, bytes.length, true); view.setUint32(16, 0x4e4f534a, true);
+        new Uint8Array(buffer, 20, bytes.length).set(bytes);
+        return buffer;
+      };
+      const skin = glb({ skins: [{ joints: [0, 1] }], meshes: [] });
+      const jointAttr = glb({ meshes: [{ primitives: [{ attributes: { JOINTS_0: 0 } }] }] });
+      const plain = glb({ meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }] });
+      const noSkin = glb({ skins: [], meshes: [] });
+      console.log(JSON.stringify([m.glbHasSkeleton(skin), m.glbHasSkeleton(jointAttr),
+        m.glbHasSkeleton(plain), m.glbHasSkeleton(noSkin), m.glbHasSkeleton(new ArrayBuffer(0))]));""")
+    assert out == [True, True, False, False, False]
+
+
+@needs_node
 def test_the_plan_form_carries_the_motion_prompt_and_settings():
     out = _run("create.js", """
       const form = m.planForm({ steps: ['motion'], description: 'fox', motionPrompt: 'An object walks forward.',

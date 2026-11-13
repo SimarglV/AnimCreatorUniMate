@@ -30,8 +30,10 @@ export function retryWant(want, category) {
 
 /** The steps to run, in order, before any "stop after".
  *  `frontBack`: draw a back picture and build the 3D model from front and back (one prop or
- *  a character; a sheet of nine has no back). */
-export function planFor(have, want, { finishUpload = false, frontBack = false } = {}) {
+ *  a character; a sheet of nine has no back).
+ *  `riggedUpload`: the uploaded model already has a skeleton, so UniMate's motion reads its
+ *  own bones — no SkinTokens re-rig. */
+export function planFor(have, want, { finishUpload = false, frontBack = false, riggedUpload = false } = {}) {
   const full = {
     picture: ['picture'],
     prop: ['picture', 'model', 'finished'],
@@ -43,6 +45,8 @@ export function planFor(have, want, { finishUpload = false, frontBack = false } 
   let steps = full.filter((s) => !skip.includes(s));
   // an uploaded model may already be game-ready; finishing it is the user's choice
   if (have === 'model' && !finishUpload) steps = steps.filter((s) => s !== 'finished');
+  // ...and it may already be rigged: UniMate animates its own bones, so skip SkinTokens
+  if (have === 'model' && want === 'motion' && riggedUpload) steps = steps.filter((s) => s !== 'rigged');
   if (frontBack && want !== 'set' && steps.includes('model')) {
     steps.splice(steps.indexOf('model'), 0, 'back');
   }

@@ -113,6 +113,27 @@ def test_the_form_reads_motion_fields(tmp_path):
     assert chain.steps == ["rigged", "motion"]
 
 
+def test_the_form_reads_the_rigged_upload_flag():
+    base = {"title": {"value": "k"}, "steps": {"value": json.dumps(["motion"])}}
+    assert aa.chain_from_form({**base, "rigged_upload": {"value": "1"}}).rigged_upload is True
+    assert aa.chain_from_form(base).rigged_upload is False
+
+
+def test_a_rigged_upload_runs_motion_without_re_rigging(tmp_path):
+    runner, jobs = _runner(tmp_path)
+    chain = aa.Chain(title="crab", steps=["motion"], rigged_upload=True,
+                     upload=("Crab.glb", b"glb"), motion_prompt="An object walks sideways.")
+    runner.submit(chain, background=False)
+    assert chain.status == "done"
+    kept = chain.made["rigged"]
+    assert kept.startswith("rig/uploads/") and kept.endswith(".glb")
+    assert (tmp_path / kept).read_bytes() == b"glb"
+    posts = [(p, b) for m, p, b in jobs.calls if m == "POST"]
+    assert [p for p, _ in posts] == ["/api/motion"]          # its own bones: no /api/animate/rig
+    body = json.loads(posts[0][1])
+    assert body["model"] == kept and body["prompt"] == "An object walks sideways."
+
+
 def test_a_failure_stops_the_chain_in_plain_words_and_is_kept_in_history(tmp_path):
     runner, _ = _runner(tmp_path, fail="finished")
     chain = aa.Chain(title="knight", steps=["picture", "model", "finished", "rigged"], prompt="a knight")

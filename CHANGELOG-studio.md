@@ -22,8 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Imported rigs appear in the Library as rigged characters. Joint labels can now come from
   an **LLM** as well as the offline rules — a local HuggingFace model, or any OpenAI-compatible
   server (LM Studio, Ollama, vLLM) via its base URL, which needs no API key.
+- **Create recognises a rigged GLB.** Load a model that already has a skeleton and pick
+  "A character moved by text": Create skips its own SkinTokens rigging and UniMate animates the
+  existing bones. "Review the joint labels first" opens the review sheet (now reached from
+  Create) for non-standard bone names.
 
 ### Changed
+- The top bar's **Import rig** button is gone: the review workflow lives in Create's
+  "Review the joint labels first". **Animate a rig** became **Rig examples** and keeps the
+  built-in examples and server paths.
 - The studio is branded **UniMate** (the AssetFurnace design stays). The write marker header
   is `X-UniMate-Request`; usage counts and the notice feed are off by default (no collection
   endpoint in this merged repo; a fork can set `I3D_USAGE_URL` / `I3D_NOTICES_URL`).

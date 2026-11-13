@@ -30,11 +30,12 @@ sentence / picture → 3D model → finish → rig → UniMate motion → animat
   skeleton (**Rig**, SkinTokens) and animates it. Close the tab and the run carries on.
 - **UniMate motion — any skeleton.** Preset moves are humanoid-only; UniMate reads one
   sentence ("An object walks forward.") and animates people, animals and machines alike.
-  The clip lands in your Library beside the rig. Bring a rig with **Animate a rig** (a
-  built-in example, an uploaded rigged GLB, or a path) — no auto-rig needed, so
-  non-humanoids work too. **Import rig** is UniMate's own workflow: upload a rig, review
-  and fix its joint labels and facing, then build and animate it. Results come with
-  rendered videos, and prompts can be chained into one long clip. See
+  The clip lands in your Library beside the rig. In **Create**, load a GLB and pick
+  "A character moved by text": an unrigged model is rigged first, and one that already has a
+  skeleton is animated as it is — no auto-rig needed, so non-humanoids work too. Tick
+  "Review the joint labels first" to fix the labels and facing before building. Built-in
+  examples and rigs already on disk are under **Rig examples**. Results come with rendered
+  videos, and prompts can be chained into one long clip. See
   [`docs/unimate-motion.md`](docs/unimate-motion.md).
 - **The studio.** Your Library, one 3D viewer and a Steps panel. Every step is a button too,
   so you can stop after any of them.

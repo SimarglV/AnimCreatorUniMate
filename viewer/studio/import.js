@@ -7,7 +7,7 @@ import { openMotionImport } from './motion.js';
 
 const esc = (text) => String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-export function openRigImport({ stage, ctx, onResult }) {
+export function openRigImport({ stage, ctx, onResult, prefill = null }) {
   closeSheet(stage);
   const el = document.createElement('div');
   el.className = 'sheet';
@@ -15,7 +15,7 @@ export function openRigImport({ stage, ctx, onResult }) {
     <form class="sheet-card rig-import" novalidate>
       <div class="sheet-top"><h2>Import a <span>rig</span></h2><button type="button" class="ghost" data-close>Cancel</button></div>
       <p class="hint">Bring a rigged GLB / glTF / FBX. UniMate labels its joints, you check and
-        fix them, then it builds the asset — after which Animate a rig can move it.
+        fix them, then it builds the asset — after which the studio can move it.
         ${ctx.motionReady === false ? `<b>${esc(ctx.motionNote || 'UniMate is not set up.')}</b>` : ''}</p>
       <div data-source>
         <input type="file" data-upload accept=".glb,.gltf,.fbx" hidden>
@@ -93,9 +93,10 @@ export function openRigImport({ stage, ctx, onResult }) {
   syncLlm();
 
   let analysed = null;   // { directory, annotation, source }
+  const chosenFile = () => upload.files[0] || prefill?.file || null;
 
   const runAnalyse = async () => {
-    const file = upload.files[0];
+    const file = chosenFile();
     const pathValue = path.value.trim();
     if (!file && !pathValue) return fail('Choose a GLB to upload, or give a path.');
     let body;
@@ -222,4 +223,9 @@ export function openRigImport({ stage, ctx, onResult }) {
   el.querySelector('form').onsubmit = (event) => { event.preventDefault(); runAnalyse(); };
   $('[data-close]').addEventListener('click', () => el.remove());
   el.addEventListener('keydown', (e) => { if (e.key === 'Escape') el.remove(); });
+  // opened from Create's "Review the joint labels" for an already-rigged upload: start at once
+  if (prefill?.file) {
+    drop.textContent = prefill.file.name;
+    runAnalyse();
+  }
 }

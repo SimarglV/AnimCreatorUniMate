@@ -29,6 +29,35 @@ export function pastedPicture(clipboard, now = Date.now) {
 }
 
 /**
+ * Whether a GLB's bytes describe a model that already has a skeleton: a skin (joints bound to
+ * a mesh), or a mesh whose vertices carry joint/weight attributes. Only the JSON chunk is read.
+ * Anything unreadable counts as unrigged, so the ordinary rig step still runs.
+ */
+export function glbHasSkeleton(buffer) {
+  try {
+    if (!buffer || buffer.byteLength < 20) return false;
+    const view = new DataView(buffer);
+    if (view.getUint32(0, true) !== 0x46546c67) return false;   // 'glTF'
+    let offset = 12;   // magic, version, length
+    while (offset + 8 <= buffer.byteLength) {
+      const length = view.getUint32(offset, true);
+      const type = view.getUint32(offset + 4, true);
+      offset += 8;
+      if (type === 0x4e4f534a) {   // 'JSON'
+        const json = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, offset, length)));
+        if (Array.isArray(json.skins) && json.skins.length) return true;
+        const meshes = Array.isArray(json.meshes) ? json.meshes : [];
+        return meshes.some((mesh) => (mesh.primitives || []).some((prim) => prim.attributes && 'JOINTS_0' in prim.attributes));
+      }
+      offset += length;
+    }
+  } catch {
+    /* not a readable GLB: treat it as unrigged */
+  }
+  return false;
+}
+
+/**
  * The picture job's settings from Create's choices. A new seed each time by default, so the
  * same prompt gives fresh tries; a fixed seed gives the same picture back.
  */
@@ -106,7 +135,7 @@ export function detailStates(details) {
 }
 
 /** Show the Create sheet over the viewer. `onStart(plan)` runs it. */
-export function openCreate({ stage, recipes, engines, presets, motionPrompts = [], frontBack = null, pictureEngines = [], prefill = null, onStart, onSourceChange = null }) {
+export function openCreate({ stage, recipes, engines, presets, motionPrompts = [], frontBack = null, pictureEngines = [], prefill = null, onStart, onReview = null, onSourceChange = null }) {
   const sheet = document.createElement('div');
   sheet.className = 'sheet';
   stage.appendChild(sheet);
@@ -114,7 +143,7 @@ export function openCreate({ stage, recipes, engines, presets, motionPrompts = [
   let firstRender = true;
   let sourceRevision = 0;
   const state = { have: 'idea', want: 'character', stop: null, tips: false, useRecipe: true, text: '', file: null, preview: null,
-    backFile: null, backPreview: null,
+    backFile: null, backPreview: null, fileRigged: false, review: false,
     engine: engines[0]?.id, firstMove: presets.find((p) => !p.take)?.id,
     motionPrompt: motionPrompts[0]?.text || '',
     motion: { cfg: 3, reps: 1, loop: false },
@@ -164,8 +193,10 @@ export function openCreate({ stage, recipes, engines, presets, motionPrompts = [
     if (ALLOWED[state.have][state.want] !== true) state.want = Object.keys(ALLOWED[state.have]).find((k) => ALLOWED[state.have][k] === true);
     const installedPictures = pictureEngines.filter((e) => e.installed);
     const pixal = state.engine === 'pixal3d';
+    // an uploaded GLB that already has a skeleton goes straight to UniMate, not through SkinTokens
+    const riggedUpload = state.have === 'model' && state.fileRigged;
     // your own back replaces the drawn one, so the plan has no "Back picture" step to run
-    const plan = planFor(state.have, state.want, { frontBack: state.frontBack && pixal && Boolean(frontBack?.ready) && !state.backFile });
+    const plan = planFor(state.have, state.want, { frontBack: state.frontBack && pixal && Boolean(frontBack?.ready) && !state.backFile, riggedUpload });
     if (state.stop && !plan.includes(state.stop)) state.stop = null;
     const active = stopAfter(plan, state.stop);
     fitPicture(!active.includes('model') && !active.includes('back'));   // as the server reads it: no 3D build after it
@@ -198,7 +229,8 @@ export function openCreate({ stage, recipes, engines, presets, motionPrompts = [
       <div class="path">${plan.map((s, i) => `${i ? '<span class="arr">→</span>' : ''}<button type="button" class="pstep${active.includes(s) ? '' : ' skip'}" data-stop="${s}">${STEP_LABELS[s]}</button>`).join('')}</div>
       ${heroChoice(state, active, pixal)}
       ${active.includes('animated') ? `<label class="field">First move<select data-k="move">${presets.filter((p) => !p.take).map((p) => `<option value="${esc(p.id)}" ${p.id === state.firstMove ? 'selected' : ''}>${esc(p.label)}</option>`).join('')}</select></label>` : ''}
-      ${active.includes('motion') ? `<label class="field">Motion prompt<span class="hint">One sentence in UniMate's style: start with “An object”, name one motion, not the character.</span></label>
+      ${active.includes('motion') ? `${riggedUpload ? `<p class="hint">This model already has a skeleton, so UniMate animates its own bones — no re-rigging.</p>
+        <label class="check"><input type="checkbox" data-review ${state.review ? 'checked' : ''}><span>Review the joint labels first <span class="hint">opens the review sheet; useful when the bone names are non-standard</span></span></label>` : ''}<label class="field">Motion prompt<span class="hint">One sentence in UniMate's style: start with “An object”, name one motion, not the character.</span></label>
         <div class="moves" role="group" aria-label="Motion prompts">${motionPrompts.map((p) => `<button type="button" class="chip" data-mprompt="${esc(p.text)}" aria-pressed="${p.text === state.motionPrompt}">${esc(p.label)}</button>`).join('')}</div>
         <textarea data-k="motiontext" rows="2" maxlength="400" placeholder="An object walks forward.">${esc(state.motionPrompt)}</textarea>
         <details class="adv"><summary>Advanced: motion</summary>
@@ -248,17 +280,28 @@ export function openCreate({ stage, recipes, engines, presets, motionPrompts = [
   const takeFile = (file) => {
     if (!file) return;
     setFile(file);
-    state.have = /\.glb$/i.test(file.name) ? 'model' : PICTURE_TYPES.test(file.name) ? 'picture' : state.have;
+    const isGlb = /\.glb$/i.test(file.name);
+    state.have = isGlb ? 'model' : PICTURE_TYPES.test(file.name) ? 'picture' : state.have;
+    state.fileRigged = false;
+    state.review = false;
     render();
+    // a GLB may already carry a skeleton; read only its JSON chunk, and re-plan if it does
+    if (isGlb) {
+      file.arrayBuffer().then((buffer) => {
+        if (state.file !== file) return;   // replaced while reading
+        state.fileRigged = glbHasSkeleton(buffer);
+        render();
+      }).catch(() => {});
+    }
   };
 
   function wire(active) {
     const q = (sel) => sheet.querySelector(sel);
     q('[data-close]').onclick = close;
-    sheet.querySelectorAll('[data-have]').forEach((b) => b.onclick = () => { state.have = b.dataset.have; setFile(null); state.stop = null; render(); });
+    sheet.querySelectorAll('[data-have]').forEach((b) => b.onclick = () => { state.have = b.dataset.have; setFile(null); state.stop = null; state.fileRigged = false; state.review = false; render(); });
     sheet.querySelectorAll('[data-want]').forEach((b) => b.onclick = () => { state.want = b.dataset.want; state.stop = null; render(); });
     sheet.querySelectorAll('[data-stop]').forEach((b) => b.onclick = () => { state.stop = state.stop === b.dataset.stop ? null : b.dataset.stop; render(); });
-    sheet.querySelectorAll('.qs').forEach((b) => b.onclick = () => { state.want = b.dataset.w; state.have = b.dataset.h; setFile(null); state.stop = null; render(); });
+    sheet.querySelectorAll('.qs').forEach((b) => b.onclick = () => { state.want = b.dataset.w; state.have = b.dataset.h; setFile(null); state.stop = null; state.fileRigged = false; state.review = false; render(); });
     q('[data-tips]')?.addEventListener('click', () => { state.tips = !state.tips; render(); });
     // the tips' "picture guide" link opens here, over Create, instead of on GitHub
     q('.tipsbox')?.addEventListener('click', (e) => {
@@ -299,6 +342,7 @@ export function openCreate({ stage, recipes, engines, presets, motionPrompts = [
       sheet.querySelector('[data-o="mcfg"]').textContent = Number(e.target.value).toFixed(1);
     });
     q('[data-k="mloop"]')?.addEventListener('change', (e) => { state.motion.loop = e.target.checked; });
+    q('[data-review]')?.addEventListener('change', (e) => { state.review = e.target.checked; });
     q('[data-k="engine"]')?.addEventListener('change', (e) => { state.engine = e.target.value; render(); const d = sheet.querySelector('[data-k="keep"]')?.closest('details'); if (d) d.open = true; });
     q('[data-k="keep"]')?.addEventListener('change', (e) => { state.keep = e.target.checked; });
     q('[data-k="picengine"]')?.addEventListener('change', (e) => {
@@ -343,8 +387,12 @@ export function openCreate({ stage, recipes, engines, presets, motionPrompts = [
       if (state.want === 'motion' && !state.motionPrompt.trim()) return fail('Say what motion you want (or pick one of the prompts).');
       const { file } = state;   // closing the sheet clears state.file, so take it first
       const backFile = backSlotShown(state, frontBack, active) ? state.backFile : null;
+      // an already-rigged upload can go straight to the review sheet instead of the quick rule pass
+      const review = state.have === 'model' && state.fileRigged && state.want === 'motion' && state.review;
       close();
+      if (review) { onReview?.(file); return; }
       onStart({ have: state.have, want: state.want, steps: active, file, engine: state.engine, firstMove: state.firstMove,
+        riggedUpload: active.includes('motion') && state.have === 'model' && state.fileRigged,
         motionPrompt: active.includes('motion') ? normalizePromptText(state.motionPrompt) : null,
         motionSettings: active.includes('motion')
           ? { cfg_scale: state.motion.cfg, repetitions: state.motion.reps, loop: state.motion.loop } : null,
@@ -451,6 +499,7 @@ export function planForm(plan, made = {}) {
   if (plan.pictureEngine) form.append('picture_engine', plan.pictureEngine);
   if (plan.modelSeed != null) form.append('model_seed', String(plan.modelSeed));
   if (plan.keepEverything) form.append('keep_everything', '1');
+  if (plan.riggedUpload) form.append('rigged_upload', '1');
   if (plan.finishSettings) form.append('finish_settings', JSON.stringify(plan.finishSettings));
   if (plan.moveSettings) form.append('move_settings', JSON.stringify(plan.moveSettings));
   if (plan.backSettings) form.append('back_settings', JSON.stringify(plan.backSettings));

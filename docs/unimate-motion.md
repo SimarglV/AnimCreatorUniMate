@@ -6,18 +6,23 @@ the second.
 
 ## How to run it in the studio
 
-**Animate a rig** (top bar) animates a rig you bring, whatever its skeleton:
+**Create → A 3D model → A character moved by text** is the one place for your own file:
 
-- a **built-in example** (crab, dragon, eagle, shark, snake, human, Unitree Go2) — already
-  adapted, goes straight to sampling;
-- an **uploaded rigged GLB/glTF/FBX**, or a **path** on this machine — adapted on the fly.
+- an **unrigged GLB** — the studio rigs it first (SkinTokens), then UniMate animates it;
+- a **rigged GLB** — Create sees the skeleton and skips its own rigging: UniMate reads the
+  existing bones and animates them. Tick **Review the joint labels first** when the bone
+  names are non-standard, to open the review sheet before anything is built.
 
-**Import rig** is UniMate's own full workflow: upload a rig, review and fix the joint
-labels and the facing pair, then build the asset (cond.npy + canonical GLB) and animate it.
-Imported rigs show up in the Library as rigged characters, so they can be animated again
-later from the Steps panel's Animate step.
+**Rig examples** (top bar) runs UniMate motion on a **built-in example** (crab, dragon,
+eagle, shark, snake, human, Unitree Go2) or a **path** on this machine. Both are already
+adapted or self-contained, so they go straight to sampling.
 
-Joint labels come from one of two sources, chosen in the Import rig form:
+Importing a rig is UniMate's own full workflow: it labels the joints, stops, you review and
+fix the labels and the facing pair, then it builds the asset (cond.npy + canonical GLB) and
+animates it. Imported rigs show up in the Library as rigged characters, so they can be
+animated again later from the Steps panel's Animate step.
+
+Joint labels come from one of two sources, chosen in the review sheet:
 
 - **rules** (default) — offline, no model, no key;
 - **an LLM** — a local HuggingFace model, or any **OpenAI-compatible server** (LM Studio,
@@ -28,11 +33,8 @@ Joint labels come from one of two sources, chosen in the Import rig form:
 LLM labelling is still a first pass: check and fix the labels and the facing pair before
 you build, exactly as with the rules.
 
-The same UniMate motion runs on humanoid characters through the normal pipeline
-(**Create → A character moved by text**, or the Animate step after the rig).
-
 Every run returns the animated GLB + FBX, the rendered videos and T-pose stills.
-**Motion expansion** (a checkbox in Animate a rig) chains several prompts, one per line,
+**Motion expansion** (a checkbox in the motion step) chains several prompts, one per line,
 into one long clip.
 
 ## What happens
