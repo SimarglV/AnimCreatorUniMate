@@ -440,3 +440,16 @@ img.glow { animation: doorglow 2.4s ease-in-out infinite; }
 .motion-import input[type="text"], .motion-import textarea { width: 100%; }
 .motion-out { display: grid; gap: 6px; margin-top: 8px; }
 .motion-out .job-msg { margin: 0; }
+
+/* Import & Adaptation sheet */
+.rig-import .drop { border: 1px dashed var(--line); border-radius: 10px; padding: 18px; text-align: center; color: var(--ash); cursor: pointer; }
+.rig-import .grow { min-width: 0; flex: 1; display: grid; gap: 8px; align-content: start; }
+.rig-import .rig-preview { max-width: 260px; max-height: 260px; border-radius: 10px; border: 1px solid var(--line); object-fit: contain; }
+.rig-import .joints { max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; }
+.rig-import .joints table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.rig-import .joints th { position: sticky; top: 0; background: var(--raise); text-align: left; padding: 6px 8px; color: var(--ash); }
+.rig-import .joints td { padding: 4px 8px; border-top: 1px solid var(--line); }
+.rig-import .joints input { width: 100%; }
+.rig-out { display: grid; gap: 6px; margin-top: 8px; }
+
+.motion-video { width: 100%; border-radius: 10px; border: 1px solid var(--line); background: #000; }

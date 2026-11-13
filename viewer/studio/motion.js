@@ -7,7 +7,7 @@ import { closeSheet } from './pages.js';
 
 const esc = (text) => String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-export async function openMotionImport({ stage, ctx, onResult }) {
+export async function openMotionImport({ stage, ctx, onResult, prefill = null }) {
   closeSheet(stage);
   const prompts = ctx.motionPrompts || [];
   let builtins = [];
@@ -34,6 +34,10 @@ export async function openMotionImport({ stage, ctx, onResult }) {
       <label class="field">Motion prompt<span class="hint">Start with “An object”, name one motion.</span></label>
       <div class="moves" role="group" aria-label="Motion prompts">${prompts.map((p, i) => `<button type="button" class="chip" data-mprompt="${esc(p.text)}" aria-pressed="${i === 0}">${esc(p.label)}</button>`).join('')}</div>
       <textarea data-prompt rows="2" maxlength="400" placeholder="An object walks forward.">${esc(prompts[0]?.text || '')}</textarea>
+      <label class="check"><input type="checkbox" data-expand><span>Motion expansion <span class="hint">one motion per line; they chain into one long clip (60 + (60 − overlap) × (N − 1) frames)</span></span></label>
+      <div data-expand-box hidden>
+        <label class="field">Expansion overlap (frames) <output data-o="overlap">10</output><input type="range" data-overlap min="1" max="40" value="10"></label>
+      </div>
       <details class="adv"><summary>Advanced</summary>
         <label class="field">Samples<select data-reps>${[1, 2, 3, 4].map((n) => `<option value="${n}">${n}${n === 1 ? ' sample' : ' samples — pick the best'}</option>`).join('')}</select></label>
         <label class="field">Prompt strength <output data-o="cfg">3.0</output><input type="range" data-cfg min="1" max="8" step="0.5" value="3"></label>
@@ -57,6 +61,10 @@ export async function openMotionImport({ stage, ctx, onResult }) {
     path.hidden = src.value !== 'path';
   };
   src.onchange = syncSource;
+  if (prefill?.path) {
+    src.value = 'path';
+    path.value = prefill.path;
+  }
   syncSource();
 
   el.querySelectorAll('[data-mprompt]').forEach((chip) => chip.onclick = () => {
@@ -65,6 +73,8 @@ export async function openMotionImport({ stage, ctx, onResult }) {
   });
   prompt.oninput = () => el.querySelectorAll('[data-mprompt]').forEach((c) => c.setAttribute('aria-pressed', 'false'));
   $('[data-cfg]').oninput = () => { $('[data-o="cfg"]').textContent = Number($('[data-cfg]').value).toFixed(1); };
+  $('[data-expand]').onchange = () => { $('[data-expand-box]').hidden = !$('[data-expand]').checked; };
+  $('[data-overlap]').oninput = () => { $('[data-o="overlap"]').textContent = $('[data-overlap]').value; };
 
   const fail = (message) => { const e = $('[data-error]'); e.textContent = message; e.hidden = false; };
 
@@ -73,7 +83,9 @@ export async function openMotionImport({ stage, ctx, onResult }) {
     if (ctx.motionReady === false) return fail(ctx.motionNote || 'UniMate is not set up.');
     const text = prompt.value.trim();
     if (!text) return fail('Write a motion prompt first.');
-    const settings = { cfg_scale: Number($('[data-cfg]').value), repetitions: Number($('[data-reps]').value), loop: $('[data-loop]').checked };
+    const settings = { cfg_scale: Number($('[data-cfg]').value), repetitions: Number($('[data-reps]').value),
+      loop: $('[data-loop]').checked, expand: $('[data-expand]').checked,
+      expand_overlap: Number($('[data-overlap]').value) };
     let body, kind;
     if (src.value === 'upload') {
       if (!upload.files[0]) return fail('Choose a GLB to upload.');
@@ -111,7 +123,11 @@ export async function openMotionImport({ stage, ctx, onResult }) {
     }
     const done = final.last_event || {};
     const name = (done.path || '').split('/').pop() || 'motion';
-    out.innerHTML = `<p class="job-msg">Done</p>`;
+    const videos = (done.media || []).filter((m) => m.endsWith('.mp4'));
+    const files = (done.files || []).map((f) => ({ name: f.split('/').pop(), url: `/${f}` }));
+    out.innerHTML = `<p class="job-msg">Done</p>` +
+      videos.map((v) => `<video class="motion-video" controls muted loop src="${esc(`/${v}`)}"></video>`).join('') +
+      `<div class="row">${files.map((f) => `<a class="ghost small" href="${esc(f.url)}" download="${esc(f.name)}">${esc(f.name)}</a>`).join('')}</div>`;
     onResult(done.result_url, name, done.path);
     el.querySelector('[data-close]')?.click();
   };

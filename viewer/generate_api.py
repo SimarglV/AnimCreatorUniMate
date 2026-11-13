@@ -209,6 +209,16 @@ from vat_api import (
     status_payload as vat_status_payload,
 )
 
+import rig_import_api
+from rig_import_api import (
+    RIG_IMPORT_JOBS,
+    cancel_job as cancel_rig_import_job,
+    installed as rig_import_installed,
+    missing_note as rig_import_missing_note,
+    run_job as run_rig_import_job,
+    status_payload as rig_import_status_payload,
+)
+
 REPO = Path(__file__).resolve().parents[1]
 WRAPPER = REPO / "scripts" / "trellis_space_generate.py"
 PYTHON = REPO / "vendor" / "trellis-space-mac" / ".venv" / "bin" / "python"
@@ -1598,6 +1608,7 @@ HEAVY_JOBS: dict[str, Callable[[], bool]] = {
     "animate": lambda: _animate_running(),
     "motion": lambda: _running(MOTION_JOBS),
     "vat": lambda: _running(VAT_JOBS),
+    "rigimport": lambda: _running(RIG_IMPORT_JOBS),
     "skin": lambda: skins_api.BUILDS.running(),
 }
 BUSY_WORDS = {
@@ -1607,6 +1618,7 @@ BUSY_WORDS = {
     "animate": "an auto-rig or animation is running",
     "motion": "a UniMate motion job is running",
     "vat": "a VAT export is running",
+    "rigimport": "a rig import is running",
     "skin": "a skin is being made",
 }
 
@@ -2948,6 +2960,24 @@ class Handler(SimpleHTTPRequestHandler):
         if parts == ["api", "vat"]:
             self._create_vat_job()
             return
+        if parts == ["api", "import", "analyze"]:
+            self._create_import_analyze()
+            return
+        if parts == ["api", "import", "build"]:
+            self._create_import_build()
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "import"] and parts[3] == "cancel":
+            job = RIG_IMPORT_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                cancel_rig_import_job(job)
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._send_json(202, {"job_id": job.id, "status": job.status})
+            return
         if len(parts) == 4 and parts[:2] == ["api", "vat"] and parts[3] == "cancel":
             job = VAT_JOBS.get(parts[2])
             if job is None:
@@ -3708,6 +3738,17 @@ class Handler(SimpleHTTPRequestHandler):
         if parts == ["api", "vat", "tools"]:
             self._send_json(200, {"tools": vat_engine_tools(), "installed": vat_installed()})
             return
+        if len(parts) == 4 and parts[:2] == ["api", "import"]:
+            job = RIG_IMPORT_JOBS.get(parts[2])
+            if job is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if parts[3] == "events":
+                self._stream_events(job)
+                return
+            if parts[3] == "status":
+                self._send_json(200, rig_import_status_payload(job))
+                return
         if len(parts) == 4 and parts[:2] == ["api", "vat"]:
             job = VAT_JOBS.get(parts[2])
             if job is None:
@@ -4121,9 +4162,11 @@ class Handler(SimpleHTTPRequestHandler):
             prompt = str(body.get("prompt", ""))
             cfg, reps, seed = body.get("cfg_scale", 3.0), body.get("repetitions", 1), body.get("seed")
             loop = bool(body.get("loop"))
+            expand, overlap = bool(body.get("expand")), body.get("expand_overlap", 10)
             try:
                 if upload is not None:
-                    job = MOTION_JOBS.create(upload, prompt, cfg, reps, seed, loop)
+                    job = MOTION_JOBS.create(upload, prompt, cfg, reps, seed, loop,
+                                             expand=expand, overlap=overlap)
                 else:
                     builtin = str(body.get("builtin", "")).strip()
                     path = str(body.get("path", "")).strip()
@@ -4132,7 +4175,8 @@ class Handler(SimpleHTTPRequestHandler):
                         if directory is None:
                             self._send_json(422, {"error": f"no such built-in rig: {builtin!r}"})
                             return
-                        job = MOTION_JOBS.create_from_dir(directory, prompt, cfg, reps, seed, loop)
+                        job = MOTION_JOBS.create_from_dir(directory, prompt, cfg, reps, seed, loop,
+                                                          expand=expand, overlap=overlap)
                     elif path:
                         candidate = Path(path).expanduser()
                         if not candidate.is_absolute():
@@ -4141,9 +4185,11 @@ class Handler(SimpleHTTPRequestHandler):
                             self._send_json(422, {"error": f"not found: {path!r}"})
                             return
                         if candidate.is_dir() and (candidate / "cond.npy").is_file():
-                            job = MOTION_JOBS.create_from_dir(candidate, prompt, cfg, reps, seed, loop)
+                            job = MOTION_JOBS.create_from_dir(candidate, prompt, cfg, reps, seed, loop,
+                                                              expand=expand, overlap=overlap)
                         elif candidate.is_file() and candidate.suffix.lower() in (".glb", ".gltf", ".fbx"):
-                            job = MOTION_JOBS.create(candidate, prompt, cfg, reps, seed, loop)
+                            job = MOTION_JOBS.create(candidate, prompt, cfg, reps, seed, loop,
+                                                     expand=expand, overlap=overlap)
                         else:
                             self._send_json(422, {"error": f"not a rigged GLB or an adapted rig dir: {path!r}"})
                             return
@@ -4168,6 +4214,145 @@ class Handler(SimpleHTTPRequestHandler):
         if note:
             return f"VAT export is not ready. {note}"
         return None
+
+    def _import_blocked(self) -> str | None:
+        waiting = busy_reason("rigimport")
+        if waiting:
+            return waiting
+        note = rig_import_missing_note()
+        if note:
+            return f"Import is not ready. {note}"
+        return None
+
+    def _start_import(self, job) -> None:
+        threading.Thread(target=run_rig_import_job, args=(job,), daemon=True,
+                         name=f"import-{job.id[:8]}").start()
+        self._send_json(202, {"job_id": job.id, "kind": job.kind,
+                              "events_url": f"/api/import/{job.id}/events",
+                              "status_url": f"/api/import/{job.id}/status"})
+
+    @staticmethod
+    def _resolve_import_source(path: str) -> Path | None:
+        """A GLB/glTF/FBX the user named, absolute or repo-relative, or None."""
+        if not path:
+            return None
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = (REPO / path).resolve()
+        if candidate.is_file() and candidate.suffix.lower() in (".glb", ".gltf", ".fbx"):
+            return candidate
+        return None
+
+    def _create_import_analyze(self) -> None:
+        """Analyse a rig: upload a GLB/glTF/FBX or name a path; rig_preprocess labels the
+        joints and stops for review (annotation.json + REVIEW.md + preview)."""
+        try:
+            blocked = self._import_blocked()
+            if blocked:
+                self._send_json(409, {"error": blocked})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 512 * 1024 * 1024:
+                self._send_json(400, {"error": "request is missing or larger than 512 MiB"})
+                return
+            content_type = self.headers.get("Content-Type", "")
+            body: dict[str, Any] = {}
+            source: Path | None = None
+            if "multipart" in content_type:
+                form = parse_multipart(content_type, self.rfile.read(length))
+                asset = form.get("asset")
+                if asset and str(asset.get("filename", "")).lower().endswith((".glb", ".gltf", ".fbx")):
+                    keep = rig_import_api.RIG_ROOT / "uploads" / uuid.uuid4().hex[:10]
+                    keep.mkdir(parents=True, exist_ok=True)
+                    source = keep / str(asset["filename"])
+                    source.write_bytes(asset["data"])
+                else:
+                    self._send_json(422, {"error": "send a .glb/.gltf/.fbx in 'asset'"})
+                    return
+                settings_value = str((form.get("settings") or {}).get("value", "")).strip()
+                try:
+                    body = json.loads(settings_value) if settings_value else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "invalid settings JSON"})
+                    return
+            else:
+                try:
+                    body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "expected a JSON object"})
+                    return
+            if not isinstance(body, dict):
+                self._send_json(422, {"error": "expected a JSON object"})
+                return
+            if source is None:
+                source = self._resolve_import_source(str(body.get("path", "")).strip())
+                if source is None:
+                    self._send_json(422, {"error": "give a path to a .glb/.gltf/.fbx or upload one"})
+                    return
+            try:
+                job = RIG_IMPORT_JOBS.create_analyze(
+                    source, str(body.get("name", "")), str(body.get("profile", "auto")),
+                    str(body.get("annotate", "rule")), str(body.get("face_r", "")),
+                    str(body.get("face_l", "")), bool(body.get("body_axis")),
+                    str(body.get("rest_rotation", "")), bool(body.get("save_clips")))
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            (job.directory / ".source.json").write_text(
+                json.dumps({"input": str(source.resolve())}), encoding="utf-8")
+            self._start_import(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _create_import_build(self) -> None:
+        """Build an analysed rig from the reviewed annotation (cond.npy + canonical GLB)."""
+        try:
+            blocked = self._import_blocked()
+            if blocked:
+                self._send_json(409, {"error": blocked})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 65536 else {}
+            except json.JSONDecodeError:
+                self._send_json(422, {"error": "expected a JSON object"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(422, {"error": "expected a JSON object"})
+                return
+            directory = str(body.get("directory", "")).strip()
+            outdir = (REPO / directory).resolve() if directory else None
+            if outdir is None or not (outdir / "annotation.json").is_file():
+                self._send_json(422, {"error": "no analysed rig at that directory"})
+                return
+            try:
+                source = Path(json.loads((outdir / ".source.json").read_text())["input"])
+            except (OSError, ValueError, KeyError):
+                self._send_json(422, {"error": "the analysed rig lost its source file"})
+                return
+            if not source.is_file():
+                self._send_json(422, {"error": f"source file not found: {source}"})
+                return
+            annotation = body.get("annotation")
+            if not isinstance(annotation, dict):
+                self._send_json(422, {"error": "'annotation' must be the reviewed JSON"})
+                return
+            try:
+                job = RIG_IMPORT_JOBS.create_build(
+                    source, outdir, str(body.get("profile", "general")), annotation,
+                    str(body.get("rest_rotation", "")), bool(body.get("save_clips")))
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._start_import(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
 
     def _start_vat(self, job) -> None:
         threading.Thread(target=run_vat_job, args=(job,), daemon=True,

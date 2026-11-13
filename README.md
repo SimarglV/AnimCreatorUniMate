@@ -32,7 +32,10 @@ sentence / picture → 3D model → finish → rig → UniMate motion → animat
   sentence ("An object walks forward.") and animates people, animals and machines alike.
   The clip lands in your Library beside the rig. Bring a rig with **Animate a rig** (a
   built-in example, an uploaded rigged GLB, or a path) — no auto-rig needed, so
-  non-humanoids work too. See [`docs/unimate-motion.md`](docs/unimate-motion.md).
+  non-humanoids work too. **Import rig** is UniMate's own workflow: upload a rig, review
+  and fix its joint labels and facing, then build and animate it. Results come with
+  rendered videos, and prompts can be chained into one long clip. See
+  [`docs/unimate-motion.md`](docs/unimate-motion.md).
 - **The studio.** Your Library, one 3D viewer and a Steps panel. Every step is a button too,
   so you can stop after any of them.
 - **Low poly, high quality.** Pixel Match puts your picture's real pixels back on the model,

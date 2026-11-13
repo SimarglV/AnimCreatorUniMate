@@ -166,6 +166,35 @@ def test_create_from_dir_skips_the_adapt_step(tmp_path, monkeypatch):
     assert job.copy_to is None
 
 
+def test_motion_expansion_chains_prompt_lines_into_segments(rig, monkeypatch):
+    python = rig.parent / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ma, "venv_python", lambda: python)
+    monkeypatch.setattr(ma, "EXP_DIR", rig.parent / "exp")
+    job = ma.MOTION_JOBS.create(rig, "An object walks forward.\nAn object jumps in place.",
+                                expand=True, overlap=5)
+    sample = job.commands[1][0]
+    assert "--motion_expand" in sample
+    assert sample[sample.index("--expand_overlap") + 1] == "5"
+    prompts = [a for a in sample[sample.index("--prompt") + 1:sample.index("--motion_expand")]]
+    assert prompts == ["An object walks forward.", "An object jumps in place."]
+    ma.MOTION_JOBS.finish(job)
+    # without expansion the same prompt is one argument
+    plain = ma.MOTION_JOBS.create(rig, "An object walks forward.")
+    plain_sample = plain.commands[1][0]
+    assert plain_sample[plain_sample.index("--prompt") + 1] == "An object walks forward."
+    assert "--motion_expand" not in plain_sample
+
+
+def test_motion_expansion_needs_two_lines(rig, monkeypatch):
+    python = rig.parent / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ma, "venv_python", lambda: python)
+    monkeypatch.setattr(ma, "EXP_DIR", rig.parent / "exp")
+    with pytest.raises(ValueError, match="2 prompts"):
+        ma.MOTION_JOBS.create(rig, "An object walks forward.", expand=True)
+
+
 def test_create_from_dir_refuses_a_directory_without_cond(tmp_path, monkeypatch):
     root = tmp_path / "output"
     root.mkdir()

@@ -223,6 +223,24 @@ def _input_identity(path: Path) -> tuple[str, str]:
     return path.name, (hashlib.sha256(glb.read_bytes()).hexdigest() if glb is not None else "")
 
 
+def _sample_args(prompt: str, scale: float, repetitions: int, seed_value: int | None,
+                 expand: bool = False, overlap: int = 10) -> list[str]:
+    """The sampler's arguments after ``-m unimate.inference.sample`` (shared by both
+    create paths). With expand, the prompt is one segment per line and is chained."""
+    args = ["--exp_dir", str(EXP_DIR), "--num_repetitions", str(repetitions),
+            "--cfg_scale", f"{scale:g}"]
+    if expand:
+        segments = [s.strip() for s in str(prompt).splitlines() if s.strip()]
+        if len(segments) < 2:
+            raise ValueError("motion expansion needs at least 2 prompts, one per line")
+        args += ["--prompt"] + segments + ["--motion_expand", "--expand_overlap", str(int(overlap))]
+    else:
+        args += ["--prompt", prompt]
+    if seed_value is not None:
+        args += ["--seed", str(seed_value)]
+    return args
+
+
 class MotionJob:
     def __init__(self, job_id: str, directory: Path, result: Path,
                  commands: list[tuple[list[str], Path]], expected_seconds: float,
@@ -278,7 +296,8 @@ class MotionJobManager:
 
     def create(self, rigged: Path, prompt: str, cfg_scale: Any = 3.0,
                reps: Any = 1, seed: Any = None, loop: bool = False,
-               source: dict[str, Any] | None = None) -> MotionJob:
+               source: dict[str, Any] | None = None, expand: bool = False,
+               overlap: int = 10) -> MotionJob:
         with self.lock:
             if self.busy():
                 raise RuntimeError("a Motion job is already running")
@@ -294,12 +313,9 @@ class MotionJobManager:
                       "--input", str(rigged), "--output_dir", str(asset_dir),
                       "--profile", "general", "--annotate", "rule",
                       "--no_review", "--no_preview", "--overwrite"], REPO)
-            sample = [[python, "-m", "unimate.inference.sample",
-                       "--exp_dir", str(EXP_DIR), "--asset", str(asset_dir),
-                       "--prompt", prompt, "--num_repetitions", str(repetitions),
-                       "--cfg_scale", f"{scale:g}", "--output_dir", str(samples_dir)], REPO]
-            if seed_value is not None:
-                sample[0] += ["--seed", str(seed_value)]
+            sample = [[python, "-m", "unimate.inference.sample", "--asset", str(asset_dir),
+                       *_sample_args(prompt, scale, repetitions, seed_value, expand, overlap),
+                       "--output_dir", str(samples_dir)], REPO]
             animate = [[python, "scripts/animate_samples.py", str(samples_dir)], REPO]
             if loop:
                 animate[0] += ["--loop"]
@@ -322,7 +338,8 @@ class MotionJobManager:
             return self._claim(job)
 
     def create_from_dir(self, asset_dir: Path, prompt: str, cfg_scale: Any = 3.0,
-                        reps: Any = 1, seed: Any = None, loop: bool = False) -> MotionJob:
+                        reps: Any = 1, seed: Any = None, loop: bool = False,
+                        expand: bool = False, overlap: int = 10) -> MotionJob:
         """Sample + animate an already-adapted rig directory (one holding ``cond.npy``),
         e.g. one of the shipped ``assets/examples`` — no auto-rig, so non-humanoids work."""
         with self.lock:
@@ -337,12 +354,9 @@ class MotionJobManager:
             samples_dir = directory / "samples"
 
             python = str(venv_python())
-            sample = [[python, "-m", "unimate.inference.sample",
-                       "--exp_dir", str(EXP_DIR), "--asset", str(asset_dir),
-                       "--prompt", prompt, "--num_repetitions", str(repetitions),
-                       "--cfg_scale", f"{scale:g}", "--output_dir", str(samples_dir)], REPO]
-            if seed_value is not None:
-                sample[0] += ["--seed", str(seed_value)]
+            sample = [[python, "-m", "unimate.inference.sample", "--asset", str(asset_dir),
+                       *_sample_args(prompt, scale, repetitions, seed_value, expand, overlap),
+                       "--output_dir", str(samples_dir)], REPO]
             animate = [[python, "scripts/animate_samples.py", str(samples_dir)], REPO]
             if loop:
                 animate[0] += ["--loop"]
@@ -449,13 +463,21 @@ def run_job(job: MotionJob, manager: MotionJobManager = MOTION_JOBS) -> None:
                 return
             set_glb_generator(result)
             write_provenance(result.with_suffix(".provenance.json"), job.record)
+            samples = job.directory / "samples"
+            animated = samples / "animated"
+            files = sorted([str(p.relative_to(REPO)) for p in animated.glob("*")
+                            if p.suffix.lower() in (".glb", ".fbx") and p.is_file()])
+            media = sorted([str(p.relative_to(REPO)) for p in (samples / "animations").rglob("*")
+                            if p.suffix.lower() in (".mp4", ".png") and p.is_file()])
             job.emit({"phase": "done", "overall_pct": 100,
                       "message": "Animated",
                       "kind": job.kind,
                       "path": result.relative_to(REPO / "output").as_posix()
                       if REPO / "output" in result.parents else None,
                       "result_url": served_url(result),
-                      "size_bytes": result.stat().st_size})
+                      "size_bytes": result.stat().st_size,
+                      "files": files,
+                      "media": media})
             job.status = "done"
             usage_api.count_done("motion")
     except Exception as exc:

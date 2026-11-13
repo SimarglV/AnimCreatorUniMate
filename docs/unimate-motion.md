@@ -12,8 +12,15 @@ the second.
   adapted, goes straight to sampling;
 - an **uploaded rigged GLB/glTF/FBX**, or a **path** on this machine — adapted on the fly.
 
+**Import rig** is UniMate's own full workflow: upload a rig, review and fix the joint
+labels and the facing pair, then build the asset (cond.npy + canonical GLB) and animate it.
+
 The same UniMate motion runs on humanoid characters through the normal pipeline
 (**Create → A character moved by text**, or the Animate step after the rig).
+
+Every run returns the animated GLB + FBX, the rendered videos and T-pose stills.
+**Motion expansion** (a checkbox in Animate a rig) chains several prompts, one per line,
+into one long clip.
 
 ## What happens
 

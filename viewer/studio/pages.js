@@ -265,6 +265,7 @@ export const GUIDE = [
   ['Fix a spot', 'The brush button in the 3D view, on a finished model. Click to mark spots (size the ring with the slider or [ ]), press Patch to preview, flip Before / After, then Keep (a new version) or Discard. Fill hole cuts out a pocket or dent and patches it smooth: dark pupils, goggle eyes, pits in a beard. Smooth irons out bumps and ridges without cutting (set its strength). Repaint changes paint only, from your picture: scuffs and smears.'],
   ['Open GLB', 'Look at any GLB from your computer, or drop one anywhere on the page. View only: nothing is copied into your Library.'],
   ['Animate a rig', 'Run UniMate motion on a rig you bring: a built-in example (crab, dragon, eagle, shark, snake, human, Unitree Go2), an uploaded rigged GLB, or a path on this machine. Any skeleton, no auto-rig needed.'],
+  ['Import rig', 'Bring a rigged GLB / glTF / FBX. UniMate labels its joints, you review and fix the labels and the facing pair, then it builds the asset. After that, Animate a rig can move it.'],
   ['News', 'Short notes from the repo maintainers. Off by default in this merged repo. A number shows when there is something new; it never pops up.'],
   ['Activity', 'Everything that has run, finished, stopped or failed, with logs when something breaks.'],
   ['Report a bug', 'Tell us what broke. The studio adds the version, your machine and the error; you read it all, then send it through GitHub.'],

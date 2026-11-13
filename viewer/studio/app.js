@@ -10,6 +10,7 @@ import { closeBrushStage } from './brush.js';
 import { openCreate, runChain } from './create.js';
 import { openActivity, openAbout, openGuide, openReport, closeSheet, usageNotice, openNews, refreshNews } from './pages.js';
 import { openMotionImport } from './motion.js';
+import { openRigImport } from './import.js';
 import { STEP_LABELS, stoppedLine, stoppedStep } from './plan.js';
 import { mountSkins } from './skins.js';
 import { installTooltips } from './tooltips.js';
@@ -968,17 +969,24 @@ $('openFile').addEventListener('change', (event) => { openFile(event.target.file
 
 // Animate a rig: UniMate motion on a built-in example, an uploaded rigged GLB, or a path.
 $('motionBtn').addEventListener('click', () => {
-  openMotionImport({ stage: $('stage'), ctx, onResult: (glbUrl, name, path) => {
-    viewingStep = null;
-    viewingPictures = false;
-    $('vTitle').textContent = name;
-    $('vMeta').textContent = 'UniMate motion';
-    viewer.setFacing(null);
-    viewer.setClips([]);
-    viewer.load(glbUrl, { label: name, autoplay: true });
-    if (path) setDownload(path);
-  } });
+  openMotionImport({ stage: $('stage'), ctx, onResult: showMotionResult });
 });
+
+// Import a rig: UniMate's own workflow — analyse, review joint labels + facing, build.
+$('importBtn').addEventListener('click', () => {
+  openRigImport({ stage: $('stage'), ctx, onResult: showMotionResult });
+});
+
+function showMotionResult(glbUrl, name, path) {
+  viewingStep = null;
+  viewingPictures = false;
+  $('vTitle').textContent = name;
+  $('vMeta').textContent = 'UniMate motion';
+  viewer.setFacing(null);
+  viewer.setClips([]);
+  viewer.load(glbUrl, { label: name, autoplay: true });
+  if (path) setDownload(path);
+}
 // a file dropped anywhere opens in the viewer, instead of the browser downloading it.
 // Create's sheet takes its own drops first (and marks them handled).
 window.addEventListener('dragover', (event) => event.preventDefault());

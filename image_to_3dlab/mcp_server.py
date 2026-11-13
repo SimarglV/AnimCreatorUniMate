@@ -67,11 +67,14 @@ STUDIO_ONLY = {
     "api/animate/play": "via create / continue_asset", "api/motion": "via create / continue_asset",
     "api/motion/import": "via the studio's Animate a rig sheet",
     "api/vat": "a niche export the user starts with Export VAT in the studio",
+    "api/import/analyze": "via the studio's Import rig sheet",
+    "api/import/build": "via the studio's Import rig sheet",
     "api/rig/rebind": "re-rigs from the Steps panel",
     "api/generate/*/cancel": "via cancel_run", "api/finish/*/cancel": "via cancel_run",
     "api/props/*/cancel": "via cancel_run", "api/image/*/cancel": "via cancel_run",
     "api/animate/*/cancel": "via cancel_run", "api/motion/*/cancel": "via cancel_run",
     "api/vat/*/cancel": "via cancel_run",
+    "api/import/*/cancel": "via cancel_run",
     "api/rig/rebind/*/cancel": "via cancel_run",
 }
 # Server actions the tools below call.
