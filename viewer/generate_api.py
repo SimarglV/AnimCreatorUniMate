@@ -2942,6 +2942,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parts == ["api", "motion"]:
             self._create_motion_job()
             return
+        if parts == ["api", "motion", "import"]:
+            self._create_motion_import()
+            return
         if parts == ["api", "vat"]:
             self._create_vat_job()
             return
@@ -3695,6 +3698,13 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
             return
+        if parts == ["api", "motion", "builtins"]:
+            try:
+                self._send_json(200, {"builtins": motion_api.builtin_dirs(),
+                                      "installed": motion_installed()})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
         if parts == ["api", "vat", "tools"]:
             self._send_json(200, {"tools": vat_engine_tools(), "installed": vat_installed()})
             return
@@ -4065,6 +4075,90 @@ class Handler(SimpleHTTPRequestHandler):
         if motion_api.rig_run_of(path) is None:
             return None
         return path
+
+    def _create_motion_import(self) -> None:
+        """UniMate motion on a rig the user brings: a built-in example (already adapted),
+        a server path to a rigged GLB or an adapted rig directory, or an uploaded rigged
+        GLB. The latter two are adapted on the fly (no auto-rig), so non-humanoids work."""
+        try:
+            blocked = self._motion_blocked()
+            if blocked:
+                self._send_json(409, {"error": blocked})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 512 * 1024 * 1024:
+                self._send_json(400, {"error": "request is missing or larger than 512 MiB"})
+                return
+            content_type = self.headers.get("Content-Type", "")
+            body: dict[str, Any] = {}
+            upload: Path | None = None
+            if "multipart" in content_type:
+                form = parse_multipart(content_type, self.rfile.read(length))
+                asset = form.get("asset")
+                if asset and str(asset.get("filename", "")).lower().endswith((".glb", ".gltf", ".fbx")):
+                    keep = OUTPUT_ROOT / "motion" / "uploads" / uuid.uuid4().hex[:10]
+                    keep.mkdir(parents=True, exist_ok=True)
+                    upload = keep / str(asset["filename"])
+                    upload.write_bytes(asset["data"])
+                else:
+                    self._send_json(422, {"error": "send a rigged .glb/.gltf/.fbx in 'asset'"})
+                    return
+                settings_value = str((form.get("settings") or {}).get("value", "")).strip()
+                try:
+                    body = json.loads(settings_value) if settings_value else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "invalid settings JSON"})
+                    return
+            else:
+                try:
+                    body = json.loads(self.rfile.read(length)) if 0 < length <= 4096 else {}
+                except json.JSONDecodeError:
+                    self._send_json(422, {"error": "expected a JSON object"})
+                    return
+            if not isinstance(body, dict):
+                self._send_json(422, {"error": "expected a JSON object"})
+                return
+            prompt = str(body.get("prompt", ""))
+            cfg, reps, seed = body.get("cfg_scale", 3.0), body.get("repetitions", 1), body.get("seed")
+            loop = bool(body.get("loop"))
+            try:
+                if upload is not None:
+                    job = MOTION_JOBS.create(upload, prompt, cfg, reps, seed, loop)
+                else:
+                    builtin = str(body.get("builtin", "")).strip()
+                    path = str(body.get("path", "")).strip()
+                    if builtin:
+                        directory = motion_api.resolve_builtin(builtin)
+                        if directory is None:
+                            self._send_json(422, {"error": f"no such built-in rig: {builtin!r}"})
+                            return
+                        job = MOTION_JOBS.create_from_dir(directory, prompt, cfg, reps, seed, loop)
+                    elif path:
+                        candidate = Path(path).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = (REPO / path).resolve()
+                        if not candidate.exists():
+                            self._send_json(422, {"error": f"not found: {path!r}"})
+                            return
+                        if candidate.is_dir() and (candidate / "cond.npy").is_file():
+                            job = MOTION_JOBS.create_from_dir(candidate, prompt, cfg, reps, seed, loop)
+                        elif candidate.is_file() and candidate.suffix.lower() in (".glb", ".gltf", ".fbx"):
+                            job = MOTION_JOBS.create(candidate, prompt, cfg, reps, seed, loop)
+                        else:
+                            self._send_json(422, {"error": f"not a rigged GLB or an adapted rig dir: {path!r}"})
+                            return
+                    else:
+                        self._send_json(422, {"error": "give 'builtin', 'path', or an uploaded 'asset'"})
+                        return
+            except ValueError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._start_motion(job)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
 
     def _vat_blocked(self) -> str | None:
         waiting = busy_reason("vat")

@@ -48,6 +48,8 @@ OUTPUT_ROOT = REPO / "output" / "motion"
 EXP_DIR = REPO / "outputs" / "unimate_uniml3d_f60_v3"
 CHECKPOINT = EXP_DIR / "checkpoints" / "checkpoint_step_150000.pt"
 PROMPTS_FILE = REPO / "image_to_3dlab" / "unimate_prompts.json"
+# Ready-made, already-adapted rigs that ship with UniMate (cond.npy + canonical GLB).
+BUILTINS = REPO / "assets" / "examples"
 # A rig folder's run: output/animate/<stem>__rig__<stamp>/, holding <stem>_rigged.glb.
 RIG_RUN = re.compile(r"^[A-Za-z0-9_-]{1,80}__rig__\d{8}-\d{6}(?:-\d+)?$")
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -116,6 +118,30 @@ def resolve_prompt(prompt_id: str) -> str:
     return ""
 
 
+def builtin_dirs(root: Path | None = None) -> list[dict[str, str]]:
+    """The shipped, already-adapted rigs (a ``cond.npy`` beside a canonical GLB)."""
+    root = BUILTINS if root is None else root
+    found = []
+    if not root.is_dir():
+        return found
+    for entry in sorted(root.iterdir()):
+        if entry.is_dir() and (entry / "cond.npy").is_file():
+            glb = next(entry.glob("*.glb"), None)
+            found.append({"name": entry.name, "label": entry.name.replace("_", " ").title(),
+                          "path": entry.relative_to(REPO).as_posix(),
+                          "glb": glb.relative_to(REPO).as_posix() if glb else None})
+    return found
+
+
+def resolve_builtin(name: str, root: Path | None = None) -> Path | None:
+    """A built-in rig's directory, by its folder name, or None."""
+    root = BUILTINS if root is None else root
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return None
+    path = root / name
+    return path if path.is_dir() and (path / "cond.npy").is_file() else None
+
+
 def rig_run_of(glb: Path) -> Path | None:
     """The rig folder a ``_rigged.glb`` lives in, or None for anything else."""
     run = glb.parent
@@ -149,7 +175,7 @@ def _clamp(value: Any, low: float, high: float, name: str) -> float:
     return number
 
 
-def _record(rigged: Path, source: dict[str, Any] | None, prompt: str,
+def _record(input_name: str, input_sha: str, source: dict[str, Any] | None, prompt: str,
             cfg_scale: float, reps: int, loop: bool) -> dict[str, Any]:
     """Provenance: the source model's licence carries over, and UniMate's is listed beside
     it. The output is research-only: the checkpoint is CC BY-NC 4.0."""
@@ -157,8 +183,7 @@ def _record(rigged: Path, source: dict[str, Any] | None, prompt: str,
         "schema_version": 1,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "tool": "viewer Motion step: UniMate text-to-motion",
-        "input": {"name": rigged.name,
-                  "sha256": hashlib.sha256(rigged.read_bytes()).hexdigest()},
+        "input": {"name": input_name, "sha256": input_sha},
         "license": (source or {}).get("license"),
         "classification": "research-only",
         "motion": {"prompt": prompt, "cfg_scale": cfg_scale,
@@ -167,6 +192,35 @@ def _record(rigged: Path, source: dict[str, Any] | None, prompt: str,
                    "code_license": UNIMATE_CODE_LICENSE},
         "source_record": source,
     }
+
+
+def _settings(prompt: Any, cfg_scale: Any, reps: Any, seed: Any) -> tuple[str, float, int, int | None]:
+    """Validate and normalise the shared motion settings."""
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        raise ValueError("a motion prompt is required")
+    if len(prompt) > MAX_PROMPT_LEN:
+        raise ValueError(f"the prompt is longer than {MAX_PROMPT_LEN} characters")
+    scale = _clamp(cfg_scale, *CFG_RANGE, "cfg_scale")
+    try:
+        repetitions = int(reps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("repetitions must be a whole number") from exc
+    if not REPS_RANGE[0] <= repetitions <= REPS_RANGE[1]:
+        raise ValueError(f"repetitions must be between {REPS_RANGE[0]} and {REPS_RANGE[1]}")
+    try:
+        seed_value = int(seed) if seed not in (None, "") else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("seed must be a whole number or empty") from exc
+    return prompt, scale, repetitions, seed_value
+
+
+def _input_identity(path: Path) -> tuple[str, str]:
+    """(name, sha256) for the provenance record: the file, or a directory's canonical GLB."""
+    if path.is_file():
+        return path.name, hashlib.sha256(path.read_bytes()).hexdigest()
+    glb = next(path.glob("*.glb"), None)
+    return path.name, (hashlib.sha256(glb.read_bytes()).hexdigest() if glb is not None else "")
 
 
 class MotionJob:
@@ -228,33 +282,12 @@ class MotionJobManager:
         with self.lock:
             if self.busy():
                 raise RuntimeError("a Motion job is already running")
-            prompt = str(prompt or "").strip()
-            if not prompt:
-                raise ValueError("a motion prompt is required")
-            if len(prompt) > MAX_PROMPT_LEN:
-                raise ValueError(f"the prompt is longer than {MAX_PROMPT_LEN} characters")
-            scale = _clamp(cfg_scale, *CFG_RANGE, "cfg_scale")
-            try:
-                repetitions = int(reps)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("repetitions must be a whole number") from exc
-            if not REPS_RANGE[0] <= repetitions <= REPS_RANGE[1]:
-                raise ValueError(f"repetitions must be between {REPS_RANGE[0]} and {REPS_RANGE[1]}")
-            try:
-                seed_value = int(seed) if seed not in (None, "") else None
-            except (TypeError, ValueError) as exc:
-                raise ValueError("seed must be a whole number or empty") from exc
+            prompt, scale, repetitions, seed_value = _settings(prompt, cfg_scale, reps, seed)
             stem = rigged.name.removesuffix("_rigged.glb")
             slug = _slug(prompt)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            directory = self.output_root / f"{stem}__motion__{stamp}"
-            suffix = 2
-            while directory.exists():
-                directory = self.output_root / f"{stem}__motion__{stamp}-{suffix}"
-                suffix += 1
+            directory = self._run_dir(stem)
             asset_dir = directory / "asset"
             samples_dir = directory / "samples"
-            (directory / "steps").mkdir(parents=True)
 
             python = str(venv_python())
             adapt = ([python, "-m", "data_process.rig_preprocess", "run",
@@ -279,13 +312,60 @@ class MotionJobManager:
             else:
                 # An uploaded rig has no rig folder; the result is the first animated GLB.
                 result = samples_dir / "animated" / f"{stem}_{slug}.glb"
+            name, sha = _input_identity(rigged)
             job = MotionJob(uuid.uuid4().hex, directory, result,
                             [adapt, sample, animate],
                             ADAPT_SECONDS + SAMPLE_SECONDS + repetitions * 15.0
                             + ANIMATE_SECONDS + repetitions * 10.0,
-                            _record(rigged, source, prompt, scale, repetitions, loop),
+                            _record(name, sha, source, prompt, scale, repetitions, loop),
                             copy_to)
             return self._claim(job)
+
+    def create_from_dir(self, asset_dir: Path, prompt: str, cfg_scale: Any = 3.0,
+                        reps: Any = 1, seed: Any = None, loop: bool = False) -> MotionJob:
+        """Sample + animate an already-adapted rig directory (one holding ``cond.npy``),
+        e.g. one of the shipped ``assets/examples`` — no auto-rig, so non-humanoids work."""
+        with self.lock:
+            if self.busy():
+                raise RuntimeError("a Motion job is already running")
+            prompt, scale, repetitions, seed_value = _settings(prompt, cfg_scale, reps, seed)
+            if not asset_dir.is_dir() or not (asset_dir / "cond.npy").is_file():
+                raise ValueError("not an adapted rig: it needs a cond.npy")
+            stem = _slug(asset_dir.name)
+            slug = _slug(prompt)
+            directory = self._run_dir(stem)
+            samples_dir = directory / "samples"
+
+            python = str(venv_python())
+            sample = [[python, "-m", "unimate.inference.sample",
+                       "--exp_dir", str(EXP_DIR), "--asset", str(asset_dir),
+                       "--prompt", prompt, "--num_repetitions", str(repetitions),
+                       "--cfg_scale", f"{scale:g}", "--output_dir", str(samples_dir)], REPO]
+            if seed_value is not None:
+                sample[0] += ["--seed", str(seed_value)]
+            animate = [[python, "scripts/animate_samples.py", str(samples_dir)], REPO]
+            if loop:
+                animate[0] += ["--loop"]
+
+            result = samples_dir / "animated" / f"{stem}_{slug}.glb"
+            name, sha = _input_identity(asset_dir)
+            job = MotionJob(uuid.uuid4().hex, directory, result,
+                            [sample, animate],
+                            SAMPLE_SECONDS + repetitions * 15.0
+                            + ANIMATE_SECONDS + repetitions * 10.0,
+                            _record(name, sha, None, prompt, scale, repetitions, loop),
+                            None)
+            return self._claim(job)
+
+    def _run_dir(self, stem: str) -> Path:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        directory = self.output_root / f"{stem}__motion__{stamp}"
+        suffix = 2
+        while directory.exists():
+            directory = self.output_root / f"{stem}__motion__{stamp}-{suffix}"
+            suffix += 1
+        (directory / "steps").mkdir(parents=True)
+        return directory
 
     def get(self, job_id: str) -> MotionJob | None:
         return self.jobs.get(job_id) if JOB_ID.fullmatch(job_id) else None

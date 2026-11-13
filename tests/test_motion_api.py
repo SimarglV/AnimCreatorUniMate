@@ -130,14 +130,69 @@ def test_a_second_job_waits_for_the_first(rig, monkeypatch):
 
 def test_the_provenance_record_says_noncommercial(rig):
     source = {"license": {"name": "MIT"}, "classification": "commercial-clear"}
-    record = ma._record(rig, source, "An object walks forward.", 3.0, 1, False)
+    name, sha = ma._input_identity(rig)
+    record = ma._record(name, sha, source, "An object walks forward.", 3.0, 1, False)
     assert record["classification"] == "research-only"
     assert record["motion"]["made_with"] == "UniMate"
     assert record["motion"]["license"]["name"] == "CC BY-NC 4.0"
     assert "not for commercial use" in record["motion"]["license"]["note"]
     assert record["motion"]["prompt"] == "An object walks forward."
+    assert record["input"]["name"] == rig.name
     # the source's licence travels with it
     assert record["license"] == {"name": "MIT"}
+
+
+def test_create_from_dir_skips_the_adapt_step(tmp_path, monkeypatch):
+    root = tmp_path / "output"
+    root.mkdir()
+    python = root / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ma, "REPO", tmp_path)
+    monkeypatch.setattr(ma, "OUTPUT_ROOT", root / "motion")
+    monkeypatch.setattr(ma, "MOTION_JOBS", ma.MotionJobManager(root / "motion"))
+    monkeypatch.setattr(ma, "venv_python", lambda: python)
+    monkeypatch.setattr(ma, "EXP_DIR", root / "exp")
+    asset = root / "assets" / "crab"
+    asset.mkdir(parents=True)
+    (asset / "cond.npy").write_bytes(b"cond")
+    (asset / "Crab.glb").write_bytes(b"glb")
+    job = ma.MOTION_JOBS.create_from_dir(asset, "An object scuttles sideways.", reps=2)
+    commands = [command for command, _ in job.commands]
+    assert len(commands) == 2                     # no rig_preprocess step
+    sample, animate = commands
+    assert sample[sample.index("--asset") + 1] == str(asset)
+    assert sample[sample.index("--prompt") + 1] == "An object scuttles sideways."
+    assert animate[:2] == [str(python), "scripts/animate_samples.py"]
+    assert job.copy_to is None
+
+
+def test_create_from_dir_refuses_a_directory_without_cond(tmp_path, monkeypatch):
+    root = tmp_path / "output"
+    root.mkdir()
+    python = root / "fake-python"
+    python.write_bytes(b"x")
+    monkeypatch.setattr(ma, "REPO", tmp_path)
+    monkeypatch.setattr(ma, "OUTPUT_ROOT", root / "motion")
+    monkeypatch.setattr(ma, "MOTION_JOBS", ma.MotionJobManager(root / "motion"))
+    monkeypatch.setattr(ma, "venv_python", lambda: python)
+    monkeypatch.setattr(ma, "EXP_DIR", root / "exp")
+    bare = root / "assets" / "bare"
+    bare.mkdir(parents=True)
+    with pytest.raises(ValueError, match="cond.npy"):
+        ma.MOTION_JOBS.create_from_dir(bare, "An object walks forward.")
+
+
+def test_builtin_dirs_list_shipped_examples(tmp_path, monkeypatch):
+    examples = tmp_path / "examples"
+    monkeypatch.setattr(ma, "REPO", tmp_path)
+    (examples / "crab").mkdir(parents=True)
+    (examples / "crab" / "cond.npy").write_bytes(b"c")
+    (examples / "crab" / "Crab.glb").write_bytes(b"g")
+    (examples / "empty").mkdir()
+    builtins = ma.builtin_dirs(examples)
+    assert [b["name"] for b in builtins] == ["crab"]
+    assert ma.resolve_builtin("crab", examples) == examples / "crab"
+    assert ma.resolve_builtin("../etc", examples) is None and ma.resolve_builtin("nope", examples) is None
 
 
 def test_the_result_is_copied_into_the_rig_folder_when_the_animator_wrote_one(rig, monkeypatch):

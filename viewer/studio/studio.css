@@ -435,3 +435,8 @@ img.glow { animation: doorglow 2.4s ease-in-out infinite; }
 .vat-out a { justify-self: start; }
 .vat-tools { display: grid; gap: 3px; margin-top: 4px; }
 .vat-tools .meta { margin-top: 4px; }
+
+/* UniMate motion import sheet */
+.motion-import input[type="text"], .motion-import textarea { width: 100%; }
+.motion-out { display: grid; gap: 6px; margin-top: 8px; }
+.motion-out .job-msg { margin: 0; }

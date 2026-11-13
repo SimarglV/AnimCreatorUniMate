@@ -9,6 +9,7 @@ import { retryWant } from './plan.js';
 import { closeBrushStage } from './brush.js';
 import { openCreate, runChain } from './create.js';
 import { openActivity, openAbout, openGuide, openReport, closeSheet, usageNotice, openNews, refreshNews } from './pages.js';
+import { openMotionImport } from './motion.js';
 import { STEP_LABELS, stoppedLine, stoppedStep } from './plan.js';
 import { mountSkins } from './skins.js';
 import { installTooltips } from './tooltips.js';
@@ -964,6 +965,20 @@ function openFile(file) {
 
 $('openBtn').addEventListener('click', () => $('openFile').click());
 $('openFile').addEventListener('change', (event) => { openFile(event.target.files[0]); event.target.value = ''; });
+
+// Animate a rig: UniMate motion on a built-in example, an uploaded rigged GLB, or a path.
+$('motionBtn').addEventListener('click', () => {
+  openMotionImport({ stage: $('stage'), ctx, onResult: (glbUrl, name, path) => {
+    viewingStep = null;
+    viewingPictures = false;
+    $('vTitle').textContent = name;
+    $('vMeta').textContent = 'UniMate motion';
+    viewer.setFacing(null);
+    viewer.setClips([]);
+    viewer.load(glbUrl, { label: name, autoplay: true });
+    if (path) setDownload(path);
+  } });
+});
 // a file dropped anywhere opens in the viewer, instead of the browser downloading it.
 // Create's sheet takes its own drops first (and marks them handled).
 window.addEventListener('dragover', (event) => event.preventDefault());

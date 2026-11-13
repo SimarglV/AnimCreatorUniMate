@@ -30,8 +30,9 @@ sentence / picture → 3D model → finish → rig → UniMate motion → animat
   skeleton (**Rig**, SkinTokens) and animates it. Close the tab and the run carries on.
 - **UniMate motion — any skeleton.** Preset moves are humanoid-only; UniMate reads one
   sentence ("An object walks forward.") and animates people, animals and machines alike.
-  The clip lands in your Library beside the rig. See
-  [`docs/unimate-motion.md`](docs/unimate-motion.md).
+  The clip lands in your Library beside the rig. Bring a rig with **Animate a rig** (a
+  built-in example, an uploaded rigged GLB, or a path) — no auto-rig needed, so
+  non-humanoids work too. See [`docs/unimate-motion.md`](docs/unimate-motion.md).
 - **The studio.** Your Library, one 3D viewer and a Steps panel. Every step is a button too,
   so you can stop after any of them.
 - **Low poly, high quality.** Pixel Match puts your picture's real pixels back on the model,

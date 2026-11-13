@@ -4,22 +4,34 @@ The studio's **Animate** step has two routes: preset moves (SkinTokens + Kimodo 
 humanoids only) and **UniMate motion** — one sentence, any skeleton. This page is about
 the second.
 
+## How to run it in the studio
+
+**Animate a rig** (top bar) animates a rig you bring, whatever its skeleton:
+
+- a **built-in example** (crab, dragon, eagle, shark, snake, human, Unitree Go2) — already
+  adapted, goes straight to sampling;
+- an **uploaded rigged GLB/glTF/FBX**, or a **path** on this machine — adapted on the fly.
+
+The same UniMate motion runs on humanoid characters through the normal pipeline
+(**Create → A character moved by text**, or the Animate step after the rig).
+
 ## What happens
 
-One job, three subprocesses, all in UniMate's own environment (`.venv`, Python 3.10 —
+One job, up to three subprocesses, all in UniMate's own environment (`.venv`, Python 3.10 —
 the studio's `.venv-studio` cannot hold both numpy pins):
 
-1. **Adapt** — `data_process.rig_preprocess` labels the joints with the offline rules
-   (`--annotate rule --no_review`) and bakes `cond.npy` + the canonical GLB. No review
-   step: the studio is a one-click flow; label quality follows the rule vocabulary.
+1. **Adapt** (skipped for an already-adapted rig) — `data_process.rig_preprocess` labels
+   the joints with the offline rules (`--annotate rule --no_review`) and bakes `cond.npy` +
+   the canonical GLB. No review step: the studio is a one-click flow; label quality follows
+   the rule vocabulary.
 2. **Sample** — `unimate.inference.sample` writes one motion per repetition
    (`cfg_scale`, `repetitions`, `seed`).
 3. **Animate** — `scripts/animate_samples.py` drives the canonical mesh and exports
    GLB + FBX per repetition.
 
-The animated GLB is copied into the rig's folder as `<base>_<slug>.glb`, so the Library
-lists it beside the rig like a preset clip. Working files stay in
-`output/motion/<stem>__motion__<stamp>/`.
+For a humanoid in the Library the animated GLB is copied into the rig's folder as
+`<base>_<slug>.glb`, so it lists beside the rig like a preset clip. Imported rigs keep
+their result in `output/motion/<stem>__motion__<stamp>/`.
 
 ## Writing prompts
 
