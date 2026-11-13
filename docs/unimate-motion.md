@@ -14,6 +14,8 @@ the second.
 
 **Import rig** is UniMate's own full workflow: upload a rig, review and fix the joint
 labels and the facing pair, then build the asset (cond.npy + canonical GLB) and animate it.
+Imported rigs show up in the Library as rigged characters, so they can be animated again
+later from the Steps panel's Animate step.
 
 The same UniMate motion runs on humanoid characters through the normal pipeline
 (**Create → A character moved by text**, or the Animate step after the rig).

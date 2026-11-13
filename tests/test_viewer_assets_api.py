@@ -61,6 +61,24 @@ def _by_name(assets):
     return {a["name"]: a for a in assets}
 
 
+def test_an_imported_rig_is_a_rigged_character(output):
+    _write(output / "rig" / "crab" / "cond.npy", b"cond", 6000)
+    _write(output / "rig" / "crab" / "Crab.glb", b"CRAB", 6100)
+    assets = _by_name(aa.list_assets(output))
+    crab = assets["crab"]
+    assert crab["kind"] == "character" and crab["stage"] == "rigged"
+    assert crab["imported"] is True
+    assert crab["rigged"].endswith("Crab.glb")
+    assert crab["rig_dir"] == "rig/crab"
+    assert crab["fits_moves"] is False and crab["clips"] == []
+    assert crab["picture"] is None and crab["model"] is None and crab["finished"] is None
+
+
+def test_a_folder_without_cond_is_not_an_imported_rig(output):
+    _write(output / "rig" / "bare" / "thing.glb", b"GLB", 7000)
+    assert "bare" not in _by_name(aa.list_assets(output))
+
+
 def test_a_full_chain_becomes_one_animated_asset(output):
     knight = _by_name(aa.list_assets(output))["a chunky knight"]
     assert knight["kind"] == "character"

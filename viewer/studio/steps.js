@@ -433,6 +433,9 @@ export function chainPlan(stepId, asset, settings) {
   }
   if (stepId === 'motion') {
     if (!asset.rigged || !settings.motionPrompt) return null;
+    // An imported rig is a one-off run (its labels are already reviewed), not a Library
+    // chain: startMotion posts straight to /api/motion/import with the rig directory.
+    if (asset.imported) return null;
     return { ...base, steps: ['motion'], made, motionPrompt: settings.motionPrompt,
       motionSettings: { cfg_scale: settings.motionCfg, repetitions: settings.motionReps, loop: settings.motionLoop } };
   }
@@ -476,6 +479,10 @@ async function startAnimate(asset, preset, speed, arm_spread, in_place) {
 
 async function startMotion(asset, prompt, cfg, reps, loop) {
   if (!prompt) throw new Error('Say what motion you want first.');
+  if (asset.imported && asset.rig_dir) {
+    return { kind: 'motion', start: await postStart('/api/motion/import',
+      JSON.stringify({ path: asset.rig_dir, prompt, cfg_scale: cfg, repetitions: reps, loop })) };
+  }
   return { kind: 'motion', start: await postStart('/api/motion',
     JSON.stringify({ model: asset.rigged, prompt, cfg_scale: cfg, repetitions: reps, loop })) };
 }

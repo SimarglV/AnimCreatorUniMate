@@ -307,6 +307,24 @@ def _prop_sets(output: Path) -> list[dict[str, Any]]:
     return found
 
 
+def _imported_rigs(output: Path) -> list[dict[str, Any]]:
+    """Standalone rigs imported through Import & Adaptation (`output/rig/<name>/` with a
+    ``cond.npy`` and a canonical GLB). They are rigged characters ready for UniMate motion."""
+    root = output / "rig"
+    found = []
+    if not root.is_dir():
+        return found
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or not (entry / "cond.npy").is_file():
+            continue
+        glb = next(entry.glob("*.glb"), None)
+        if glb is None:
+            continue
+        found.append({"name": entry.name, "dir": entry, "file": glb,
+                      "mtime": max(glb.stat().st_mtime, (entry / "cond.npy").stat().st_mtime)})
+    return found
+
+
 def list_assets(output: Path, with_runs: bool = False) -> list[dict[str, Any]]:
     """Every asset on disk, the one touched most recently first. `with_runs` adds the run folders
     that belong to this version alone (what deleting it would remove); the Library list never needs them."""
@@ -501,6 +519,21 @@ def list_assets(output: Path, with_runs: bool = False) -> list[dict[str, Any]]:
         counts[asset["family"]] = counts.get(asset["family"], 0) + 1
     for asset in assets:
         asset["versions"] = counts[asset["family"]]
+    # Imported rigs: no family tree, no skins; just a rigged character ready to animate.
+    for rig in _imported_rigs(output):
+        asset_id = hashlib.sha1(("rig/" + rig["name"]).encode()).hexdigest()[:12]
+        assets.append({
+            "id": asset_id, "family": asset_id, "version": 1, "versions": 1,
+            "name": friendly_name(rig["name"]), "kind": "character", "stage": "rigged",
+            "picture": None, "prompt": None, "picture_settings": None, "picture_want": None,
+            "back": None, "model": None, "finished": None, "pixel_match": None,
+            "rigged": rel(rig["file"]),
+            "rig_dir": rel(rig["dir"]),
+            "fits_moves": False, "facing": None,
+            "clips": [], "props": [], "timings": {}, "updated": rig["mtime"],
+            "imported": True,
+            **({"runs": [rel(rig["dir"])]} if with_runs else {}),
+        })
     hashes.save()   # the rig facts read above are cached too
     meta = _read_meta(output)
     hidden = set(meta.get("hidden", []))

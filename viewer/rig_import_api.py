@@ -33,7 +33,7 @@ import usage_api
 
 from image_to_3dlab import host, processes
 
-RIG_ROOT = REPO / "outputs" / "rig"
+RIG_ROOT = REPO / "output" / "rig"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 TERMINAL = {"done", "error", "cancelled"}
 ANALYZE_SECONDS = 60.0
